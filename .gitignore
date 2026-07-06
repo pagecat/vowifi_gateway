@@ -1,0 +1,34 @@
+# runtime data: config, per-instance state, SQLite DB, logs, certs, saved PINs/secrets
+data/*
+!data/.gitkeep
+
+# build artifacts
+**/__pycache__/
+*.pyc
+node_modules/
+webui/dist/
+
+# Python venv (native/local control-plane install)
+.venv/
+control/.venv/
+
+# local env overrides (may hold secrets/paths)
+.env
+.env.*
+
+# editor / tooling / OS cruft
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# keys & certs (never commit)
+*.pem
+*.key
+*.crt
+id_rsa*
+id_ed25519*
+
+# debug captures
+*.pcap

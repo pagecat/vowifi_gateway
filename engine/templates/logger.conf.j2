@@ -1,0 +1,6 @@
+[general]
+
+[logfiles]
+console => notice,warning,error,verbose{{ ',debug' if debug_asterisk else '' }}
+full => notice,warning,error,verbose,dtmf{{ ',debug' if debug_asterisk else '' }}
+messages => notice,warning,error

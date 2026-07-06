@@ -1,0 +1,196 @@
+[global]
+type=global
+allow_sending_180_after_183=yes
+user_agent={{ user_agent }}
+
+[system]
+type=system
+timer_t1=2000
+
+; ================= VoLTE / VoWiFi IMS core transport (over the ePDG tunnel) =================
+[volte_ims]
+type=transport
+protocol=tcp
+bind=[::]:5060
+bind_interface=ipsec0
+sec_port_c_min=40000
+sec_port_c_max=44999
+sec_port_s_min=50000
+sec_port_s_max=54999
+{% if pani %}
+p_access_network_info={{ pani }}
+{% endif %}
+sec_encryption=yes
+
+{% if pcscf %}
+[volte_ims]
+type=registration
+transport=volte_ims
+outbound_auth=volte_ims
+imei={{ imei }}
+server_uri=sip:{{ realm }}
+client_uri=sip:{{ imsi }}@{{ realm }}
+retry_interval=30
+fatal_retry_interval=30
+max_retries=999999999
+expiration=600000
+volte=yes
+manual_register=yes
+endpoint=volte_ims
+receive_sms=yes
+
+[volte_ims]
+type=endpoint
+; user_eq_phone MUST be off: Telus' SMSC rejects a MESSAGE whose request-URI carries
+; ;user=phone with "400 SIP Parser Error, line 10 col 168" (breaks MO SMS). Registration
+; and calls don't use phone-number request-URIs, so disabling this is safe.
+user_eq_phone=no
+transport=volte_ims
+context=volte_ims
+message_context=volte_ims_msg
+disallow=all
+allow=amr
+bw_value=41
+outbound_auth=volte_ims
+aors=volte_ims
+rewrite_contact=yes
+from_domain={{ realm }}
+from_user={{ msisdn }}
+volte=yes
+dedicated_bearer_up=yes
+100rel=peer_supported
+moh_passthrough=yes
+direct_media=no
+smsc_uri=sip:{{ smsc }}@{{ realm }}
+sdp_owner={{ sdp_owner }}
+sdp_session={{ sdp_session }}
+
+[volte_ims]
+type=auth
+auth_type=ims_aka
+username={{ imsi }}@{{ realm }}
+usim_ami=yes
+
+[volte_ims]
+type=aor
+contact=sip:{{ imsi }}@{{ realm }}
+max_contacts=1
+
+[volte_ims]
+type=identify
+endpoint=volte_ims
+match={{ pcscf }}
+
+[{{ realm }}]
+type=resolve
+ip={{ pcscf }}
+transport=volte_ims
+
+[smsoip.{{ realm }}]
+type=resolve
+ip={{ pcscf }}
+transport=volte_ims
+{% endif %}
+
+; ================= Local SIP access (external clients / softphone provisioning) =================
+{# The engine runs in a docker bridge container; its private IP (e.g. 172.17.0.2) is NOT
+   routable from a LAN SIP client. Without an external address Asterisk advertises that
+   private IP in its Contact + SDP, so a remote MicroSIP sends in-dialog requests (BYE!) to
+   an unroutable target and the call never tears down. Advertise the host's reachable address
+   (domain wins if set, else the manager-supplied advertise_addr = host LAN IP). #}
+{% set local_ext = domain or advertise_addr %}
+{% if sip_transport == 'tls' %}
+[transport-local]
+type=transport
+protocol=tls
+bind={{ sip_listen }}:{{ sip_tls_port }}
+cert_file=/etc/asterisk/certificate.crt
+priv_key_file=/etc/asterisk/certificate.key
+method=tlsv1_2
+{% if domain %}
+domain={{ domain }}
+{% endif %}
+{% if local_ext %}
+external_media_address={{ local_ext }}
+external_signaling_address={{ local_ext }}
+{% endif %}
+{% else %}
+[transport-local]
+type=transport
+protocol={{ sip_transport }}
+bind={{ sip_listen }}:{{ sip_udp_port }}
+{% if local_ext %}
+external_media_address={{ local_ext }}
+external_signaling_address={{ local_ext }}
+{% endif %}
+{% endif %}
+
+{% if webrtc_enable %}
+; WebRTC (wss) rides on the built-in HTTP/TLS server configured in http.conf.
+; bind is still REQUIRED (transport_apply rejects the object without it) even though
+; the actual listener is http.conf's tlsbindaddr; without it the transport object is
+; never created and any INVITE on the webrtc endpoint dies with 500
+; ("Unable to retrieve PJSIP transport 'transport-wss'").
+[transport-wss]
+type=transport
+protocol=wss
+bind=0.0.0.0
+{% if local_ext %}
+external_media_address={{ local_ext }}
+external_signaling_address={{ local_ext }}
+{% endif %}
+{% endif %}
+
+[endpoint-local](!)
+type=endpoint
+context=from-local
+message_context=msg-from-local
+disallow=all
+allow=amr
+allow=ulaw
+allow=alaw
+allow=opus
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+; Never let a local client (WebRTC softphone / external SIP) direct-media with the IMS side:
+; the two legs are incompatible (DTLS-SRTP + opus/ulaw on the client vs plain RTP + AMR on
+; the carrier), so Asterisk MUST stay in the media path to bridge/transcode. With direct_media
+; left on (the default) Asterisk would try to re-INVITE the two ends to talk directly, which
+; can't work → no audio. (volte_ims already has direct_media=no.)
+direct_media=no
+{% if msisdn %}
+callerid=undefined <{{ msisdn }}>
+{% endif %}
+
+[auth-local](!)
+type=auth
+auth_type=userpass
+
+[aor-local](!)
+type=aor
+max_contacts=3
+remove_existing=yes
+
+{% for acct in external_accounts %}
+[{{ acct.username }}](endpoint-local)
+auth=auth-{{ acct.username }}
+aors={{ acct.username }}
+[auth-{{ acct.username }}](auth-local)
+username={{ acct.username }}
+password={{ acct.password }}
+[{{ acct.username }}](aor-local)
+{% endfor %}
+
+{% if webrtc_enable %}
+[{{ webrtc_user }}](endpoint-local)
+auth=auth-{{ webrtc_user }}
+aors={{ webrtc_user }}
+transport=transport-wss
+webrtc=yes
+dtls_auto_generate_cert=yes
+[auth-{{ webrtc_user }}](auth-local)
+username={{ webrtc_user }}
+password={{ webrtc_password }}
+[{{ webrtc_user }}](aor-local)
+{% endif %}

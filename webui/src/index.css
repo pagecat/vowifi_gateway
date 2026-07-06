@@ -1,0 +1,98 @@
+@import "tailwindcss";
+
+/* ============ Theme palettes ============ */
+:root {
+  /* light (default + fallback when system preference is unavailable) */
+  --bg: #f4f6fb;
+  --sidebar: #ffffff;
+  --panel: #ffffff;
+  --input-bg: #ffffff;
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+  --hover: #eef2f7;
+  --active: #e0e9ff;
+  --text: #0f172a;
+  --text-soft: #334155;
+  --text-dim: #64748b;
+  --text-mute: #94a3b8;
+  --text-faint: #b6c0cf;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --shadow: rgba(15, 23, 42, 0.18);
+  color-scheme: light;
+}
+:root[data-theme="dark"], .theme-dark-vars {
+  --bg: #0b0f1a;
+  --sidebar: #0d1320;
+  --panel: #131a2b;
+  --input-bg: #0e1626;
+  --border: #1f2937;
+  --border-strong: #263149;
+  --hover: #1c2537;
+  --active: #1c2942;
+  --text: #e5e9f0;
+  --text-soft: #cbd5e1;
+  --text-dim: #94a3b8;
+  --text-mute: #64748b;
+  --text-faint: #475569;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --shadow: rgba(0, 0, 0, 0.55);
+  color-scheme: dark;
+}
+/* auto: follow the system when no explicit light/dark is chosen */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    --bg: #0b0f1a; --sidebar: #0d1320; --panel: #131a2b; --input-bg: #0e1626;
+    --border: #1f2937; --border-strong: #263149; --hover: #1c2537; --active: #1c2942;
+    --text: #e5e9f0; --text-soft: #cbd5e1; --text-dim: #94a3b8; --text-mute: #64748b;
+    --text-faint: #475569; --primary: #2563eb; --primary-hover: #1d4ed8;
+    --shadow: rgba(0, 0, 0, 0.55); color-scheme: dark;
+  }
+}
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  transition: background .2s, color .2s;
+}
+
+/* status dot colors (semantic — consistent across themes) */
+.dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+.st-OK { background: #22c55e; box-shadow: 0 0 8px #22c55e88; }
+.st-REGISTERING { background: #eab308; box-shadow: 0 0 8px #eab30888; }
+.st-TUNNEL_DOWN { background: #f97316; }
+.st-EPDG_UNRESOLVED { background: #f97316; }
+.st-PIN_PROBLEM { background: #ef4444; }
+.st-NO_CARD { background: #ef4444; }
+.st-ERROR { background: #ef4444; box-shadow: 0 0 8px #ef444488; }
+.st-STOPPED { background: #94a3b8; }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
+.btn { border-radius: 10px; padding: 8px 14px; font-weight: 600; font-size: 14px; cursor: pointer; border: 1px solid transparent; transition: .15s; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-ghost { background: var(--hover); color: var(--text-soft); }
+.btn-ghost:hover { background: var(--active); }
+
+/* Row-hover-reveal delete affordance (call log / conversation list). Pure CSS so it also
+   works with keyboard focus (focus-within) and doesn't fight React's DOM reconciliation. */
+.row-del { opacity: 0; transition: opacity .15s; border: none; background: transparent;
+  color: #ef4444; cursor: pointer; font-size: 15px; padding: 2px 4px; }
+.hover-row:hover .row-del, .hover-row:focus-within .row-del { opacity: 1; }
+.row-del:focus-visible { opacity: 1; outline: 2px solid #ef4444; border-radius: 6px; }
+.btn-danger { background: #b91c1c; color: white; }
+.btn-danger:hover { background: #991b1b; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+input, select, textarea {
+  background: var(--input-bg); border: 1px solid var(--border-strong); border-radius: 9px;
+  padding: 8px 10px; color: var(--text); width: 100%; font-size: 14px; outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--primary); }
+label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 4px; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+a { color: inherit; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; }

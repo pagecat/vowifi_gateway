@@ -1,0 +1,102 @@
+{% set local_eps = [] %}
+{% for acct in external_accounts %}{% set _ = local_eps.append('PJSIP/' ~ acct.username) %}{% endfor %}
+{% if webrtc_enable %}{% set _ = local_eps.append('PJSIP/' ~ webrtc_user) %}{% endif %}
+{% set dialstr = local_eps | join('&') %}
+{% set msg_targets = [] %}
+{% for acct in external_accounts %}{% set _ = msg_targets.append(acct.username) %}{% endfor %}
+{% if webrtc_enable %}{% set _ = msg_targets.append(webrtc_user) %}{% endif %}
+
+; ===== Incoming call from the IMS/VoWiFi side =====
+[volte_ims]
+; MUST be _. (match anything): the IMS routes inbound calls to our REGISTERED CONTACT, whose
+; user part is a random GRUU/UUID (e.g. ef666c87-...@[v6]:port), NOT a phone number — so a
+; numeric-only pattern like _[+0-9]. never matches and every incoming call is 404-rejected.
+; The explicit h/i/t handlers below take precedence over _. , so no phantom "call to h" is
+; logged (that was the original reason _. had been narrowed).
+exten => _.,1,NoOp(Incoming call from ${CALLERID(num)})
+same => n,Set(CALLPEER=${CALLERID(num)})
+same => n,Progress()
+same => n,Set(FILE(/logs/calls.txt,,,a)=IN call from ${CALLERID(num)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
+same => n,TrySystem(/usr/local/bin/notify.py call_in ${CALLERID(num)} &)
+same => n,WaitForPrecondition(10,2000)
+same => n,Ringing()
+{% if dialstr %}
+same => n,Dial({{ dialstr }},60)
+{% else %}
+same => n,Answer()
+same => n,Wait(30)
+{% endif %}
+same => n,Hangup()
+; i (invalid) / t (response timeout) are explicit no-ops so the broad _. never mislogs them.
+exten => i,1,Hangup()
+exten => t,1,Hangup()
+; The hangup handler ALWAYS runs (whether the caller hangs up unanswered, we decline, or the
+; call completes), so the "ringing" record is finalized to a real disposition here instead of
+; only after Dial() (which is skipped when the inbound leg is torn down first).
+; CRITICAL: after priority 1 Asterisk auto-increments to h,2 which does NOT exist, so it would
+; FALL THROUGH to the broad `_.` pattern (priorities 2-9: Set/Progress/call_in/Dial…) and fire
+; a phantom SECOND `call_in` (+ a stray Dial) for every call — leaving a ghost 'ringing' row in
+; the call log. Return() ends the 'h' routine cleanly so no fall-through happens.
+exten => h,1,TrySystem(/usr/local/bin/notify.py call_result in "${CALLPEER}" "${DIALSTATUS}" "${HANGUPCAUSE}" &)
+same => n,Return()
+
+; ===== Incoming SMS from the IMS/VoWiFi side =====
+[volte_ims_msg]
+exten => _.,1,NoOp(Incoming SMS from ${MESSAGE(from)})
+same => n,Set(NL=${BASE64_DECODE(Cg==)})
+same => n,Set(FILE(/logs/messages.txt,,,a)=IN SMS from ${MESSAGE(from)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)}:${NL}${MESSAGE(body)}${NL}=====${NL})
+same => n,TrySystem(/usr/local/bin/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" &)
+{% for t in msg_targets %}
+same => n,MessageSend(pjsip:{{ t }},${MESSAGE(from)},sip:{{ t }})
+{% endfor %}
+same => n,Hangup()
+
+; ===== Outgoing call from a local endpoint (softphone / external SIP) =====
+; Single dial attempt (no auto-redial). The dial result (incl. far-end reject) is
+; reported to the manager for the call log.
+[from-local]
+; _[+0-9]. (not _.) so the special h/i/t extensions never match here and log phantom calls
+exten => _[+0-9].,1,NoOp(Outgoing call to ${EXTEN} from ${CALLERID(num)})
+same => n,Set(CALLPEER=${EXTEN})
+same => n,Set(FILE(/logs/calls.txt,,,a)=OUT call to ${EXTEN} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
+same => n,TrySystem(/usr/local/bin/notify.py call_out ${EXTEN} &)
+; Ring timeout {{ ring_timeout }}s (configurable): if the callee never answers, Asterisk
+; CANCELs the outbound INVITE at this deadline instead of leaving it open. The carrier keeps
+; the early dialog alive and RE-ALERTS the callee (repeated 180 Ringing) for as long as our
+; INVITE is pending, so a shorter timeout bounds how many ring cycles the callee gets before
+; we give up. Most carriers roll to voicemail by ~30s; 35 is the default. (The repeated
+; ringing itself is carrier-side MMTel behaviour and can't be removed here.) A caller who
+; hangs up earlier still CANCELs immediately.
+same => n,Dial(PJSIP/${EXTEN}@volte_ims,{{ ring_timeout }})
+; Dial only returns here when the call was NEVER answered (reject/busy/no-answer/congestion);
+; answered calls are bridged and tear down via BYE, never reaching this line.
+; Save the REAL disposition for the call log BEFORE overriding the response (PJSIPHangup does
+; not clobber HANGUPCAUSE, but Set them first so the 'h' handler is order-independent).
+same => n,Set(REALSTATUS=${DIALSTATUS})
+same => n,Set(REALCAUSE=${HANGUPCAUSE})
+; CRITICAL: on a rejected/unavailable call the carrier (Telus IMS) returns "480 Temporarily
+; Unavailable", which Asterisk forwards to the local caller. 480 is a RETRYABLE response
+; (RFC 3261 §21.4.11), so MicroSIP auto-redials forever and JsSIP hangs. Force a clean,
+; non-retryable "603 Decline" to the caller instead so the client stops and shows the call as
+; ended/declined. (ANSWER never reaches here; the guard is belt-and-suspenders.)
+same => n,ExecIf($["${DIALSTATUS}" != "ANSWER"]?PJSIPHangup(Decline))
+same => n,Hangup()
+; Report the outcome from the hangup handler, NOT inline after Dial(): when the caller
+; (softphone) hangs up mid-ring, the caller channel is destroyed and jumps straight to 'h',
+; so an inline call_result would never run and the record would stay stuck on "dialing".
+; Use REALSTATUS/REALCAUSE (captured right after Dial) so the log keeps the TRUE far-end
+; disposition (e.g. CHANUNAVAIL/31) rather than the overridden Decline; fall back to the live
+; vars when REAL* are unset (caller hung up mid-ring → jumped straight to 'h' before Set).
+exten => h,1,Set(ST=${IF($["${REALSTATUS}" != ""]?${REALSTATUS}:${DIALSTATUS})})
+same => n,Set(CS=${IF($["${REALCAUSE}" != ""]?${REALCAUSE}:${HANGUPCAUSE})})
+same => n,TrySystem(/usr/local/bin/notify.py call_result out "${CALLPEER}" "${ST}" "${CS}" &)
+same => n,Return()
+
+; ===== Outgoing SMS from a local endpoint =====
+[msg-from-local]
+exten => _.,1,NoOp(Outgoing SMS to ${MESSAGE(to)})
+same => n,Set(NL=${BASE64_DECODE(Cg==)})
+same => n,Set(EXTEN=${CUT(CUT(MESSAGE(to),@,1),:,2)})
+same => n,Set(FILE(/logs/messages.txt,,,a)=OUT SMS to ${EXTEN} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)}:${NL}${MESSAGE(body)}${NL}=====${NL})
+same => n,TrySystem(/usr/local/bin/notify.py sms_out "${EXTEN}" "${BASE64_ENCODE(${MESSAGE(body)})}" &)
+same => n,MessageSend(pjsip:volte_ims/${EXTEN}@volte_ims,sip:{{ msisdn }}@{{ realm }},sip:${EXTEN}@volte_ims)

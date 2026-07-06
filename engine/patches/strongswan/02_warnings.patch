@@ -1,0 +1,101 @@
+diff --git a/src/libcharon/encoding/payloads/encrypted_payload.c b/src/libcharon/encoding/payloads/encrypted_payload.c
+index ba56ace55..6ee727c03 100644
+--- a/src/libcharon/encoding/payloads/encrypted_payload.c
++++ b/src/libcharon/encoding/payloads/encrypted_payload.c
+@@ -1023,7 +1023,7 @@ encrypted_fragment_payload_t *encrypted_fragment_payload_create()
+ 				.get_length = _frag_get_length,
+ 				.add_payload = _frag_add_payload,
+ 				.remove_payload = (void*)return_null,
+-				.generate_payloads = nop,
++				.generate_payloads = (void*)nop,
+ 				.set_transform = _frag_set_transform,
+ 				.get_transform = _frag_get_transform,
+ 				.encrypt = _frag_encrypt,
+diff --git a/src/libcharon/plugins/updown/updown_handler.c b/src/libcharon/plugins/updown/updown_handler.c
+index 72d7f7da3..a45eec387 100644
+--- a/src/libcharon/plugins/updown/updown_handler.c
++++ b/src/libcharon/plugins/updown/updown_handler.c
+@@ -219,7 +219,7 @@ updown_handler_t *updown_handler_create()
+ 			.handler = {
+ 				.handle = _handle,
+ 				.release = _release,
+-				.create_attribute_enumerator = enumerator_create_empty,
++				.create_attribute_enumerator = (void*)enumerator_create_empty,
+ 			},
+ 			.create_dns_enumerator = _create_dns_enumerator,
+ 			.destroy = _destroy,
+diff --git a/src/libsimaka/simaka_crypto.h b/src/libsimaka/simaka_crypto.h
+index 9881c53ee..81c95436a 100644
+--- a/src/libsimaka/simaka_crypto.h
++++ b/src/libsimaka/simaka_crypto.h
+@@ -22,6 +22,7 @@
+ #define SIMAKA_CRYPTO_H_
+ 
+ #include <library.h>
++#include "eap/eap.h"
+ 
+ typedef struct simaka_crypto_t simaka_crypto_t;
+ 
+@@ -109,6 +110,6 @@ struct simaka_crypto_t {
+  *
+  * @return		EAP-SIM/AKA crypto instance, NULL if algorithms missing
+  */
+-simaka_crypto_t *simaka_crypto_create();
++simaka_crypto_t *simaka_crypto_create(eap_type_t type);
+ 
+ #endif /** SIMAKA_CRYPTO_H_ @}*/
+diff --git a/src/libstrongswan/processing/scheduler.c b/src/libstrongswan/processing/scheduler.c
+index 903b097a1..296d8ad93 100644
+--- a/src/libstrongswan/processing/scheduler.c
++++ b/src/libstrongswan/processing/scheduler.c
+@@ -328,7 +328,7 @@ scheduler_t * scheduler_create()
+ 	this->heap = (event_t**)calloc(this->heap_size + 1, sizeof(event_t*));
+ 
+ 	job = callback_job_create_with_prio((callback_job_cb_t)schedule, this,
+-										NULL, return_false, JOB_PRIO_CRITICAL);
++										NULL, (void*)return_false, JOB_PRIO_CRITICAL);
+ 	lib->processor->queue_job(lib->processor, (job_t*)job);
+ 
+ 	return &this->public;
+diff --git a/src/libstrongswan/utils/identification.c b/src/libstrongswan/utils/identification.c
+index 0175f8da9..b51a5cedc 100644
+--- a/src/libstrongswan/utils/identification.c
++++ b/src/libstrongswan/utils/identification.c
+@@ -1373,7 +1373,7 @@ static private_identification_t *identification_create(id_type_t type)
+ 			this->public.hash = _hash_binary;
+ 			this->public.equals = _equals_binary;
+ 			this->public.matches = _matches_any;
+-			this->public.contains_wildcards = return_true;
++			this->public.contains_wildcards = (void*)return_true;
+ 			break;
+ 		case ID_FQDN:
+ 		case ID_RFC822_ADDR:
+@@ -1404,13 +1404,13 @@ static private_identification_t *identification_create(id_type_t type)
+ 			this->public.hash = _hash_binary;
+ 			this->public.equals = _equals_binary;
+ 			this->public.matches = _matches_range;
+-			this->public.contains_wildcards = return_false;
++			this->public.contains_wildcards = (void*)return_false;
+ 			break;
+ 		default:
+ 			this->public.hash = _hash_binary;
+ 			this->public.equals = _equals_binary;
+ 			this->public.matches = _matches_binary;
+-			this->public.contains_wildcards = return_false;
++			this->public.contains_wildcards = (void*)return_false;
+ 			break;
+ 	}
+ 	return this;
+diff --git a/src/pki/command.c b/src/pki/command.c
+index 778f2a2cf..84df745de 100644
+--- a/src/pki/command.c
++++ b/src/pki/command.c
+@@ -243,7 +243,7 @@ int command_usage(char *error)
+ /**
+  * Show usage information
+  */
+-static int help(int c, char *v[])
++static int help()
+ {
+ 	return command_usage(NULL);
+ }

@@ -1,0 +1,379 @@
+"""
+config.py - Persistent manager state (global settings + per-SIM instances).
+
+Stored as YAML at $VOWIFI_DATA/config.yaml. Threadsafe-ish via a module lock; the
+manager is single-process. Instances describe SIMs; render_instance_json() converts an
+instance into the engine's /config/instance.json contract.
+"""
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import socket
+import threading
+from copy import deepcopy
+
+import yaml
+
+DATA_DIR = os.environ.get("VOWIFI_DATA", os.path.join(os.getcwd(), "data"))
+CONFIG_PATH = os.path.join(DATA_DIR, "config.yaml")
+_lock = threading.RLock()
+
+DEFAULTS = {
+    "settings": {
+        "http_port": 8443,
+        "bind": "0.0.0.0",
+        "tls": {"self_signed": True, "domain": "", "cert_path": "", "key_path": ""},
+        "debug": {"asterisk": True, "charon": False, "pcap": False},
+        "manager_url": "",          # reachable URL engines POST events to (auto if empty)
+        "retry": {"max": 3, "interval": 30},   # auto-retry attempts + seconds per attempt
+        # Outbound ring timeout (s): how long Asterisk lets an outgoing call ring before it
+        # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
+        # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
+        "ring_timeout": 35,
+    },
+    "instances": {},
+}
+
+# Port block allocation per instance index (avoids collisions across SIMs)
+PORT_BASE = {"sip_udp": 5060, "sip_tls": 5061, "webrtc": 8089, "ami": 5038,
+             "rtp_start": 10000, "rtp_end": 11000}
+PORT_STRIDE = {"sip_udp": 10, "sip_tls": 10, "webrtc": 10, "ami": 10,
+               "rtp_start": 2000, "rtp_end": 2000}
+
+
+def _host_lan_ipv4() -> str:
+    """Best-effort primary LAN IPv4 of the host the manager runs on. Used as the address
+    Asterisk advertises to LOCAL SIP clients (Contact + SDP), so a LAN MicroSIP can route
+    in-dialog requests (BYE) back to the published host port instead of the unroutable
+    docker-bridge container IP. Uses a UDP connect (no traffic sent) to learn the source
+    address the kernel would pick for outbound; returns "" if it can't be determined."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+        return ip if ip and not ip.startswith("127.") else ""
+    except Exception:
+        return ""
+    finally:
+        s.close()
+
+
+def ims_realm(mcc: str, mnc: str) -> str:
+    """The carrier's IMS home-network realm, derived purely from the SIM's MCC/MNC per the
+    3GPP naming scheme: ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org, with the MNC zero-padded to 3
+    digits (matches the engine's render.py so control-side SMS/AMI addressing and the engine's
+    registration realm agree, including for 2-digit-MNC carriers)."""
+    return f"ims.mnc{str(mnc).zfill(3)}.mcc{str(mcc)}.3gppnetwork.org"
+
+
+def advertise_address(settings: dict) -> str:
+    """The host-reachable address to advertise to local SIP clients. Precedence: explicit
+    TLS domain (already used as the TLS external address) > VOWIFI_ADVERTISE_ADDR env >
+    settings.advertise_address > auto-detected host LAN IPv4.
+
+    The env override matters when the control plane itself runs in a (bridge-networked)
+    container: _host_lan_ipv4() would then return the container's docker-bridge IP, not the
+    host LAN IP a SIP/WebRTC client must reach. The installer passes the real host IP in
+    VOWIFI_ADVERTISE_ADDR."""
+    tls_domain = (settings.get("tls", {}) or {}).get("domain", "")
+    return (tls_domain or os.environ.get("VOWIFI_ADVERTISE_ADDR", "")
+            or settings.get("advertise_address", "") or _host_lan_ipv4())
+
+
+def _ensure():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "w") as f:
+            yaml.safe_dump(DEFAULTS, f)
+
+
+def load() -> dict:
+    with _lock:
+        _ensure()
+        with open(CONFIG_PATH) as f:
+            data = yaml.safe_load(f) or {}
+        # merge defaults (shallow for settings)
+        out = deepcopy(DEFAULTS)
+        out["settings"].update(data.get("settings", {}))
+        if "tls" in data.get("settings", {}):
+            out["settings"]["tls"] = {**DEFAULTS["settings"]["tls"], **data["settings"]["tls"]}
+        out["settings"]["retry"] = {**DEFAULTS["settings"]["retry"],
+                                    **(data.get("settings", {}).get("retry", {}))}
+        out["instances"] = data.get("instances", {})
+        return out
+
+
+def save(data: dict):
+    with _lock:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+        os.replace(tmp, CONFIG_PATH)
+
+
+def get_settings() -> dict:
+    return load()["settings"]
+
+
+def update_settings(patch: dict) -> dict:
+    data = load()
+    data["settings"].update(patch)
+    save(data)
+    return data["settings"]
+
+
+def list_instances() -> list:
+    return list(load()["instances"].values())
+
+
+def get_instance(iid: str) -> dict | None:
+    return load()["instances"].get(str(iid))
+
+
+def _alloc_ports(index: int) -> dict:
+    """The nominal port block for an instance index (no conflict checking)."""
+    return {k: PORT_BASE[k] + index * PORT_STRIDE[k] for k in PORT_BASE}
+
+
+# How many RTP host ports the engine actually publishes (engine.start binds rtp_start..+60).
+RTP_SPAN = 60
+# Valid user-selectable SIP port range (avoid well-known/privileged ports).
+MIN_USER_PORT, MAX_USER_PORT = 1024, 65535
+
+
+def _block_ports(block: dict) -> set[int]:
+    """Every host port a port-block occupies: the 4 fixed services + the RTP span."""
+    used = {block["sip_udp"], block["sip_tls"], block["webrtc"], block["ami"]}
+    used |= set(range(block["rtp_start"], block["rtp_start"] + RTP_SPAN))
+    return used
+
+
+def _reserved_ports(data: dict, exclude_iid: str | None = None) -> set[int]:
+    """All host ports already reserved by OTHER instances (from their stored port blocks)."""
+    used: set[int] = set()
+    for iid, inst in data["instances"].items():
+        if exclude_iid is not None and str(iid) == str(exclude_iid):
+            continue
+        p = inst.get("ports")
+        if p:
+            used |= _block_ports(p)
+    return used
+
+
+def _host_port_free(port: int) -> bool:
+    """True if the host isn't already LISTENing on this TCP or UDP port. Best-effort:
+    we try to bind; EADDRINUSE => taken. Uses SO_REUSEADDR off so an active listener
+    is detected. Any unexpected error is treated as 'free' (don't block provisioning)."""
+    for fam, typ in ((socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET, socket.SOCK_DGRAM)):
+        s = socket.socket(fam, typ)
+        try:
+            s.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+        except Exception:
+            pass
+        finally:
+            s.close()
+    return True
+
+
+def _block_free(block: dict, reserved: set[int]) -> bool:
+    """A candidate block is usable if none of its ports collide with reserved ports and
+    none of its 4 service ports are already listening on the host."""
+    bp = _block_ports(block)
+    if bp & reserved:
+        return False
+    # Only probe the 4 service ports on the host (probing 60 RTP ports every try is slow;
+    # RTP conflicts are caught by the reserved-set check against other instances).
+    for port in (block["sip_udp"], block["sip_tls"], block["webrtc"], block["ami"]):
+        if not _host_port_free(port):
+            return False
+    return True
+
+
+def alloc_ports_auto(data: dict, exclude_iid: str | None = None) -> dict:
+    """Automatic port allocation: scan index blocks from 0 upward and take the first whose
+    whole port block collides with neither another instance nor a live host listener. This
+    is the default behaviour. Starting at 0 (not next_index) means re-provisioning a line
+    back to Auto reclaims the lowest free block instead of drifting ever upward."""
+    reserved = _reserved_ports(data, exclude_iid)
+    for index in range(0, 500):                    # generous bound; ~500 lines is absurd
+        block = _alloc_ports(index)
+        if max(_block_ports(block)) > MAX_USER_PORT:
+            break
+        if _block_free(block, reserved):
+            return block
+    raise ValueError("no free port block available for a new line")
+
+
+def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None) -> dict:
+    """Manual port selection: the user picks the SIP UDP port; the rest of the block is
+    derived from it at the same offsets as the nominal layout, so one number configures
+    the whole line. Validates range and checks the whole derived block for conflicts.
+    Raises ValueError with a user-facing message on any problem."""
+    if not isinstance(sip_udp, int):
+        raise ValueError("port must be a number")
+    if not (MIN_USER_PORT <= sip_udp <= MAX_USER_PORT):
+        raise ValueError(f"port must be between {MIN_USER_PORT} and {MAX_USER_PORT}")
+    # Derive the block from the SIP UDP base using the nominal per-service offsets.
+    base0 = _alloc_ports(0)
+    off = {k: base0[k] - base0["sip_udp"] for k in PORT_BASE}   # sip_udp offset = 0
+    block = {k: sip_udp + off[k] for k in PORT_BASE}
+    if max(_block_ports(block)) > MAX_USER_PORT:
+        raise ValueError(f"port {sip_udp} is too high — its RTP range would exceed {MAX_USER_PORT}")
+    reserved = _reserved_ports(data, exclude_iid)
+    clash = _block_ports(block) & reserved
+    if clash:
+        if sip_udp in clash or block["sip_tls"] in clash:
+            raise ValueError(f"port {sip_udp} is already used by another line. "
+                             f"Choose a different port or use Automatic.")
+        # A derived service/RTP port (WebRTC/control/RTP) overlaps a neighbouring line's
+        # block. Tell the user what to avoid without exposing internal port math.
+        raise ValueError(f"port {sip_udp} overlaps another line's port range "
+                         f"(conflict at {min(clash)}). Try a port at least 10 away, or "
+                         f"use Automatic.")
+    for port, name in ((block["sip_udp"], "SIP/UDP"), (block["sip_tls"], "SIP/TLS"),
+                       (block["webrtc"], "WebRTC"), (block["ami"], "control")):
+        if not _host_port_free(port):
+            raise ValueError(f"port {port} ({name}) is already in use on the host. "
+                             f"Choose a different port or use Automatic.")
+    return block
+
+
+def next_index(data: dict) -> int:
+    used = {inst.get("index", 0) for inst in data["instances"].values()}
+    i = 0
+    while i in used:
+        i += 1
+    return i
+
+
+def upsert_instance(inst: dict) -> dict:
+    data = load()
+    iid = str(inst["id"])
+    # Runtime-only fields sometimes ride along on the instance object (the API returns
+    # instances with a computed `status` and `has_pin`); never persist them to config.
+    inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
+    existing = data["instances"].get(iid, {})
+    if "index" not in existing:
+        inst["index"] = next_index(data)
+    else:
+        inst["index"] = existing["index"]
+    # Port block: keep an existing/explicit block; otherwise auto-allocate a conflict-free
+    # one (checks other instances AND live host listeners, stepping forward on collision).
+    if "ports" not in inst:
+        inst["ports"] = existing.get("ports") or alloc_ports_auto(data, exclude_iid=iid)
+    if "ami_secret" not in inst:
+        inst["ami_secret"] = existing.get("ami_secret") or secrets.token_urlsafe(16)
+    # The SIM PIN is a locally-saved credential tied to this IMSI/ICCID; it is used on
+    # every engine start. A config edit that doesn't carry a (new, non-empty) PIN must NOT
+    # wipe the stored one — otherwise saving unrelated fields (IMEI, SMSC, SIP accounts…)
+    # would silently drop the PIN and break the next start. Only an explicit non-empty PIN
+    # updates it; clearing is done deliberately elsewhere (wrong-PIN / PIN-removed handling).
+    if not inst.get("pin"):
+        inst.pop("pin", None)
+        if existing.get("pin"):
+            inst["pin"] = existing["pin"]
+    merged = {**existing, **inst}
+    # Ensure a STABLE WebRTC softphone credential (used by both the Asterisk config and
+    # the softphone provisioning endpoint — they must match).
+    sip = merged.setdefault("sip", {})
+    wr = sip.setdefault("webrtc", {})
+    wr.setdefault("username", "webrtc")
+    if not wr.get("password"):
+        prev = (existing.get("sip", {}) or {}).get("webrtc", {}) or {}
+        wr["password"] = prev.get("password") or secrets.token_urlsafe(12)
+    data["instances"][iid] = merged
+    save(data)
+    return merged
+
+
+def clear_pin(iid: str) -> bool:
+    """Delete the saved SIM PIN for an instance. Returns True if a PIN was removed. The
+    line will then require the PIN to be re-entered before it can start again (used by the
+    'Delete saved PIN' action and by wrong-PIN / PIN-removed handling)."""
+    data = load()
+    inst = data["instances"].get(str(iid))
+    if not inst:
+        return False
+    had = bool(inst.get("pin"))
+    inst["pin"] = ""
+    save(data)
+    return had
+
+
+def delete_instance(iid: str):
+    data = load()
+    data["instances"].pop(str(iid), None)
+    save(data)
+
+
+def render_instance_json(inst: dict, settings: dict) -> dict:
+    """Convert a stored instance into the engine /config/instance.json contract."""
+    ports = inst.get("ports", _alloc_ports(inst.get("index", 0)))
+    sip = inst.get("sip", {}) or {}
+    webrtc = sip.get("webrtc", {}) or {}
+    return {
+        "id": str(inst["id"]),
+        "imsi": inst["imsi"],
+        "mcc": inst["mcc"],
+        "mnc": inst["mnc"],
+        "imei": inst.get("imei", ""),
+        "pin": inst.get("pin", ""),
+        "reader": inst.get("reader") or f"imsi:{inst['imsi']}",
+        "iccid": inst.get("iccid", ""),
+        "msisdn": inst.get("msisdn", ""),
+        "smsc": inst.get("smsc", ""),
+        "pcscf": inst.get("pcscf", ""),
+        "ami_user": inst.get("ami_user", "vowifi"),
+        "ami_secret": inst["ami_secret"],
+        # Where engine notify.py POSTs events. Explicit setting wins; else VOWIFI_MANAGER_URL
+        # env (the installer sets this to the PUBLISHED host port when the control plane runs
+        # in a bridge-networked container with a non-8443 port map); else the default assumes
+        # a 1:1 host.docker.internal:<http_port> mapping.
+        "manager_url": settings.get("manager_url")
+                       or os.environ.get("VOWIFI_MANAGER_URL")
+                       or f"https://host.docker.internal:{settings.get('http_port', 8443)}",
+        "domain": settings.get("tls", {}).get("domain", ""),
+        "rtp_start": ports["rtp_start"],
+        # The engine publishes only rtp_start..rtp_start+RTP_SPAN-1 host ports (engine.start),
+        # so the Asterisk RTP pool (rtp.conf rtpend) MUST match that published window — a port
+        # picked above it would be unreachable from a LAN WebRTC client → no/one-way audio. Cap
+        # rtp_end to the published span rather than the (larger) block-allocation rtp_end.
+        "rtp_end": min(ports["rtp_end"], ports["rtp_start"] + RTP_SPAN - 1),
+        "sip": {
+            "listen_addr": sip.get("listen_addr", "0.0.0.0"),
+            "transport": sip.get("transport", "udp"),
+            "udp_port": 5060,       # inside container; host maps ports["sip_udp"]
+            "tls_port": 5061,
+            "external": sip.get("external", []),
+            "advertise_address": advertise_address(settings),
+            # Outbound ring timeout: per-line override (sip.ring_timeout) wins, else the global
+            # settings default, else 35s. Clamped to a sane 5..180 range.
+            "ring_timeout": max(5, min(180, int(
+                sip.get("ring_timeout") or settings.get("ring_timeout", 35)))),
+            "user_agent": sip.get("user_agent", "iOS/26.6 iPhone"),
+            "pani": sip.get("pani", ""),
+            "webrtc": {
+                "enable": bool(webrtc.get("enable", True)),
+                "username": webrtc.get("username", "webrtc"),
+                "password": webrtc.get("password") or "webrtc-secret",
+                "port": 8089,
+            },
+        },
+        "debug": inst.get("debug", settings.get("debug", {})),
+    }
+
+
+def write_instance_json(inst: dict, settings: dict) -> str:
+    d = os.path.join(DATA_DIR, "instances", str(inst["id"]))
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "instance.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(render_instance_json(inst, settings), f, indent=2)
+    os.replace(tmp, path)
+    return path
