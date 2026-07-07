@@ -362,12 +362,22 @@ MODIFIED_BEARER                         = 42020
 APN_AMBR                                = 42094
 EXTENDED_APN_AMBR                       = 42095
 N1_MODE_CAPABILITY                      = 51015
+N1_MODE_INFORMATION                     = 51115
+N1_MODE_S_NSSAI_PLMN_ID                 = 52216
+DNS_SRV_SEC_INFO_IND                    = 52301
+DNS_SRV_SEC_INFO                        = 52302
+ATSSS_REQUEST                           = 52331
+ATSSS_RESPONSE                          = 52332
+HPA_INFO                                = 55911
 
-# Reverse lookup: IKEv2 Notify Message Type value -> name, for debug logging of received
-# Notify payloads (helps diagnose ePDG behaviour and prepares for fuller 3GPP support). Only
-# genuine Notify Message Types are listed (RFC 7296 + 3GPP TS 24.302 / IANA), so protocol-ID
-# and transform constants that happen to share integer values are not confused for notifies.
+# Reverse lookup: IKEv2 Notify Message Type value -> name, for decode/logging of received
+# Notify payloads and for responding correctly to ePDG requests (3GPP TS 24.302 clause 8.1.2).
+# Covers RFC 7296 status/error notifies plus the FULL 3GPP private ranges:
+#   Table 8.1.2.2-1 (Private Error Types)  and  Table 8.1.2.3-1 (Private Status Types).
+# Only genuine Notify Message Types are listed (so protocol-ID and transform constants that
+# happen to share integer values are never confused for notifies).
 NOTIFY_TYPE_NAMES = {
+    # ---- RFC 7296 error types (< 16384) ----
     1: "UNSUPPORTED_CRITICAL_PAYLOAD", 4: "INVALID_IKE_SPI", 5: "INVALID_MAJOR_VERSION",
     7: "INVALID_SYNTAX", 9: "INVALID_MESSAGE_ID", 11: "INVALID_SPI",
     14: "NO_PROPOSAL_CHOSEN", 17: "INVALID_KE_PAYLOAD", 24: "AUTHENTICATION_FAILED",
@@ -375,28 +385,102 @@ NOTIFY_TYPE_NAMES = {
     37: "FAILED_CP_REQUIRED", 38: "TS_UNACCEPTABLE", 39: "INVALID_SELECTORS",
     40: "UNACCEPTABLE_ADDRESSES", 41: "UNEXPECTED_NAT_DETECTED", 43: "TEMPORARY_FAILURE",
     44: "CHILD_SA_NOT_FOUND",
-    # 3GPP / private-use error range
+    # ---- 3GPP TS 24.302 Table 8.1.2.2-1: Private Error Types ----
     8192: "PDN_CONNECTION_REJECTION", 8193: "MAX_CONNECTION_REACHED",
-    8244: "NO_APN_SUBSCRIPTION", 9001: "USER_UNKNOWN", 9002: "NO_APN_SUBSCRIPTION",
-    9003: "AUTHORIZATION_REJECTED", 9006: "ILLEGAL_ME", 10500: "NETWORK_FAILURE",
-    11001: "RAT_TYPE_NOT_ALLOWED", 11005: "IMEI_NOT_ACCEPTED", 11011: "PLMN_NOT_ALLOWED",
-    11055: "UNAUTHENTICATED_EMERGENCY_NOT_SUPPORTED",
-    # status range (>= 16384)
+    8241: "SEMANTIC_ERROR_IN_THE_TFT_OPERATION",
+    8242: "SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION",
+    8244: "SEMANTIC_ERRORS_IN_PACKET_FILTERS",
+    8245: "SYNTACTICAL_ERRORS_IN_PACKET_FILTERS",
+    9000: "NON_3GPP_ACCESS_TO_EPC_NOT_ALLOWED", 9001: "USER_UNKNOWN",
+    9002: "NO_APN_SUBSCRIPTION", 9003: "AUTHORIZATION_REJECTED", 9006: "ILLEGAL_ME",
+    10500: "NETWORK_FAILURE", 11001: "RAT_TYPE_NOT_ALLOWED", 11005: "IMEI_NOT_ACCEPTED",
+    11011: "PLMN_NOT_ALLOWED", 11055: "UNAUTHENTICATED_EMERGENCY_NOT_SUPPORTED",
+    # ---- RFC 7296 status types (>= 16384) ----
     16384: "INITIAL_CONTACT", 16385: "SET_WINDOW_SIZE", 16386: "ADDITIONAL_TS_POSSIBLE",
     16387: "IPCOMP_SUPPORTED", 16388: "NAT_DETECTION_SOURCE_IP",
     16389: "NAT_DETECTION_DESTINATION_IP", 16390: "COOKIE", 16391: "USE_TRANSPORT_MODE",
     16392: "HTTP_CERT_LOOKUP_SUPPORTED", 16393: "REKEY_SA",
     16394: "ESP_TFC_PADDING_NOT_SUPPORTED", 16395: "NON_FIRST_FRAGMENTS_ALSO",
-    16417: "EAP_ONLY_AUTHENTICATION", 40961: "REACTIVATION_REQUESTED_CAUSE",
-    41041: "BACKOFF_TIMER", 41101: "DEVICE_IDENTITY", 41112: "EMERGENCY_SUPPORT",
+    16417: "EAP_ONLY_AUTHENTICATION",
+    # ---- 3GPP TS 24.302 Table 8.1.2.3-1: Private Status Types ----
+    40961: "REACTIVATION_REQUESTED_CAUSE", 41041: "BACKOFF_TIMER",
+    41050: "PDN_TYPE_IPv4_ONLY_ALLOWED", 41051: "PDN_TYPE_IPv6_ONLY_ALLOWED",
+    41101: "DEVICE_IDENTITY", 41112: "EMERGENCY_SUPPORT",
     41134: "EMERGENCY_CALL_NUMBERS", 41288: "NBIFOM_GENERIC_CONTAINER",
-    41304: "P_CSCF_RESELECTION_SUPPORT", 41501: "PTI", 42014: "EPS_QOS",
+    41304: "P_CSCF_RESELECTION_SUPPORT", 41501: "PTI",
+    42011: "IKEV2_MULTIPLE_BEARER_PDN_CONNECTIVITY", 42014: "EPS_QOS",
     42015: "EXTENDED_EPS_QOS", 42017: "TFT", 42020: "MODIFIED_BEARER",
     42094: "APN_AMBR", 42095: "EXTENDED_APN_AMBR", 51015: "N1_MODE_CAPABILITY",
+    51115: "N1_MODE_INFORMATION", 52216: "N1_MODE_S_NSSAI_PLMN_ID",
+    52301: "DNS_SRV_SEC_INFO_IND", 52302: "DNS_SRV_SEC_INFO",
+    52331: "ATSSS_REQUEST", 52332: "ATSSS_RESPONSE", 55911: "HPA_INFO",
+}
+
+# Friendly, human-readable descriptions for the 3GPP TS 24.302 private Notify types (Tables
+# 8.1.2.2-1 and 8.1.2.3-1). Used to render errors/status in the IKE log so operators do not
+# have to look up the numeric code. Keyed by Notify Message Type value.
+NOTIFY_DESCRIPTIONS = {
+    # ---- Private Error Types (Table 8.1.2.2-1) ----
+    8192: "PDN connection (for the IP address in the notify data) was rejected by the network",
+    8193: "Max PDN connections for this APN reached; no more can be established (first-conn "
+          "rejection means the APN is not allowed for this UE)",
+    8241: "Requested service rejected: semantic error in the TFT operation in the request",
+    8242: "Requested service rejected: syntactical error in the TFT operation in the request",
+    8244: "Requested service rejected: semantic error in the packet filter(s) in the request",
+    8245: "Requested service rejected: syntactical error in the packet filter(s) in the request",
+    9000: "Non-3GPP access to EPC not allowed (no non-3GPP subscription / policy) "
+          "[DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION]",
+    9001: "User unknown - the IMSI is not known to the network [DIAMETER_ERROR_USER_UNKNOWN]",
+    9002: "No APN subscription - requested APN not in the user profile "
+          "[DIAMETER_ERROR_USER_NO_APN_SUBSCRIPTION]",
+    9003: "Authorization rejected - user barred from non-3GPP access or this APN "
+          "[DIAMETER_AUTHORIZATION_REJECTED]",
+    9006: "Illegal ME - the mobile equipment is not accepted by the network "
+          "[DIAMETER_ERROR_ILLEGAL_EQUIPMENT]",
+    10500: "Network failure - the requested procedure could not be completed "
+           "[DIAMETER_ERROR_UNABLE_TO_COMPLY]",
+    11001: "RAT type not allowed - access type is restricted for this user "
+           "[DIAMETER_RAT_TYPE_NOT_ALLOWED]",
+    11005: "IMEI not accepted - emergency request using an IMEI was rejected",
+    11011: "PLMN not allowed - roaming/PLMN filtering rejected the request "
+           "[DIAMETER_ERROR_ROAMING_NOT_ALLOWED]",
+    11055: "Unauthenticated emergency not supported - emergency with unauthenticated IMSI "
+           "rejected (auth failed / cannot proceed at AAA)",
+    # ---- Private Status Types (Table 8.1.2.3-1) ----
+    40961: "Reactivation requested - the IPsec tunnel was released; UE should re-establish it "
+           "for the same PDN connection",
+    41041: "Backoff timer - network-supplied backoff timer value (GPRS timer 3)",
+    41050: "Only PDN type IPv4 is allowed for the requested PDN connectivity",
+    41051: "Only PDN type IPv6 is allowed for the requested PDN connectivity",
+    41101: "Device identity - the ePDG requests (or the UE supplies) the IMEI/IMEISV",
+    41112: "Emergency support - the ePDG supports emergency service",
+    41134: "Emergency call numbers - local emergency numbers provided by the ePDG",
+    41288: "NBIFOM generic container",
+    41304: "P-CSCF reselection support (P-CSCF restoration extension for untrusted WLAN)",
+    41501: "PTI - procedure transaction identity for an ePDG-initiated modification",
+    42011: "IKEv2 multiple bearer PDN connectivity support",
+    42014: "EPS QoS",
+    42015: "Extended EPS QoS",
+    42017: "TFT (traffic flow template)",
+    42020: "Modified bearer - sender's ESP SPI",
+    42094: "APN-AMBR",
+    42095: "Extended APN-AMBR",
+    51015: "N1 mode capability / PDU session ID",
+    51115: "N1 mode information (S-NSSAI)",
+    52216: "N1 mode S-NSSAI PLMN ID",
+    52301: "DNS server security info indication",
+    52302: "DNS server security info",
+    52331: "ATSSS request parameters",
+    52332: "ATSSS response parameters",
+    55911: "High priority access info",
 }
 
 def notify_name(value):
     return NOTIFY_TYPE_NAMES.get(value, "UNKNOWN")
+
+def notify_describe(value):
+    """Return a human-friendly one-line description for a Notify Message Type, or '' if none."""
+    return NOTIFY_DESCRIPTIONS.get(value, "")
 
 #IKEv2 Authenticaton Method
 RSA_DIGITAL_SIGNATURE             = 1
@@ -1165,6 +1249,9 @@ class swu():
                 extra = " data=" + (hexd if len(hexd) <= 64 else hexd[:64] + "...")
             if spi:
                 extra += " spi=" + spi.hex()
+            desc = notify_describe(ntype)
+            if desc:
+                extra += "  # " + desc
             swu_log("received Notify: %s (%d, %s) protocol=%d%s" %
                     (notify_name(ntype), ntype, klass, proto, extra))
         except Exception:
@@ -2391,15 +2478,124 @@ class swu():
         return encrypted_and_integrity_packet
 
     def answer_INFORMATIONAL_delete_CHILD(self,protocol,spi_list = b''):
-        
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, D, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])        
-       
-        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_d(protocol,spi_list))        
-        packet = self.set_ike_packet_length(header+payload)        
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
+
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, D, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+
+        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_d(protocol,spi_list))
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
-  
+
+    def answer_INFORMATIONAL_empty(self):
+        """Empty INFORMATIONAL response (no payloads). Used to acknowledge a Dead-Peer-Detection
+        liveness check (RFC 7296 clause 2.4) and any ePDG-initiated INFORMATIONAL request we do
+        not need to add payloads to. Mirrors the responder SPIs/message-id of the request."""
+        if self.old_ike_message_received == True:
+            header = self.encode_header(self.ike_spi_initiator_old, self.ike_spi_responder_old, NONE, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        else:
+            header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, NONE, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        packet = self.set_ike_packet_length(header)
+        return self.encode_payload_type_sk(packet)
+
+    def answer_INFORMATIONAL_device_identity(self):
+        """INFORMATIONAL response carrying a DEVICE_IDENTITY Notify (3GPP TS 24.302 clause 7.2.6):
+        the ePDG asked for the Mobile Equipment Identity after tunnel establishment via an
+        INFORMATIONAL request with an empty-value DEVICE_IDENTITY notify; answer with our
+        IMEISV (preferred) or IMEI."""
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',DEVICE_IDENTITY,self.encode_device_identity_notification_data()))
+        packet = self.set_ike_packet_length(header+payload)
+        return self.encode_payload_type_sk(packet)
+
+    def answer_INFORMATIONAL_notify(self, notify_message_type, notification_data=b''):
+        """INFORMATIONAL response carrying a single arbitrary Notify. Generic helper for
+        acknowledging ePDG-initiated status requests where we must echo a specific notify."""
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',notify_message_type,notification_data))
+        packet = self.set_ike_packet_length(header+payload)
+        return self.encode_payload_type_sk(packet)
+
+    def log_notify_error(self, code, context=""):
+        """Log a received Private/RFC7296 error-type Notify with its friendly name + description
+        (3GPP TS 24.302 Table 8.1.2.2-1). Central place so every auth-flow error site renders the
+        numeric code in human terms instead of a bare integer."""
+        name = notify_name(code)
+        desc = notify_describe(code)
+        where = (" during %s" % context) if context else ""
+        if desc:
+            swu_log("received ERROR Notify%s: %s (%d) - %s" % (where, name, code, desc))
+        else:
+            swu_log("received ERROR Notify%s: %s (%d)" % (where, name, code))
+
+    @staticmethod
+    def decode_backoff_timer(value_byte):
+        """Decode a one-octet GPRS timer 3 value (3GPP TS 24.008 clause 10.5.7.4a) carried in a
+        BACKOFF_TIMER Notify (clause 8.2.9.1). Returns (seconds_or_None, human_text).
+        Unit is bits 6-8, timer value is bits 1-5. Unit 7 = deactivated/no timer."""
+        unit = (value_byte >> 5) & 0x07
+        val = value_byte & 0x1F
+        if unit == 0:   return (val * 2,      "%d s" % (val * 2))          # 2 s increments
+        if unit == 1:   return (val * 60,     "%d min" % val)              # 1 min increments
+        if unit == 2:   return (val * 600,    "%d min" % (val * 10))       # 10 min increments
+        if unit == 3:   return (val * 3600,   "%d h" % val)                # 1 hour increments
+        if unit == 4:   return (val * 36000,  "%d h" % (val * 10))         # 10 hour increments
+        if unit == 5:   return (val * 120,    "%d min" % (val * 2))        # 2 min increments  (release 10+)
+        if unit == 6:   return (val * 30,     "%d s" % (val * 30))         # 30 s increments
+        return (None, "deactivated")                                       # unit == 7
+
+    def handle_INFORMATIONAL_request(self):
+        """Handle an ePDG-initiated INFORMATIONAL *request* received while CONNECTED that is NOT
+        a DELETE (those go through state_delete). Covers:
+          - Dead-Peer-Detection liveness check (empty request)  -> empty response  [RFC 7296 2.4]
+          - DEVICE_IDENTITY request (empty value)               -> answer IMEISV/IMEI [TS 24.302 7.2.6]
+          - REACTIVATION_REQUESTED_CAUSE (usually with DELETE, handled there)
+          - any other status notify (bearer mod, PTI, ...)      -> acknowledge with empty response
+        Every payload is logged with its friendly name so operators can see what the ePDG asked.
+        Returns True if a response was sent, False if the message was not an INFORMATIONAL request
+        we recognised (caller may fall through)."""
+        device_identity_requested = False
+        saw_notify = False
+        payload_names = []
+        for i in self.decoded_payload[0][1]:
+            if i[0] == N:
+                saw_notify = True
+                ntype = i[1][1]
+                ndata = i[1][3]
+                payload_names.append(notify_name(ntype))
+                if ntype == DEVICE_IDENTITY:
+                    # Identity Value empty (only the 1-byte identity type present, or nothing) =>
+                    # the ePDG is asking us for the ME identity.
+                    id_type = ndata[-1] if ndata else None
+                    # notification_data layout for a request is [len(2)][identity type(1)] with no
+                    # value; treat <=3 bytes as "value empty" -> a request, not an echo of ours.
+                    if ndata is None or len(ndata) <= 3:
+                        device_identity_requested = True
+                        # honour the requested identity type (0x01 IMEI / 0x02 IMEISV); default IMEISV
+                        self.device_identity_type = id_type if id_type in (0x01, 0x02) else 0x02
+                elif ntype == BACKOFF_TIMER:
+                    secs, txt = (None, "")
+                    if ndata and len(ndata) >= 1:
+                        secs, txt = self.decode_backoff_timer(ndata[-1])
+                    swu_log("INFORMATIONAL: BACKOFF_TIMER = %s" % (txt or "?"))
+
+        # A DEVICE_IDENTITY request wins: answer with our identity.
+        if device_identity_requested:
+            swu_log("INFORMATIONAL request: ePDG asked for DEVICE_IDENTITY; answering")
+            self.send_data(self.answer_INFORMATIONAL_device_identity())
+            return True
+
+        if saw_notify:
+            swu_log("INFORMATIONAL request (status: %s); acknowledging" % ", ".join(payload_names))
+            self.send_data(self.answer_INFORMATIONAL_empty())
+            return True
+
+        # No payloads at all => Dead-Peer-Detection liveness probe. Must answer or the ePDG tears
+        # the tunnel down for being unresponsive.
+        swu_log("INFORMATIONAL request (DPD liveness check); answering")
+        self.send_data(self.answer_INFORMATIONAL_empty())
+        return True
+
 
     def create_INFORMATIONAL_delete(self,protocol,spi_list = b''):
         
@@ -2599,10 +2795,24 @@ class swu():
                     if i[1][1] == DEVICE_IDENTITY:
                         self.device_identity_requested = True
                         self.device_identity_type = i[1][3][-1] if i[1][3] else None
-                        
+
                     elif i[1][1]<16384: #error
-                        return OTHER_ERROR,str(i[1][1])
-                elif i[0] == EAP:
+                        code = i[1][1]
+                        if code == AUTHENTICATION_FAILED:
+                            # The ePDG rejected our identity at IKE_AUTH *before* sending any
+                            # EAP-AKA challenge — the SIM was never queried. This is an AAA/HSS
+                            # decision, NOT a SIM/PIN problem. Typical causes: the line is not
+                            # subscribed/provisioned for VoWiFi, or the ePDG refuses attaches
+                            # from this (foreign) source IP. Nothing tunable on our side fixes it.
+                            swu_log("IKE_AUTH rejected with AUTHENTICATION_FAILED before any "
+                                    "EAP-AKA challenge (SIM not queried). The ePDG/AAA refused "
+                                    "the identity: the SIM is likely not provisioned for VoWiFi, "
+                                    "or the ePDG blocks this source IP/region. NAI=%s APN(IDr)=%s" %
+                                    (self.identification_initiator[1] if self.identification_initiator else "?",
+                                     self.identification_responder[1] if self.identification_responder else "?"))
+                        else:
+                            self.log_notify_error(code, "IKE_AUTH")
+                        return OTHER_ERROR,str(code)
    
                     if i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
                         if i[1][3] in (AKA_Challenge, AKA_Reauthentication):
@@ -2797,8 +3007,9 @@ class swu():
                 
                 if i[0] == N:    #protocol_id, notify_message_type, spi, notification_data
                     if i[1][1]<16384: #error
+                        self.log_notify_error(i[1][1], "IKE_AUTH")
                         return OTHER_ERROR,str(i[1][1])
-                        
+
                 elif i[0] == EAP:
                     eap_received = True
                     if i[1][0] in (EAP_SUCCESS,):
@@ -2930,9 +3141,20 @@ class swu():
             for i in self.decoded_payload[0][1]:
                 
                 if i[0] == N:    #protocol_id, notify_message_type, spi, notification_data
-                    if i[1][1]<16384: #error
-                        return OTHER_ERROR,str(i[1][1])
-                        
+                    ntype = i[1][1]
+                    if ntype<16384: #error
+                        self.log_notify_error(ntype, "IKE_AUTH")
+                        return OTHER_ERROR,str(ntype)
+                    elif ntype in (PDN_TYPE_IPv4_ONLY_ALLOWED, PDN_TYPE_IPv6_ONLY_ALLOWED):
+                        # The network is telling us only one PDN type is allowed. We request an
+                        # IPv6-only CFG for Telus already, so this is informational; log it.
+                        swu_log("IKE_AUTH status: %s (%s)" % (notify_name(ntype), notify_describe(ntype)))
+                    elif ntype == BACKOFF_TIMER:
+                        secs, txt = (None, "?")
+                        if i[1][3]:
+                            secs, txt = self.decode_backoff_timer(i[1][3][-1])
+                        swu_log("IKE_AUTH status: BACKOFF_TIMER = %s" % txt)
+
                 elif i[0] == CP:
                     
                     if i[1][0] == CFG_REPLY:
@@ -2987,26 +3209,44 @@ class swu():
 
         
         else:
+            # Scan the request: is there a DELETE payload, and is REACTIVATION_REQUESTED_CAUSE
+            # present? (TS 24.302 clause 7.2.4.2: a DELETE carrying REACTIVATION_REQUESTED_CAUSE
+            # means the UE should re-establish the tunnel — our entrypoint supervisor does this
+            # automatically on exit.)
+            has_delete = any(i[0] == D for i in self.decoded_payload[0][1])
+            reactivation = any(i[0] == N and i[1][1] == REACTIVATION_REQUESTED_CAUSE
+                               for i in self.decoded_payload[0][1])
+            if reactivation:
+                swu_log("INFORMATIONAL: REACTIVATION_REQUESTED_CAUSE received - tunnel will be "
+                        "re-established after release")
+
+            if not has_delete:
+                # Not a DELETE: DPD liveness check, DEVICE_IDENTITY request, or a status notify.
+                # Answer it so the ePDG does not consider us dead. (Previously ignored -> the
+                # ePDG's DPD would eventually tear the tunnel down.)
+                self.handle_INFORMATIONAL_request()
+                return
+
             for i in self.decoded_payload[0][1]:
                 if i[0] == D: # delete
-                     
+
                     protocol = i[1][0]
                     num_spi = i[1][1]
                     spi_list = i[1][2]
                     if protocol == IKE:
-                        print('received INFORMATIONAL (DELETE IKE)') 
+                        print('received INFORMATIONAL (DELETE IKE)')
                         #delete everything, answer and quit
                         packet = self.answer_INFORMATIONAL_delete()
                         self.send_data(packet)
                         print('answering INFORMATIONAL (DELETE IKE)')
                         if self.old_ike_message_received == False:
                             self.ike_to_ipsec_encoder.send(bytes([INTER_PROCESS_DELETE_SA]))
-                            self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA])) 
+                            self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA]))
                             self.delete_routes()
-                            exit(1)    
-                            
+                            exit(1)
+
                     elif protocol == ESP:
-                        print('received INFORMATIONAL (DELETE SA CHILD)') 
+                        print('received INFORMATIONAL (DELETE SA CHILD)')
                         packet = self.answer_INFORMATIONAL_delete_CHILD(ESP,self.spi_init_child_old)
                         self.send_data(packet)
                         print('answering INFORMATIONAL (DELETE SA CHILD)')
