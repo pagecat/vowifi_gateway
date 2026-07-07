@@ -95,6 +95,40 @@ def swu_notify(event, arg=None):
         pass
 
 
+def swu_apply_pcscf(addr):
+    """Re-render pjsip.conf for a (possibly new) P-CSCF and reload Asterisk, but only when the
+    P-CSCF actually changed. The ePDG can hand out a DIFFERENT P-CSCF on every (re)connect /
+    reauth; pjsip's type=identify/type=resolve are pinned to the P-CSCF IP, so a stale value
+    means inbound INVITEs from the new P-CSCF don't match (calls/SMS fail) and outbound routing
+    is wrong. This keeps them in sync on every reconnect, not just the first bring-up."""
+    if not addr:
+        return
+    last = None
+    try:
+        with open(os.path.join(SWU_RUNDIR, "pcscf.applied")) as f:
+            last = f.read().strip()
+    except Exception:
+        last = None
+    if last == addr:
+        return
+    render = os.environ.get("SWU_RENDER", "/usr/local/bin/render.py")
+    if not os.path.exists(render):
+        return
+    try:
+        swu_log("P-CSCF changed (%s -> %s); re-rendering pjsip + reloading Asterisk" % (last, addr))
+        subprocess.call(["python3", render], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Reload just the parts affected by the P-CSCF change. res_pjsip reload re-reads
+        # pjsip.conf (identify/resolve/registration/endpoint) without dropping the tunnel.
+        subprocess.call(["asterisk", "-rx", "module reload res_pjsip.so"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["asterisk", "-rx", "pjsip send register volte_ims"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(SWU_RUNDIR, "pcscf.applied"), "w") as f:
+            f.write(addr)
+    except Exception as e:
+        swu_log("pcscf apply failed: %r" % e)
+
+
 '''
 
 Ike Process
@@ -3091,6 +3125,10 @@ class swu():
         swu_notify("tunnel_up")
         if pcscf:
             swu_notify("pcscf", pcscf)
+            # Keep pjsip's P-CSCF (identify/resolve/register) in sync when the ePDG assigns a
+            # different P-CSCF on reconnect/reauth. No-op on first bring-up (entrypoint seeds
+            # pcscf.applied after its own initial render, before Asterisk starts).
+            swu_apply_pcscf(pcscf)
 
         # Headless control channel replaces interactive stdin. Open a FIFO O_RDWR so select()
         # never sees EOF (a plain stdin/EOF would busy-spin). The manager/entrypoint can echo

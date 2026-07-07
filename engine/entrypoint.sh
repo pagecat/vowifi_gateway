@@ -89,6 +89,9 @@ addr=$(cat "$VOWIFI_RUNDIR/pcscf" 2>/dev/null)
 if [ -n "$addr" ]; then
   log "discovered P-CSCF: $addr"
   python3 /usr/local/bin/render.py || true   # re-render pjsip.conf with pcscf
+  # Seed the applied-marker so swu_ike's in-process P-CSCF watcher only re-renders + reloads
+  # Asterisk on a LATER change (reconnect/reauth), not redundantly right after this render.
+  printf '%s' "$addr" > "$VOWIFI_RUNDIR/pcscf.applied"
 else
   log "no P-CSCF discovered yet - continuing (manager will surface tunnel state)"
 fi
