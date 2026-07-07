@@ -482,6 +482,26 @@ def notify_describe(value):
     """Return a human-friendly one-line description for a Notify Message Type, or '' if none."""
     return NOTIFY_DESCRIPTIONS.get(value, "")
 
+# Notify Message Types for which swu_ike has an explicit code path (decode + act on). Any received
+# Notify NOT in this set is "unhandled": still valid, but we take no specific action, so it gets an
+# extra verbose log line (full hex + class + hint) — invaluable when diagnosing an unexpected
+# tunnel drop, since the ePDG often signals the cause via a Notify we don't yet act on. Keep this
+# in sync with the actual `== <CONST>` / `in (...)` handling sites in state_1..4 + handle_INFORMATIONAL.
+HANDLED_NOTIFY_TYPES = frozenset({
+    # IKE_SA_INIT (state_1)
+    INVALID_KE_PAYLOAD, COOKIE, NAT_DETECTION_SOURCE_IP, NAT_DETECTION_DESTINATION_IP,
+    # IKE_AUTH (state_2/3/4): DEVICE_IDENTITY request/answer, PDN type, backoff, and every
+    # error notify (< 16384) is uniformly surfaced via log_notify_error before aborting.
+    DEVICE_IDENTITY, PDN_TYPE_IPv4_ONLY_ALLOWED, PDN_TYPE_IPv6_ONLY_ALLOWED, BACKOFF_TIMER,
+    # INFORMATIONAL (handle_INFORMATIONAL_request / state_delete)
+    REACTIVATION_REQUESTED_CAUSE,
+})
+
+def notify_is_handled(value):
+    """True if swu_ike has a specific action for this Notify type. All error types (< 16384) are
+    considered handled because the auth flow uniformly logs + aborts on them."""
+    return value < 16384 or value in HANDLED_NOTIFY_TYPES
+
 #IKEv2 Authenticaton Method
 RSA_DIGITAL_SIGNATURE             = 1
 SHARED_KEY_MESSAGE_INTEGRITY_CODE = 2
@@ -1239,6 +1259,9 @@ class swu():
         # Debug: log every received IKEv2 Notify (type name + code, protocol, and data hex).
         # Helps diagnose ePDG behaviour (errors, BACKOFF_TIMER, DEVICE_IDENTITY, P-CSCF-reselect,
         # …) and is groundwork for fuller 3GPP TS 24.302 handling. Goes to the IKE (charon) log.
+        # ANY received Notify is recorded; those without an explicit swu_ike handler get an extra
+        # verbose line (full hex, no truncation) so an operator can reconstruct the ePDG's intent
+        # when chasing an unexpected tunnel drop.
         try:
             ntype = struct.unpack("!H", data[2:4])[0]
             proto = data[0]
@@ -1254,6 +1277,21 @@ class swu():
                 extra += "  # " + desc
             swu_log("received Notify: %s (%d, %s) protocol=%d%s" %
                     (notify_name(ntype), ntype, klass, proto, extra))
+            # Unhandled STATUS notify (all errors are uniformly handled by the auth flow): emit a
+            # louder, fully-detailed diagnostic so nothing the ePDG sends is silently ignored.
+            if not notify_is_handled(ntype):
+                known = notify_name(ntype) != "UNKNOWN"
+                full_hex = notification_data.hex() if notification_data else "(none)"
+                proto_name = {0: "IKE/none", IKE: "IKE", AH: "AH",
+                              ESP: "ESP"}.get(proto, str(proto))
+                swu_log("  UNHANDLED Notify %s(%d) proto=%s spi=%s data=%s%s "
+                        "-- recorded, no action taken (retain for drop diagnosis)" % (
+                            notify_name(ntype) if known else "type",
+                            ntype, proto_name,
+                            spi.hex() if spi else "(none)", full_hex,
+                            (" | " + desc) if desc else
+                            ("" if known else " | NOT in 3GPP TS 24.302 v18.5.0 tables — "
+                             "vendor-private or newer release")))
         except Exception:
             pass
         return [data[0],struct.unpack("!H", data[2:4])[0],spi,notification_data] # protocol_id, notify_message_type, spi, notification_data
@@ -3538,7 +3576,7 @@ class swu():
         self.ike_to_ipsec_decoder.send(self.encode_inter_process_protocol(inter_process_list_start_decoder))
 
         # VoWiFi engine addition: tunnel is up. Publish P-CSCF + state and notify the manager
-        # (replaces strongSwan's ims.updown + charon P-CSCF log parsing).
+        # (in-process, replacing any external updown script + IKE-log P-CSCF parsing).
         pcscf = (self.pcscfv6_address_list[0] if getattr(self, "pcscfv6_address_list", [])
                  else (self.pcscf_address_list[0] if getattr(self, "pcscf_address_list", []) else ""))
         inner = (self.ipv6_address_list[0] if self.ipv6_address_list
@@ -4021,9 +4059,9 @@ def read_res_ck_ik_2(reader_index,rand,autn):
     # PIN handling (VoWiFi engine addition): if USIM_PIN is set, we MUST VERIFY CHV1 before
     # AUTHENTICATE or PIN-enabled cards (e.g. Telus) return 0x6982. VERIFY + AUTHENTICATE must
     # happen in the SAME PC/SC connection (CHV1 does not reliably persist across a fresh
-    # connection when strongSwan-style resets occur). When no PIN is configured we fall through
-    # to the UPSTREAM path (mitshell card.USIM) unchanged, so PIN-less / 3rd-party cards behave
-    # exactly as the original emulator -- same gating as the strongSwan 03 patch.
+    # connection when the card is reset). When no PIN is configured we fall through to the
+    # UPSTREAM path (mitshell card.USIM) unchanged, so PIN-less / 3rd-party cards behave exactly
+    # as the original emulator.
     pin = os.environ.get("USIM_PIN", "").strip()
     if pin and pin.lower() not in ("none", "disabled"):
         return _read_res_ck_ik_pin(reader_index, rand, autn, pin)
