@@ -1,15 +1,15 @@
-# VoWiFi engine image: patched strongSwan-epdg + sysmocom Asterisk + USIM bridge.
+# VoWiFi engine image: pure-Python SWu IKEv2/IPsec tunnel + sysmocom Asterisk + USIM bridge.
 # Based on phcoder/asterisk-docker (osmocom "VoWiFi with Asterisk"), with additions:
+#   - swu_ike.py    : pure-Python SWu (ePDG) IKEv2/IPsec client (fasferraz/SWu-IKEv2, patched)
+#                     — the ONLY tunnel path; verifies the SIM PIN in EAP-AKA, userspace ESP
 #   - pin_keeper.py : holds SIM PIN (CHV1) verified so IKE EAP-AKA + SIP IMS-AKA work on PIN-enabled SIMs
 #   - ami_usim.py   : reference USIM<->AMI bridge, patched to VERIFY PIN + report status
-#   - render.py     : renders /config/instance.json -> Asterisk/strongSwan configs at container start
-# No strongSwan C source patch is needed for PIN (verification persists across PC/SC connections).
+#   - render.py     : renders /config/instance.json -> Asterisk configs at container start
 #
 # Reproducibility: all build inputs are pinned so a from-scratch build on any machine/arch
 # (amd64/arm64) is functionally identical — the base image tag below, sysmocom asterisk
-# (sysmocom/20.7.0) + pjproject (sysmocom/2.14) + cherry-pick f1b60dc, patches/asterisk/*.py,
-# and strongSwan-epdg (jolly/work). Pin the base tag rather than :latest for determinism.
-# NOTE: Fedora 41 breaks strongSwan-epdg build; use 40 (last known-good).
+# (sysmocom/20.7.0) + pjproject (sysmocom/2.14) + cherry-pick f1b60dc, patches/asterisk/*.py.
+# Pin the base tag rather than :latest for determinism.
 FROM fedora:40
 
 # pcsc-lite is pinned to a fixed upstream version and built from source (see below), so the
@@ -19,9 +19,6 @@ FROM fedora:40
 ARG PCSC_VERSION=2.3.3
 
 WORKDIR /home/asterisk-build
-COPY patches/strongswan/01_configure_gettext.patch /home/asterisk-build/01_configure_gettext.patch
-COPY patches/strongswan/02_warnings.patch /home/asterisk-build/02_warnings.patch
-COPY patches/strongswan/03_eap_sim_pcsc_verify_pin.patch /home/asterisk-build/03_eap_sim_pcsc_verify_pin.patch
 
 RUN dnf -y update && \
     dnf -y install git gcc g++ openssl-devel patch libedit-devel opus-devel libuuid-devel autoconf \
@@ -39,9 +36,8 @@ RUN dnf -y update && \
     tcpdump bind-utils iputils
 
 # Build pcsc-lite ${PCSC_VERSION} from source (client library + headers). Installs over any
-# distro-provided libpcsclite pulled in by python3-pyscard, so both strongSwan (--enable-eap-sim-pcsc,
-# links at build time) and pyscard (loads libpcsclite.so.1 at runtime) use the pinned version and
-# talk the same protocol as the host pcscd.
+# distro-provided libpcsclite pulled in by python3-pyscard so pyscard (loads libpcsclite.so.1 at
+# runtime) uses the pinned version and talks the same protocol as the host pcscd.
 RUN cd /tmp && \
     wget -qO pcsc.tar.gz "https://github.com/LudovicRousseau/PCSC/archive/refs/tags/${PCSC_VERSION}.tar.gz" && \
     tar xf pcsc.tar.gz && cd "PCSC-${PCSC_VERSION}" && \
@@ -67,34 +63,16 @@ RUN git clone --depth=1 --branch sysmocom/2.14 https://gitea.sysmocom.de/sysmoco
     make -j$(nproc) && \
     make install
 
-# strongSwan ePDG fork (SWu/IKEv2 EAP-AKA + P-CSCF discovery + userspace ESP), identical build flags
-RUN git clone --depth=1 --branch jolly/work https://gitea.osmocom.org/ims-volte-vowifi/strongswan-epdg.git && \
-    cd strongswan-epdg && \
-    patch -i ../02_warnings.patch -p1 && \
-    patch -i ../03_eap_sim_pcsc_verify_pin.patch -p1 && \
-    autoreconf -if && \
-    ./configure --enable-eap-sim-pcsc --enable-p-cscf --enable-save-keys --enable-eap-sim \
-                --enable-eap-aka --enable-kernel-libipsec --disable-nls && \
-    make -j$(nproc) && \
-    make install
-
 RUN pip install panoramisk
 
-# SWu (python IKEv2/IPsec) tunnel dependencies. swu_ike.py replaces strongSwan for the ePDG
-# tunnel; it needs pycryptodome/cryptography (IKE + ESP crypto), pyserial (imported by the
-# upstream emulator), and mitshell's CryptoMobile + card (USIM/Milenage helpers). strongSwan is
-# still built above and kept in the image as a rollback path.
+# SWu (python IKEv2/IPsec) tunnel dependencies. swu_ike.py is the ePDG tunnel: it needs
+# pycryptodome/cryptography (IKE + ESP crypto), pyserial (imported by the upstream emulator), and
+# mitshell's CryptoMobile + card (USIM/Milenage helpers).
 RUN pip install pyserial pycryptodome cryptography \
     "git+https://github.com/mitshell/CryptoMobile.git" \
     "git+https://github.com/mitshell/card.git"
 
-# strongSwan charon plugin toggles (from reference)
-COPY p-cscf.conf     /usr/local/etc/strongswan.d/charon/p-cscf.conf
-COPY osmo-epdg.conf  /usr/local/etc/strongswan.d/charon/osmo-epdg.conf
-COPY strongswan.conf /usr/local/etc/strongswan.conf
-
 # our scripts + templates
-COPY ims.updown      /usr/local/etc/ims.updown
 COPY pin_keeper.py   /usr/local/bin/pin_keeper.py
 COPY ami_usim.py     /usr/local/bin/ami_usim.py
 COPY swu_ike.py      /usr/local/bin/swu_ike.py
@@ -102,6 +80,6 @@ COPY render.py       /usr/local/bin/render.py
 COPY notify.py       /usr/local/bin/notify.py
 COPY templates/      /opt/vowifi/templates/
 COPY entrypoint.sh   /entrypoint.sh
-RUN chmod +x /usr/local/etc/ims.updown /usr/local/bin/*.py /entrypoint.sh
+RUN chmod +x /usr/local/bin/*.py /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

@@ -40,7 +40,7 @@ def _hcard(conn):
 
 class _Tx:
     """Best-effort PC/SC transaction: exclusive card access for the auth sequence, so it
-    cannot interleave with pin_keeper / strongSwan APDUs on the shared card."""
+    cannot interleave with pin_keeper / swu_ike APDUs on the shared card."""
     def __init__(self, conn):
         self.conn = conn
         self.hcard = None

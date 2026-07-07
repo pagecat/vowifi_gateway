@@ -3,8 +3,8 @@ engine.py - Per-SIM engine container lifecycle via the Docker SDK.
 
 Each instance runs one `vowifi/engine` container that owns its ePDG tunnel + Asterisk.
 The manager renders instance.json, starts/stops/recreates the container with the right
-mounts/caps/ports, reads the engine's runtime status files (bind-mounted run dir), and
-execs swanctl for tunnel state.
+mounts/caps/ports, and reads the engine's runtime status files (bind-mounted run dir):
+the swu_ike daemon publishes swu_status.json {state: CONNECTED} for tunnel state.
 
 PC/SC: engine containers are pcscd CLIENTS — they mount the HOST pcscd socket (/run/pcscd).
 The pcsc-lite client library in the engine image is pinned to the SAME version as the host
@@ -97,7 +97,6 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
         for f in ["pin_keeper.py", "ami_usim.py", "render.py", "notify.py", "swu_ike.py"]:
             volumes[os.path.join(eng, f)] = {"bind": f"/usr/local/bin/{f}", "mode": "ro"}
         volumes[os.path.join(eng, "entrypoint.sh")] = {"bind": "/entrypoint.sh", "mode": "ro"}
-        volumes[os.path.join(eng, "strongswan.conf")] = {"bind": "/usr/local/etc/strongswan.conf", "mode": "ro"}
         volumes[os.path.join(eng, "templates")] = {"bind": "/opt/vowifi/templates", "mode": "ro"}
 
     port_bindings = {
@@ -175,21 +174,10 @@ def read_pcscf(iid: str) -> str | None:
 
 
 def tunnel_installed(iid: str) -> bool:
-    """True if the ims tunnel is up.
-
-    SWu (python) engine: the swu_ike daemon writes run/swu_status.json {state: CONNECTED}.
-    Fallback (legacy strongSwan image): check swanctl for an INSTALLED ims CHILD_SA.
-    """
+    """True if the ims tunnel is up: the swu_ike daemon writes run/swu_status.json
+    {state: CONNECTED} once the SWu (ePDG) IPsec tunnel is established."""
     st = read_run_json(iid, "swu_status.json")
-    if st is not None:
-        return st.get("state") == "CONNECTED"
-    try:
-        c = _client().containers.get(container_name(iid))
-        rc, out = c.exec_run("swanctl --list-sas")
-        text = out.decode(errors="replace") if isinstance(out, bytes) else str(out)
-        return "INSTALLED" in text and "ims" in text
-    except Exception:
-        return False
+    return st is not None and st.get("state") == "CONNECTED"
 
 
 def exec_cli(iid: str, command: str) -> str:
@@ -210,7 +198,8 @@ def logs(iid: str, tail: int = 200) -> str:
 
 
 def charon_log(iid: str, tail: int = 200) -> str:
-    """Recent strongSwan/charon (IKE) log lines from the instance run dir."""
+    """Recent SWu tunnel (IKE) log lines from the instance run dir. The file is named
+    charon.log for control-plane/WebUI compatibility (the log-view key is 'charon')."""
     path = os.path.join(DATA_DIR, "instances", str(iid), "run", "charon.log")
     try:
         with open(path, errors="replace") as f:

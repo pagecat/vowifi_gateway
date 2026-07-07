@@ -520,7 +520,7 @@ def _reader_index_for_instance(inst: dict) -> int | None:
 
 def _preflight_pin(inst: dict) -> dict:
     """Actively check the SIM's PIN state BEFORE starting the engine (so we never spin up
-    strongSwan/IMS against a locked card). Reads the physical card:
+    the SWu tunnel/IMS against a locked card). Reads the physical card:
       - card absent                         -> {ok:False, code:'no_card'}
       - PIN not required (disabled)          -> {ok:True,  need_pin:False}
       - PIN required, no saved PIN           -> {ok:False, code:'pin_required'}

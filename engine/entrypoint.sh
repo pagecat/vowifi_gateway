@@ -3,12 +3,11 @@
 # pure-Python IKEv2/IPsec implementation (swu_ike.py) -> discover P-CSCF -> start Asterisk
 # (IMS registration + voice/SMS).
 #
-# SWu tunnel: swu_ike.py (fasferraz/SWu-IKEv2, patched) replaces strongSwan-epdg. It does
+# SWu tunnel: swu_ike.py (fasferraz/SWu-IKEv2, patched) is the sole ePDG tunnel path. It does
 # IKEv2 + EAP-AKA (verifying the SIM PIN in its own PC/SC connection), userspace ESP over a
 # tun device named "ipsec0" (so pjsip's bind_interface is unchanged), assigns the IPv6 inner
 # address, and requests the IPv6 P-CSCF. A supervisor restarts it on exit; because every fresh
-# start re-runs EAP-AKA WITH the PIN verify, the tunnel self-heals after a rekey/reauth teardown
-# (the failure mode strongSwan could not recover from).
+# start re-runs EAP-AKA WITH the PIN verify, the tunnel self-heals after a rekey/reauth teardown.
 #
 # PC/SC: this container is a pcscd CLIENT — it talks to the HOST pcscd via the bind-mounted
 # /run/pcscd socket. The pcsc-lite client library is pinned to the same version as the host

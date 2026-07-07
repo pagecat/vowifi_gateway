@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-render.py - Render /config/instance.json into Asterisk + strongSwan configs.
+render.py - Render /config/instance.json into Asterisk configs + the SWu launch env.
 
 Reads the per-SIM instance descriptor (written by the manager, or hand-authored for
 bring-up), fills the Jinja2 templates in /opt/vowifi/templates, and writes the final
 config files. Also derives values (NAI, realm, ePDG FQDN) and computes the container
-source IP for strongSwan local_addrs.
+source IP used as the SWu tunnel local address.
 
 Env overrides (used by entrypoint / keeper / ami_usim after render): USIM_PIN, USIM_READER.
 """
@@ -165,7 +165,6 @@ def main():
         "ami_usim.ini.j2": "/usr/local/etc/ami_usim.ini",
     }
     os.makedirs("/etc/asterisk", exist_ok=True)
-    os.makedirs("/usr/local/etc/swanctl/conf.d", exist_ok=True)
     for tpl, dest in outputs.items():
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         rendered = env.get_template(tpl).render(**ctx)
@@ -173,7 +172,7 @@ def main():
             f.write(rendered)
         print(f"[render] {tpl} -> {dest}")
 
-    # Export env for keeper / ami_usim / charon
+    # Export env for keeper / ami_usim / swu_ike
     env_path = os.environ.get("VOWIFI_ENV", "/run/vowifi/engine.env")
     os.makedirs(os.path.dirname(env_path), exist_ok=True)
     with open(env_path, "w") as f:
@@ -183,8 +182,8 @@ def main():
         f.write(f"VOWIFI_ID={ctx['id']}\n")
         f.write(f"MANAGER_URL={ctx['manager_url']}\n")
         # SWu (python IKEv2/IPsec) launch params — consumed by entrypoint.sh to start
-        # swu_ike.py in place of strongSwan. Reader is addressed by index for swu_ike's
-        # smartcard path; source is the container IP; ePDG FQDN is resolved by swu_ike.
+        # swu_ike.py. Reader is addressed by index for swu_ike's smartcard path; source is the
+        # container IP; ePDG FQDN is resolved by swu_ike.
         f.write(f"USIM_READER_INDEX={cfg.get('reader_index', 0)}\n")
         f.write(f"USIM_IMSI={ctx['imsi']}\n")
         # IMEI / IMEISV for the ePDG DEVICE_IDENTITY response. imeisv falls back to a value

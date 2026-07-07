@@ -259,16 +259,16 @@ _build_pcsclite_host() {
 
 # ------------------------------------------------------------------ image builds
 # Build the engine image ONLY if it is missing, or if forced ($1 non-empty / --no-cache).
-# The engine image is huge and slow (~15-20 min: compiles Asterisk + strongSwan + pcsc-lite),
-# and it bakes every bug-fix patch under engine/patches/* via the Dockerfile — so an unforced
-# reinstall reuses the existing patched image instead of rebuilding it.
+# The engine image is large and slow to build (~10-15 min: compiles Asterisk + pcsc-lite + the
+# Python SWu tunnel deps), and it bakes every bug-fix patch under engine/patches/* via the
+# Dockerfile — so an unforced reinstall reuses the existing patched image instead of rebuilding it.
 ensure_engine_image() {
   force="${1:-}"
   if [ -z "$force" ] && [ -z "$NOCACHE_FLAG" ] && docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
     info "engine image $ENGINE_IMAGE present — reusing (patches from engine/patches/* are baked in). Use 'reload --engines' or '--no-cache' to force a rebuild."
     return
   fi
-  info "building engine image ($ENGINE_IMAGE) from source — long; compiles Asterisk+strongSwan+pcsc-lite and bakes engine/patches/*…"
+  info "building engine image ($ENGINE_IMAGE) from source — long; compiles Asterisk+pcsc-lite+Python SWu tunnel deps and bakes engine/patches/*…"
   # shellcheck disable=SC2086
   docker build $NOCACHE_FLAG --build-arg "PCSC_VERSION=$PCSC_VERSION" -t "$ENGINE_IMAGE" "$REPO_DIR/engine"
   info "engine image built"
@@ -421,13 +421,13 @@ cmd_install() {
   need_root
   resolve_mode
   info "VoWiFi gateway install — repo: $REPO_DIR  (mode: ${B}$MODE${N})"
-  # The engine image compiles Asterisk + strongSwan + pcsc-lite from source. On low-power ARM
-  # boards (Raspberry Pi, Armbian SBCs) this first build can take 30+ minutes — only once, since
-  # later installs reuse the built image. Warn up front so a long, quiet build isn't mistaken
-  # for a hang.
+  # The engine image compiles Asterisk + pcsc-lite + the Python SWu tunnel deps from source. On
+  # low-power ARM boards (Raspberry Pi, Armbian SBCs) this first build can take 20-30 minutes —
+  # only once, since later installs reuse the built image. Warn up front so a long, quiet build
+  # isn't mistaken for a hang.
   if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
-    warn "the engine image builds from source (Asterisk + strongSwan). On low-power ARM machines"
-    warn "this can take 30+ minutes — this is normal, please be patient. It runs only once;"
+    warn "the engine image builds from source (Asterisk + pcsc-lite + SWu tunnel deps). On low-power ARM"
+    warn "machines this can take 20-30 minutes — this is normal, please be patient. It runs only once;"
     warn "later installs/reloads reuse the built image."
   fi
   ensure_docker

@@ -34,7 +34,7 @@ The control-plane WebUI — dashboard, browser softphone, and SMS messaging (lig
 
 The gateway has two planes:
 
-1. **`vowifi/engine`** (per-SIM, always a Docker container): a pure-Python SWu IKEv2/IPsec client (`swu_ike.py`, based on [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)) for the ePDG tunnel (IKEv2 + EAP-AKA, userspace ESP) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The tunnel client carries VoWiFi resilience: it verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA authentication, sends NAT-T keepalives to hold the tunnel open when idle, and re-syncs the P-CSCF into PJSIP on reconnect — so it rekeys/re-auths and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)). A patched strongSwan-epdg is still built into the image as a rollback path.
+1. **`vowifi/engine`** (per-SIM, always a Docker container): a pure-Python SWu IKEv2/IPsec client (`swu_ike.py`, based on [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)) for the ePDG tunnel (IKEv2 + EAP-AKA, userspace ESP) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The tunnel client carries VoWiFi resilience: it verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA authentication, sends NAT-T keepalives to hold the tunnel open when idle, re-syncs the P-CSCF into PJSIP on reconnect, answers the ePDG's IKEv2 `DEVICE_IDENTITY`/DPD/P-CSCF-restoration requests, and records every received 3GPP Notify — so it rekeys/re-auths and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)).
 2. **control plane** (singleton): FastAPI manager + React WebUI dashboard. Manages engine containers via the Docker SDK and reads the SIM via pyscard over the host pcscd socket.
 
 The control plane runs in one of two **deploy modes** (chosen at install time):
@@ -58,7 +58,7 @@ sudo ./install.sh install --mode docker
 
 The installer:
 - Installs Docker (via `get.docker.com` if missing) + host pcscd, **version-locked** to `PCSC_VERSION`
-- Builds the engine image from source (~10–20 min on a Pi; compiles Asterisk + the Python SWu tunnel deps + strongSwan for rollback; bakes `engine/patches/*`)
+- Builds the engine image from source (~10–15 min on a Pi; compiles Asterisk + pcsc-lite + the Python SWu tunnel deps; bakes `engine/patches/*`)
 - **local mode**: compiles the WebUI in a throwaway Node container, creates a Python venv (`control/.venv`), and starts the `vowifi-control` systemd service
 - **docker mode**: builds the `vowifi/control` image and starts the control plane in a privileged container
 - Autostart is enabled; prints `https://<host-lan-ip>:8443` — open it in your browser
@@ -213,6 +213,14 @@ blip) instead of dying on a locked card — and the newly assigned P-CSCF is re-
 so calls/SMS keep routing. No action needed; watch it in the IKE (SWu) log
 (`VoWiFi: VERIFY CHV1 ok`, `tunnel CONNECTED`).
 
+**Diagnosing an unexpected tunnel drop:**  
+The SWu client records **every** IKEv2 Notify the ePDG sends (3GPP TS 24.302 error + status
+types), with a friendly description. Notify types it doesn't specifically act on are logged with
+an extra `UNHANDLED Notify …` line carrying the full payload hex — so when a carrier tears a
+tunnel down for a non-obvious reason (backoff timer, PLMN/RAT restriction, reactivation request,
+a vendor-private code, …), the cause is captured in the IKE (SWu) log rather than lost. Look for
+`received Notify:` / `UNHANDLED Notify` around the disconnect.
+
 **Audio one-way or none:**  
 - **Browser softphone silent**: hard-refresh (Ctrl+Shift+R) to load the latest WebUI bundle (the audio attach fix). Check the browser Console for `audioblocked` or autoplay errors.
 - **External client no audio**: confirm `VOWIFI_ADVERTISE_ADDR` is the correct LAN IP (not 127.x, not a docker-bridge IP). Check firewall rules allow RTP (UDP 10000–10059+ inbound).
@@ -254,7 +262,8 @@ OK
 
 Released under the [MIT License](LICENSE). The build pulls in third-party components under their own licenses:
 - [phcoder/asterisk-docker](https://github.com/phcoder/asterisk-docker) (sysmocom VoWiFi-enabled Asterisk)
-- [strongSwan](https://www.strongswan.org/) (IPsec/IKEv2, LGPL)
+- [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2) (pure-Python SWu ePDG IKEv2/IPsec client)
+- [mitshell/CryptoMobile](https://github.com/mitshell/CryptoMobile) + [mitshell/card](https://github.com/mitshell/card) (Milenage / USIM helpers)
 - [pyscard](https://pyscard.sourceforge.io/) (PC/SC, LGPL)
 
 ---
@@ -273,4 +282,4 @@ Any VoWiFi-capable SIM should work without configuration (ePDG/realm derived fro
 
 ## Credits
 
-Concept + implementation: exploring IMS/VoWiFi as a SIP bridge use case. Builds on the excellent work by phcoder (sysmocom Asterisk VoWiFi integration) and the strongSwan + pySIM communities.
+Concept + implementation: exploring IMS/VoWiFi as a SIP bridge use case. Builds on the excellent work by phcoder (sysmocom Asterisk VoWiFi integration), fasferraz (SWu-IKEv2 ePDG client), mitshell (CryptoMobile / card), and the pySIM community.

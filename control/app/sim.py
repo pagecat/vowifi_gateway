@@ -3,7 +3,7 @@ sim.py - Physical USIM access via PC/SC (shared pcscd).
 
 Used by the manager for reader/SIM detection and PIN management. All multi-APDU
 sequences run inside a PC/SC transaction (SCardBeginTransaction) to avoid interleaving
-with the engine's strongSwan / ami_usim / pin_keeper accesses on the same card.
+with the engine's swu_ike / ami_usim / pin_keeper accesses on the same card.
 
 Safe by construction: never spends the last PIN attempts (MIN_TRIES guard) and reads
 the retry counter with a status query (63Cx) that does not consume a try.

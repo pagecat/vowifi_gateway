@@ -2,7 +2,7 @@
 """
 notify.py - Best-effort event hook: POST engine events to the manager.
 
-Usage (from the Asterisk dialplan / ims.updown):
+Usage (from the Asterisk dialplan or swu_ike tunnel hooks):
   notify.py <event> [arg1] [arg2] ...
 
 Events: call_in <from>, call_out <to>, sms_in <from> <body_b64>,
