@@ -10,6 +10,8 @@ import fcntl
 import subprocess
 import multiprocessing
 import requests
+import hashlib
+import ipaddress
 
 from optparse import OptionParser
 from binascii import hexlify, unhexlify
@@ -140,6 +142,8 @@ INTER_PROCESS_CREATE_SA = 1
 INTER_PROCESS_UPDATE_SA = 2
 INTER_PROCESS_DELETE_SA = 3
 INTER_PROCESS_IKE       = 4
+INTER_PROCESS_LIVENESS_RX = 8   # P2-3: ESP-decap worker -> IKE loop: a protected IPsec packet
+                                # arrived, so the SA is alive (refresh the DPD/liveness clock).
 
 INTER_PROCESS_IE_ENCR_ALG    = 1
 INTER_PROCESS_IE_INTEG_ALG   = 2
@@ -192,8 +196,9 @@ V =       43
 TSI =     44
 TSR =     45
 SK =      46
-CP =      47 
+CP =      47
 EAP =     48
+SKF =     53                                 # RFC 7383 Encrypted-and-Authenticated-Fragment payload
 
 #IKEv2 Exchange Types
 IKE_SA_INIT =     34
@@ -342,6 +347,8 @@ REKEY_SA                                = 16393
 ESP_TFC_PADDING_NOT_SUPPORTED           = 16394
 NON_FIRST_FRAGMENTS_ALSO                = 16395
 
+IKEV2_FRAGMENTATION_SUPPORTED           = 16430      # RFC 7383 status notify (IKE fragmentation)
+
 EAP_ONLY_AUTHENTICATION                 = 16417
 # from 24.302                                        
 REACTIVATION_REQUESTED_CAUSE            = 40961
@@ -402,6 +409,7 @@ NOTIFY_TYPE_NAMES = {
     16392: "HTTP_CERT_LOOKUP_SUPPORTED", 16393: "REKEY_SA",
     16394: "ESP_TFC_PADDING_NOT_SUPPORTED", 16395: "NON_FIRST_FRAGMENTS_ALSO",
     16417: "EAP_ONLY_AUTHENTICATION",
+    16430: "IKEV2_FRAGMENTATION_SUPPORTED",
     # ---- 3GPP TS 24.302 Table 8.1.2.3-1: Private Status Types ----
     40961: "REACTIVATION_REQUESTED_CAUSE", 41041: "BACKOFF_TIMER",
     41050: "PDN_TYPE_IPv4_ONLY_ALLOWED", 41051: "PDN_TYPE_IPv6_ONLY_ALLOWED",
@@ -490,6 +498,7 @@ def notify_describe(value):
 HANDLED_NOTIFY_TYPES = frozenset({
     # IKE_SA_INIT (state_1)
     INVALID_KE_PAYLOAD, COOKIE, NAT_DETECTION_SOURCE_IP, NAT_DETECTION_DESTINATION_IP,
+    IKEV2_FRAGMENTATION_SUPPORTED,
     # IKE_AUTH (state_2/3/4): DEVICE_IDENTITY request/answer, PDN type, backoff, and every
     # error notify (< 16384) is uniformly surfaced via log_notify_error before aborting.
     DEVICE_IDENTITY, PDN_TYPE_IPv4_ONLY_ALLOWED, PDN_TYPE_IPv6_ONLY_ALLOWED, BACKOFF_TIMER,
@@ -501,6 +510,26 @@ def notify_is_handled(value):
     """True if swu_ike has a specific action for this Notify type. All error types (< 16384) are
     considered handled because the auth flow uniformly logs + aborts on them."""
     return value < 16384 or value in HANDLED_NOTIFY_TYPES
+
+# --- 3GPP TS 24.302 clause 7.2.2.2 reject-Notify retry policy (Table 8.1.2.2-1) --------------------
+# When the ePDG rejects the attach with a Private Error Notify, blindly re-attaching in a tight loop
+# (a) hammers the network and (b) is forbidden for some causes until the USIM/PLMN changes. Classify
+# each reject so start_ike can stop spinning and so the manager gets a machine-readable reason.
+#   no_retry  : same-PLMN retry is pointless until the SIM is swapped (subscription/equipment/PLMN
+#               level rejections). swu_ike stops looping and exits; durable back-off is the manager's.
+#   backoff   : retry is allowed later; honour an attached BACKOFF_TIMER (Tw3) if present, else an
+#               implementation back-off (the supervised restart cadence spaces attempts out).
+#   transient : generic RFC 7296 / unclassified errors -> the existing bounded retry loop as today.
+REJECT_NO_RETRY_SAME_PLMN = frozenset({9000, 9001, 9003, 9006, 11001, 11011})
+REJECT_BACKOFF_THEN_RETRY = frozenset({10500, 9002})
+
+def reject_policy(code):
+    if code in REJECT_NO_RETRY_SAME_PLMN:
+        return "no_retry"
+    if code in REJECT_BACKOFF_THEN_RETRY:
+        return "backoff"
+    return "transient"     # generic / RFC 7296 errors: bounded retry as today
+
 
 #IKEv2 Authenticaton Method
 RSA_DIGITAL_SIGNATURE             = 1
@@ -677,9 +706,101 @@ class swu():
         self.imei = IMEI
         self.imeisv = IMEISV
 
+        # G2: reject-Notify classification carried out of the auth flow to start_ike / status.
+        # reject_reason_code = the friendly Notify name of the last hard reject (or None);
+        # reject_reason_policy = reject_policy() of it; reject_backoff_seconds = decoded Tw3 if the
+        # ePDG attached a BACKOFF_TIMER to the reject (else None). Reset each attach.
+        self.reject_reason_code = None
+        self.reject_reason_policy = None
+        self.reject_backoff_seconds = None
+
+        # G4: initiator liveness / Dead-Peer-Detection (TS 24.302 7.2.2A). liveness_period = idle
+        # interval before we send an empty INFORMATIONAL request probe; after SWU_LIVENESS_RETRIES
+        # consecutive unanswered probes we declare the SA dead and tear down (the supervisor
+        # re-establishes). 0 disables. Kept separate from the RFC 3948 NAT-T keepalive (that holds
+        # the UDP mapping open but is unacknowledged, so it is not a liveness proof).
+        self.liveness_period = float(os.environ.get("SWU_LIVENESS_PERIOD", "20") or 20)
+        self.liveness_retries = int(os.environ.get("SWU_LIVENESS_RETRIES", "4") or 4)
+        self._last_rx = None                 # time.monotonic() of last protected IKE msg in-loop
+        self._liveness_outstanding = 0       # consecutive probes sent without a response
+        self._liveness_probe_mid = None      # message-id of the in-flight probe (for response match)
+
+        # Proactive CHILD-SA rekey (TS 24.302 7.2.2C / RFC 7296). IKEv2 does NOT carry SA lifetime
+        # on the wire, so rekey timing is local policy: we rekey the ESP (CHILD) SA every
+        # child_rekey_period seconds measured from its establishment, before it silently ages out
+        # on the ePDG (which otherwise stops accepting our ESP => a periodic idle drop). 0 disables
+        # (passive only). SWU_CHILD_REKEY_MINUTES is set by render.py from settings.rekey.minutes
+        # (default 30 min). We use a UE-initiated make-before-break CREATE_CHILD_SA with PFS
+        # (Telus rejects a no-PFS child rekey with NO_PROPOSAL_CHOSEN); on reject/timeout we fall
+        # back to a supervised re-establish (state_delete + exit -> entrypoint restarts with PIN
+        # verify), i.e. never worse than the pre-rekey behaviour at the same expiry point.
+        _rk_min = float(os.environ.get("SWU_CHILD_REKEY_MINUTES", "30") or 30)
+        self.child_rekey_period = _rk_min * 60.0 if _rk_min > 0 else 0.0
+        self._child_sa_time = None           # time.monotonic() the current CHILD SA was installed
+        self._rekey_outstanding = False      # a UE-initiated CHILD rekey request is in flight
+        self._rekey_sent_at = None           # time.monotonic() the rekey request was sent (timeout)
+        self.rekey_response_timeout = float(os.environ.get("SWU_REKEY_TIMEOUT", "10") or 10)
+
+        # G1: IKEv2 fragmentation (RFC 7383). fragmentation_enabled advertises
+        # IKEV2_FRAGMENTATION_SUPPORTED in IKE_SA_INIT (additive/optional; disable via
+        # SWU_FRAGMENTATION=0 if a carrier chokes). peer_supports_fragmentation is set when the
+        # ePDG echoes the notify. _frag_buf reassembles inbound SKF fragments keyed by message-id.
+        self.fragmentation_enabled = (os.environ.get("SWU_FRAGMENTATION", "1") != "0")
+        self.peer_supports_fragmentation = False
+        self._frag_buf = {}
+        # P2-4: outbound RFC 7383 fragmentation. Split a protected IKE message into SKF fragments
+        # only when BOTH sides advertised support AND the plaintext body exceeds fragment_size.
+        # Default 1000 keeps each fragment well under UDP/IPsec/NAT-T path MTU; do not exceed 1200
+        # without interop testing. Telus messages are small so this never triggers there.
+        self.fragment_size = int(os.environ.get("SWU_FRAGMENT_SIZE", "1000") or 1000)
+
+        # P0-1: ePDG may assign the inner IPv6 by prefix (INTERNAL_IP6_SUBNET) instead of a full
+        # INTERNAL_IP6_ADDRESS (TS 24.302 7.4.1.1). Init empty so state_4/set_routes can test it
+        # before any CFG_REPLY is parsed. Entries are (prefix_string, prefix_len_int).
+        self.ipv6_subnet_list = []
+
+        # P2-5: responder-side duplicate-request response cache. ePDG INFORMATIONAL/CREATE_CHILD_SA
+        # requests may be retransmitted; keyed by (exchange_type, message_id) -> response bytes (or
+        # list of fragment bytes) so a duplicate re-sends the SAME response WITHOUT re-running the
+        # side effects (delete SA, switch SPI, re-register). Bounded to the most-recent few ids.
+        self._response_cache = {}
+        self._response_cache_order = []
+        self._response_cache_max = 16
+        self._capture_buf = None      # when a list, _send_one appends every packet it sends here
+
+        # P2-5: initiator request retransmission. On timeout we resend the SAME bytes (never
+        # regenerate nonce/SPI/DH/IV) following this per-attempt seconds schedule. The FIRST
+        # attempt's 2s timeout equals the original single socket timeout, so a prompt ePDG (Telus
+        # responds in <1s) succeeds on the first try with byte-for-byte identical timing; the extra
+        # attempts only help a lossy link. Bounded total (2+4+8=14s) keeps failure detection within
+        # the entrypoint's 90s establishment budget.
+        _rt = os.environ.get("SWU_IKE_RETRANS_TIMEOUTS", "2,4,8")
+        try:
+            self._retrans_timeouts = [float(x) for x in _rt.split(",") if x.strip()] or [self.timeout]
+        except Exception:
+            self._retrans_timeouts = [self.timeout]
+
+        # P2-3: throttle the ESP-activity liveness IPC so a busy tunnel does not flood the pipe.
+        self._esp_liveness_last_tx = 0.0
+        self._esp_liveness_min_interval = float(os.environ.get("SWU_ESP_LIVENESS_INTERVAL", "5") or 5)
+
         self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
-#       self.set_identification(IDR,ID_FQDN, self.apn + '.apn.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
-        self.set_identification(IDR,ID_FQDN, self.apn)
+        # IDr (the identity of the ePDG we want to reach) is, per 3GPP TS 24.302 clause 7.2.2.1,
+        # the APN encoded as an ID_FQDN. Two encodings are seen in the wild:
+        #   "apn"  -> the bare APN (e.g. "ims"). This is the Telus-verified default and stays the
+        #            default because it is empirically proven to attach; do NOT change it lightly.
+        #   "fqdn" -> the operator-identified APN-FQDN a real UE builds:
+        #            "<apn>.apn.epc.mnc<MNC3>.mcc<MCC3>.pub.3gppnetwork.org" (23.003). MNC must be
+        #            3 digits (Telus is already "220"); a 2-digit MNC must be zero-padded per 23.003.
+        # Selected by env SWU_IDR_MODE so a carrier that needs the full FQDN can opt in without a
+        # code change; falls through to the bare-APN behaviour when unset/invalid.
+        idr_mode = os.environ.get("SWU_IDR_MODE", "apn")
+        if idr_mode == "fqdn" and self.mcc and self.mnc:
+            mnc3 = self.mnc if len(self.mnc) == 3 else self.mnc.zfill(3)
+            idr_value = "%s.apn.epc.mnc%s.mcc%s.pub.3gppnetwork.org" % (self.apn, mnc3, self.mcc)
+        else:
+            idr_value = self.apn
+        self.set_identification(IDR, ID_FQDN, idr_value)
         
         self.ike_decoded_header = {}
         self.decodable_payloads = [
@@ -932,10 +1053,95 @@ class swu():
         self.server_address_esp = (address,0)
 
     def send_data(self, data):
+        # P2-4: encode_payload_type_sk may return a list of SKF fragment packets; send each.
+        if isinstance(data, (list, tuple)):
+            for d in data:
+                self._send_one(d)
+            return
+        self._send_one(data)
+
+    def _send_one(self, data):
+        # P2-5: when capturing a responder reply (see _dispatch_epdg_request), record the exact
+        # bytes so a duplicate request can be answered from cache without re-running side effects.
+        if self._capture_buf is not None:
+            self._capture_buf.append(data)
         if self.userplane_mode == ESP_PROTOCOL:
             self.socket.sendto(data, self.server_address)
         else:
             self.socket_nat.sendto(b'\x00'*4 + data, self.server_address_nat)
+
+    def _send_request_await_response(self, packet):
+        """P2-5: send an initiator IKE request and wait for a decodable response, RETRANSMITTING
+        THE SAME bytes on timeout (per SWU_IKE_RETRANS_TIMEOUTS). Never regenerates the packet, so
+        nonce/SPI/DH/IV are preserved (mandatory for IKE_SA_INIT / IKE_AUTH / CREATE_CHILD_SA
+        retransmission). Returns True once a message decoded (self.ike_decoded_ok True) — leaving
+        self.decoded_payload set for the caller — or False after the schedule is exhausted. On the
+        prompt-response path this returns on the very first recv, identical to the old behaviour."""
+        esp_mode = (self.userplane_mode == ESP_PROTOCOL)
+        sock = self.socket if esp_mode else self.socket_nat
+        schedule = self._retrans_timeouts or [self.timeout]
+        try:
+            for attempt, per_to in enumerate(schedule):
+                if attempt > 0:
+                    swu_log("IKE request retransmit %d/%d (message_id=%d, same bytes)" %
+                            (attempt + 1, len(schedule), self.message_id_request))
+                self.send_data(packet)
+                deadline = time.monotonic() + per_to
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        sock.settimeout(remaining)
+                        data, address = sock.recvfrom(2000)
+                    except socket.timeout:
+                        break
+                    except Exception:
+                        break
+                    if esp_mode:
+                        self.decode_ike(data)
+                    else:
+                        self.decode_ike(data[4:])
+                    if self.ike_decoded_ok == True:
+                        return True
+            return False
+        finally:
+            try:
+                sock.settimeout(self.timeout)
+            except Exception:
+                pass
+
+    def _cache_response(self, key, response):
+        """P2-5: store a responder reply (bytes or list[bytes]) under (exchange_type, message_id),
+        evicting the oldest when over the bound."""
+        if key not in self._response_cache:
+            self._response_cache_order.append(key)
+            while len(self._response_cache_order) > self._response_cache_max:
+                old = self._response_cache_order.pop(0)
+                self._response_cache.pop(old, None)
+        self._response_cache[key] = response
+
+    def _dispatch_epdg_request(self, handler):
+        """P2-5: dispatch an ePDG-initiated request (INFORMATIONAL/CREATE_CHILD_SA, flags[0]==0)
+        through the duplicate-request cache. On a first-seen (exchange_type, message_id) we run the
+        handler (which sends its response via send_data) while capturing the exact response bytes,
+        then cache them. On a retransmitted request with the same key we resend the cached response
+        and DO NOT re-run the handler — so the side effects (SA delete, SPI switch, P-CSCF
+        re-register) happen exactly once (RFC 7296 2.1 responder retransmission rules)."""
+        key = (self.ike_decoded_header['exchange_type'], self.ike_decoded_header['message_id'])
+        if key in self._response_cache:
+            swu_log("duplicate ePDG request exch=%d msgid=%d; resending cached response "
+                    "(side effects not re-run)" % key)
+            self.send_data(self._response_cache[key])
+            return
+        self._capture_buf = []
+        try:
+            handler()
+        finally:
+            captured = self._capture_buf
+            self._capture_buf = None
+        if captured:
+            self._cache_response(key, captured if len(captured) > 1 else captured[0])
 
     def return_random_bytes(self,size):
         if size == 0: return b''
@@ -1185,8 +1391,16 @@ class swu():
             self.decode_header(data)
             if self.ike_decoded_header_ok == False:
                 self.ike_decoded_ok = False
+            elif self.ike_decoded_header['next_payload'] == SKF:
+                # G1 (RFC 7383): the message is fragmented — buffer/reassemble instead of the normal
+                # single-message decode. _handle_skf sets ike_decoded_ok True only once every
+                # fragment has arrived (the recv loops keep reading until then).
+                self._handle_skf(data)
+                if self.ike_decoded_ok == True:
+                    print('received decoded message (reassembled from IKEv2 fragments):')
+                    print(self.decoded_payload)
             else:
-                
+
                 (self.decoded_payload_ok, self.decoded_payload) = self.decode_payload(data, self.ike_decoded_header['next_payload'])
                 if self.decoded_payload_ok == False:
                     self.ike_decoded_ok = False
@@ -1336,59 +1550,113 @@ class swu():
     ######### CIPHERED PAYLOAD ######  
     ######### CIPHERED PAYLOAD ######  
     ######### CIPHERED PAYLOAD ######      
-    def decode_payload_type_sk(self, data):
+    def _decrypt_sk_body(self, data):
+        """Decrypt + strip padding from the encrypted body of an SK (or an SKF fragment) payload,
+        returning the plaintext IKE bytes. Factored out so RFC 7383 fragment reassembly reuses the
+        exact same key selection + AES-CBC path as the normal SK decode. `data` begins with the IV
+        (AES-CBC) or the ciphertext (NULL) and ends with the trailing ICV. Matches the existing
+        behaviour: the ICV is stripped but NOT hard-verified (do not tighten this — it must remain
+        byte-for-byte compatible with the working SK path)."""
         if self.negotiated_encryption_algorithm in (ENCR_AES_CBC,):
             vector = data[0:16]
             hash_size = self.integ_key_truncated_len_bytes.get(self.negotiated_integrity_algorithm)
-            hash_data = data[-hash_size:]
-        
             encrypted_data = data[16:len(data)-hash_size]
-            
             if self.ike_decoded_header['flags'][2] == ROLE_RESPONDER:
-                if self.old_ike_message_received == True:
-                    cipher = Cipher(algorithms.AES(self.SK_ER_old), modes.CBC(vector))                  
-                else:
-                    cipher = Cipher(algorithms.AES(self.SK_ER), modes.CBC(vector))  
+                key = self.SK_ER_old if self.old_ike_message_received == True else self.SK_ER
             else:
-                if self.old_ike_message_received == True:
-                    cipher = Cipher(algorithms.AES(self.SK_EI_old), modes.CBC(vector)) 
-                else:                
-                    cipher = Cipher(algorithms.AES(self.SK_EI), modes.CBC(vector))  
-                
+                key = self.SK_EI_old if self.old_ike_message_received == True else self.SK_EI
+            cipher = Cipher(algorithms.AES(key), modes.CBC(vector))
             decryptor = cipher.decryptor()
-            
             uncipher_data = decryptor.update(encrypted_data) + decryptor.finalize()
-                       
             padding_length = uncipher_data[-1]
-            ike_payload = uncipher_data[0:-padding_length-1]
-            
-            (result_ok, decoded_payload) = self.decode_payload(ike_payload, self.current_next_payload,0)
-            if result_ok == True:
-                return decoded_payload
-
-
+            return uncipher_data[0:-padding_length-1]
         elif self.negotiated_encryption_algorithm in (ENCR_NULL,):
             hash_size = self.integ_key_truncated_len_bytes.get(self.negotiated_integrity_algorithm)
-            hash_data = data[-hash_size:]
-        
-            ike_payload = data[0:len(data)-hash_size-self.sk_ENCR_NULL_pad_length]                
-            (result_ok, decoded_payload) = self.decode_payload(ike_payload, self.current_next_payload,0)
-            if result_ok == True:
-                return decoded_payload                
-                
-                
-        
+            return data[0:len(data)-hash_size-self.sk_ENCR_NULL_pad_length]
+        return None
+
+    def decode_payload_type_sk(self, data):
+        ike_payload = self._decrypt_sk_body(data)
+        if ike_payload is None:
+            return
+        (result_ok, decoded_payload) = self.decode_payload(ike_payload, self.current_next_payload,0)
+        if result_ok == True:
+            return decoded_payload
+
+    def _handle_skf(self, data):
+        """G1 (RFC 7383): reassemble an inbound fragmented IKE message. An SKF payload replaces SK
+        when the ePDG fragments a large message (e.g. an IKE_AUTH carrying a cert chain). Each SKF
+        is individually encrypted+integrity-protected and prefixed (after the 4-byte generic payload
+        header) with Fragment Number(2) + Total Fragments(2) [RFC 7383 §2.5]; only fragment #1
+        carries the real next_payload. We decrypt each fragment, buffer plaintext by (message-id,
+        fragment number), and once every fragment is present concatenate + decode the original
+        message — presenting it to the state machine exactly as a normal SK message would be
+        (decoded_payload = [[SK, <inner payloads>]]). Until complete, ike_decoded_ok stays False so
+        the caller's recv loop keeps reading."""
+        # SKF generic payload header at offset 28: next_payload(1) C+res(1) length(2)
+        frag_next_payload = data[28]
+        payload_len = struct.unpack("!H", data[30:32])[0]
+        # fragment header immediately after the 4-byte generic payload header
+        frag_num = struct.unpack("!H", data[32:34])[0]
+        total = struct.unpack("!H", data[34:36])[0]
+        body = data[36:28 + payload_len]           # IV + ciphertext + ICV for THIS fragment
+        plaintext = self._decrypt_sk_body(body)
+        if plaintext is None:
+            plaintext = b''
+        mid = self.ike_decoded_header['message_id']
+        buf = self._frag_buf.setdefault(mid, {"total": total, "frags": {}, "first_np": None})
+        buf["total"] = total
+        buf["frags"][frag_num] = plaintext
+        if frag_num == 1:
+            buf["first_np"] = frag_next_payload
+        swu_log("IKEv2 fragment %d/%d received (message_id=%d, %d plaintext bytes)" %
+                (frag_num, total, mid, len(plaintext)))
+        if len(buf["frags"]) >= total and all(k in buf["frags"] for k in range(1, total + 1)):
+            reassembled = b''.join(buf["frags"][k] for k in range(1, total + 1))
+            first_np = buf["first_np"] if buf["first_np"] is not None else 0
+            (ok, decoded) = self.decode_payload(reassembled, first_np, 0)
+            del self._frag_buf[mid]
+            if ok:
+                # Present it like a normal SK message so downstream state code (which checks
+                # decoded_payload[0][0] == SK and iterates decoded_payload[0][1]) is unchanged.
+                self.decoded_payload = [[SK, decoded]]
+                self.decoded_payload_ok = True
+                self.ike_decoded_ok = True
+                swu_log("IKEv2 fragments reassembled (message_id=%d, %d fragments, %d plaintext bytes)" %
+                        (mid, total, len(reassembled)))
+            else:
+                self.ike_decoded_ok = False
+        else:
+            self.ike_decoded_ok = False
+
+
     def decode_payload_type_cp(self, data):
         cfg_type = data[0]
         attribute_list = []
-        position=4
-        while position < len(data):        
-            attribute_type = struct.unpack("!H", data[position:position+2])[0]
+        position = 4
+        while position + 4 <= len(data):
+            # P0-1: mask the reserved high (R) bit of the attribute type (RFC 7296 3.15.1 — the
+            # top bit is reserved and MUST be ignored on receipt; some ePDGs set it).
+            attribute_type_raw = struct.unpack("!H", data[position:position+2])[0]
+            attribute_type = attribute_type_raw & 0x7fff
             length = struct.unpack("!H", data[position+2:position+4])[0]
+            # P0-1: never read past the buffer. A truncated/lying length must not throw an
+            # uncaught exception (that would abort the whole IKE decode) — log and stop parsing
+            # this CP, returning whatever was parsed so far.
+            if position + 4 + length > len(data):
+                swu_log("CP attribute type=%d claims length=%d but only %d bytes remain; "
+                        "stopping CP parse" % (attribute_type, length, len(data) - position - 4))
+                break
             attribute_value = b''
-            if length > 0: 
+            if length > 0:
                 att_len = self.configuration_payload_len_bytes.get(attribute_type)
-                if att_len == 4: #ip
+                if attribute_type == TIMEOUT_PERIOD_FOR_LIVENESS_CHECK:
+                    # P2-3: this attribute's value is a 4-byte network-order integer (seconds), NOT
+                    # an IPv4 address, even though its length is 4. Keep the raw bytes so state_4's
+                    # struct.unpack("!I", ...) reads the period correctly.
+                    attribute_value = data[position+4:position+4+length]
+                    attribute_list.append((attribute_type,attribute_value))
+                elif att_len == 4: #ip
                     attribute_value = socket.inet_ntop(socket.AF_INET,data[position+4:position+8])
                     attribute_list.append((attribute_type,attribute_value))
                 elif att_len == 8: #ip /netmask
@@ -1397,11 +1665,14 @@ class swu():
                     attribute_list.append((attribute_type,attribute_value_1,attribute_value_2))
                 elif att_len == 16: #ipv6
                     attribute_value = socket.inet_ntop(socket.AF_INET6,data[position+4:position+20])
-                    attribute_list.append((attribute_type,attribute_value))    
-                elif att_len == 17: #ipv6 + prefix
+                    attribute_list.append((attribute_type,attribute_value))
+                elif att_len == 17: #ipv6 + prefix (16-byte prefix + 1-byte prefix length)
+                    # P0-1 fix: the prefix length is the 17th value byte, i.e.
+                    # data[position + 4 + 16] = data[position + 20]. The old code read
+                    # data[position + 21], one byte past the attribute value.
                     attribute_value_1 = socket.inet_ntop(socket.AF_INET6,data[position+4:position+20])
-                    attribute_value_2 = data[position+21]
-                    attribute_list.append((attribute_type,attribute_value_1, attribute_value_2))                      
+                    attribute_value_2 = data[position+20]
+                    attribute_list.append((attribute_type,attribute_value_1, attribute_value_2))
                 else:
                     attribute_value = data[position+4:position+4+length]
                     attribute_list.append((attribute_type,attribute_value))
@@ -1727,86 +1998,108 @@ class swu():
 
 
     def encode_payload_type_sk(self,ike_packet):
+        # P2-4 (RFC 7383): outbound fragmentation. Only when BOTH sides advertised
+        # IKEV2_FRAGMENTATION_SUPPORTED AND the plaintext body exceeds the fragment threshold do
+        # we split into SKF fragments (returns a list[bytes] the caller/send_data iterates). The
+        # common single-SK path is byte-for-byte identical to the previous implementation, so
+        # Telus (which never fragments — its messages fit under MTU) is completely unaffected.
+        inner_next_payload = ike_packet[16]
+        plaintext_body = ike_packet[28:]
+        if (self.fragmentation_enabled and self.peer_supports_fragmentation
+                and len(plaintext_body) > self.fragment_size):
+            return self._encode_sk_fragments(ike_packet, inner_next_payload, plaintext_body)
+        return self._encode_protected_payload(ike_packet, SK, inner_next_payload, plaintext_body, None)
 
+    def _encode_protected_payload(self, ike_packet, outer_payload_type, inner_next_payload,
+                                  plaintext_body, fragment_info=None):
+        """Encrypt+integrity-protect one plaintext IKE payload body into a single SK (or SKF)
+        payload and return the complete IKE packet bytes ready to send.
+
+        outer_payload_type:  SK for a normal message, SKF for a fragment.
+        inner_next_payload:  the payload-type of the first inner payload (fragment #1 / whole SK)
+                             or NONE for fragments #2..N (RFC 7383 §2.5).
+        fragment_info:       None for SK; the 4-byte 'FragNum(2)+Total(2)' header for SKF, placed
+                             (in the clear) between the generic payload header and the IV, exactly
+                             where _handle_skf expects it and covered by the integrity check.
+
+        Factored out of the old encode_payload_type_sk so the fragment path reuses the identical
+        key-selection / AES-CBC / HMAC logic. Called with (ike_packet, SK, ike_packet[16],
+        ike_packet[28:], None) this reproduces the previous single-SK output exactly."""
         hash_size = self.integ_key_truncated_len_bytes.get(self.negotiated_integrity_algorithm)
-        
+        flags_role = self.return_flags(ike_packet[19])[2]
+        frag_prefix = fragment_info if fragment_info else b''
+
         if self.negotiated_encryption_algorithm in (ENCR_AES_CBC,):
             vector = self.return_random_bytes(16)
-            data_to_encrypt = ike_packet[28:]
-        
+            data_to_encrypt = bytes(plaintext_body)
             res = 16 - (len(data_to_encrypt) % 16)
-            if res>1:
+            if res > 1:
                 data_to_encrypt += b'\x00'*(res-1) + bytes([res-1])
             else:
                 data_to_encrypt += b'\x00'*(15+res) + bytes([15+res])
-            
-            
-            flags_role = self.return_flags(ike_packet[19])[2]  
-            
-            if flags_role == ROLE_INITIATOR:    
-                if self.old_ike_message_received == True:            
-                    cipher = Cipher(algorithms.AES(self.SK_EI_old), modes.CBC(vector))                
-                else:
-                    cipher = Cipher(algorithms.AES(self.SK_EI), modes.CBC(vector))
+
+            if flags_role == ROLE_INITIATOR:
+                key = self.SK_EI_old if self.old_ike_message_received == True else self.SK_EI
             else:
-                if self.old_ike_message_received == True:
-                    cipher = Cipher(algorithms.AES(self.SK_ER_old), modes.CBC(vector))                
-                else:
-                    cipher = Cipher(algorithms.AES(self.SK_ER), modes.CBC(vector))
-            
-            encryptor = cipher.encryptor()          
+                key = self.SK_ER_old if self.old_ike_message_received == True else self.SK_ER
+
+            cipher = Cipher(algorithms.AES(key), modes.CBC(vector))
+            encryptor = cipher.encryptor()
             cipher_data = encryptor.update(data_to_encrypt) + encryptor.finalize()
-                      
-            sk_payload = self.encode_generic_payload_header(ike_packet[16],0,vector + cipher_data + b'\x00'*hash_size) #add a dummy hash to calculate correct length    
-            new_ike_packet = ike_packet[0:16] + bytes([SK]) + ike_packet[17:28] + sk_payload        
+
+            sk_payload = self.encode_generic_payload_header(inner_next_payload, 0,
+                                                            frag_prefix + vector + cipher_data + b'\x00'*hash_size)
+            new_ike_packet = ike_packet[0:16] + bytes([outer_payload_type]) + ike_packet[17:28] + sk_payload
             new_ike_packet = self.set_ike_packet_length(new_ike_packet)
-            new_ike_packet_to_integrity = new_ike_packet[0:-hash_size]           
-            hash = self.integ_function.get(self.negotiated_integrity_algorithm) 
-            
-            if flags_role == ROLE_INITIATOR:  
-                if self.old_ike_message_received == True:            
-                    h = hmac.HMAC(self.SK_AI_old,hash)                
-                else:    
-                    h = hmac.HMAC(self.SK_AI,hash)
+            new_ike_packet_to_integrity = new_ike_packet[0:-hash_size]
+            hashf = self.integ_function.get(self.negotiated_integrity_algorithm)
+
+            if flags_role == ROLE_INITIATOR:
+                ikey = self.SK_AI_old if self.old_ike_message_received == True else self.SK_AI
             else:
-                if self.old_ike_message_received == True:
-                    h = hmac.HMAC(self.SK_AR_old,hash) 
-                else:
-                    h = hmac.HMAC(self.SK_AR,hash)            
-                
+                ikey = self.SK_AR_old if self.old_ike_message_received == True else self.SK_AR
+
+            h = hmac.HMAC(ikey, hashf)
             h.update(new_ike_packet_to_integrity)
-            hash = h.finalize()[0:hash_size]         
-            
-            return new_ike_packet_to_integrity + hash
-    
+            digest = h.finalize()[0:hash_size]
+            return new_ike_packet_to_integrity + digest
 
         elif self.negotiated_encryption_algorithm in (ENCR_NULL,):
-
-            data_to_encrypt = ike_packet[28:]   
-     
-                      
-            sk_payload = self.encode_generic_payload_header(ike_packet[16],0, data_to_encrypt + b'\x00'*(hash_size + self.sk_ENCR_NULL_pad_length))    
-            new_ike_packet = ike_packet[0:16] + bytes([SK]) + ike_packet[17:28] + sk_payload        
+            data_to_encrypt = bytes(plaintext_body)
+            sk_payload = self.encode_generic_payload_header(inner_next_payload, 0,
+                                                            frag_prefix + data_to_encrypt + b'\x00'*(hash_size + self.sk_ENCR_NULL_pad_length))
+            new_ike_packet = ike_packet[0:16] + bytes([outer_payload_type]) + ike_packet[17:28] + sk_payload
             new_ike_packet = self.set_ike_packet_length(new_ike_packet)
-            new_ike_packet_to_integrity = new_ike_packet[0:-hash_size]           
-            hash = self.integ_function.get(self.negotiated_integrity_algorithm) 
-            
-            flags_role = self.return_flags(ike_packet[19])[2]            
-            if flags_role == ROLE_INITIATOR:  
-                if self.old_ike_message_received == True:            
-                    h = hmac.HMAC(self.SK_AI_old,hash)                
-                else:    
-                    h = hmac.HMAC(self.SK_AI,hash)
+            new_ike_packet_to_integrity = new_ike_packet[0:-hash_size]
+            hashf = self.integ_function.get(self.negotiated_integrity_algorithm)
+
+            if flags_role == ROLE_INITIATOR:
+                ikey = self.SK_AI_old if self.old_ike_message_received == True else self.SK_AI
             else:
-                if self.old_ike_message_received == True:
-                    h = hmac.HMAC(self.SK_AR_old,hash) 
-                else:
-                    h = hmac.HMAC(self.SK_AR,hash)            
-                
+                ikey = self.SK_AR_old if self.old_ike_message_received == True else self.SK_AR
+
+            h = hmac.HMAC(ikey, hashf)
             h.update(new_ike_packet_to_integrity)
-            hash = h.finalize()[0:hash_size]         
-            
-            return new_ike_packet_to_integrity + hash        
+            digest = h.finalize()[0:hash_size]
+            return new_ike_packet_to_integrity + digest
+
+    def _encode_sk_fragments(self, ike_packet, inner_next_payload, plaintext_body):
+        """P2-4 (RFC 7383 §2.5): split plaintext_body into fragments of at most fragment_size and
+        encode each as its own SKF-protected IKE packet. Each fragment is independently encrypted
+        (own IV / padding / ICV) — you cannot encrypt once and slice ciphertext. Fragment #1 carries
+        the original first-payload type as its inner next_payload; #2..N use NONE. Returns
+        list[bytes]. _handle_skf reassembles the mirror image."""
+        chunk = self.fragment_size if self.fragment_size > 0 else len(plaintext_body)
+        pieces = [plaintext_body[i:i+chunk] for i in range(0, len(plaintext_body), chunk)] or [b'']
+        total = len(pieces)
+        packets = []
+        for idx, piece in enumerate(pieces, start=1):
+            frag_hdr = struct.pack("!HH", idx, total)
+            inner_np = inner_next_payload if idx == 1 else NONE
+            packets.append(self._encode_protected_payload(ike_packet, SKF, inner_np, bytes(piece), frag_hdr))
+        swu_log("IKEv2 outbound fragmentation: %d plaintext bytes -> %d SKF fragments (chunk=%d)" %
+                (len(plaintext_body), total, chunk))
+        return packets
         
         
         
@@ -1866,6 +2159,24 @@ class swu():
             self.exec_in_netns("route -A inet6 add ::/1 dev " + self.tun_device)
             self.exec_in_netns("route -A inet6 add 8000::/1 dev " + self.tun_device)
 
+        elif getattr(self, "ipv6_subnet_list", []):
+            # P0-1: the ePDG assigned the inner IPv6 by prefix (INTERNAL_IP6_SUBNET) rather than a
+            # full INTERNAL_IP6_ADDRESS. Derive one stable address inside the prefix and assign it
+            # (using the ePDG-returned prefix length, not a hard-coded /64). Publish it as
+            # ipv6_address_list[0] so state_connected/reporting and the SIP source pick it up.
+            (prefix, prefix_len) = self.ipv6_subnet_list[0]
+            derived, plen = self._derive_ipv6_address_from_subnet(prefix, prefix_len)
+            if derived:
+                self.ipv6_address_list = [derived]
+                self.exec_in_netns("ip -6 addr add %s/%d dev %s" % (derived, plen, self.tun_device))
+                self.exec_in_netns("route -A inet6 add ::/1 dev " + self.tun_device)
+                self.exec_in_netns("route -A inet6 add 8000::/1 dev " + self.tun_device)
+                swu_log("assigned derived inner IPv6 %s/%d from INTERNAL_IP6_SUBNET %s/%s" %
+                        (derived, plen, prefix, prefix_len))
+            else:
+                swu_log("INTERNAL_IP6_SUBNET %s/%s could not be turned into an address" %
+                        (prefix, prefix_len))
+
 
         if (self.dns_address_list != [] or self.dnsv6_address_list != []) and \
                 (self.netns_name or SWU_WRITE_RESOLV):
@@ -1889,11 +2200,38 @@ class swu():
                     subprocess.call("echo 'nameserver " + i +"' >> /etc/resolv.conf", shell=True)            
 
     def add_dir(self):
-        if not os.path.isdir('/etc/netns'):        
+        if not os.path.isdir('/etc/netns'):
             os.mkdir('/etc/netns')
-        if not os.path.isdir('/etc/netns/' + self.netns_name):   
+        if not os.path.isdir('/etc/netns/' + self.netns_name):
             os.mkdir('/etc/netns/'  + self.netns_name)
 
+    def _derive_ipv6_address_from_subnet(self, prefix, prefix_len):
+        """P0-1: derive ONE stable inner IPv6 address inside an ePDG-assigned prefix
+        (INTERNAL_IP6_SUBNET, TS 24.302 7.4.1.1) when no full INTERNAL_IP6_ADDRESS was supplied.
+        The interface identifier is SHA-256(IMSI) top 64 bits (RFC 4291 modified EUI-64 range,
+        local bit set, never all-zero) so the address is STABLE across reconnects/reauths — a
+        random IID would drift the SIP/IMS source address every time. The ePDG-returned prefix
+        length is honoured (VoWiFi is normally /64, but a non-/64 still yields an in-prefix
+        address). Returns (address_string, prefix_len_int) or (None, prefix_len) on error."""
+        try:
+            plen = int(prefix_len)
+        except Exception:
+            plen = 64
+        if plen < 0 or plen > 128:
+            plen = 64
+        try:
+            network = ipaddress.IPv6Network((prefix, plen), strict=False)
+        except Exception as e:
+            swu_log("could not build IPv6 network from %s/%s: %r" % (prefix, prefix_len, e))
+            return (None, plen)
+        digest = hashlib.sha256(self.imsi.encode("ascii")).digest()
+        iid = int.from_bytes(digest[:8], "big")
+        iid |= 0x0200000000000000        # set the universal/local bit (local), avoid all-zero IID
+        iid &= 0x02ffffffffffffff
+        host_bits = 128 - plen
+        host_mask = ((1 << host_bits) - 1) if host_bits > 0 else 0
+        addr_int = int(network.network_address) | (iid & host_mask)
+        return (str(ipaddress.IPv6Address(addr_int)), plen)
      
     def delete_routes(self):
         if self.netns_name:
@@ -2111,23 +2449,25 @@ class swu():
                             pipe_ike.send(self.encode_inter_process_protocol(inter_process_list_ike_message))
                             
                         elif packet[0:4] == spi_init:
-                           
+
                             if encr_alg is not None:
                                 decrypted_packet = self.decapsulate_esp_packet(packet,encr_alg,encr_key,integ_alg,integ_key)
                                 if decrypted_packet is not None:
-                                    
+
                                     os.write(self.tunnel,decrypted_packet)
-                        
+                                    self._note_esp_activity(pipe_ike)
+
                 elif sock == self.socket_esp:
                     packet, address = self.socket_esp.recvfrom(2000)
                     if encr_alg is not None:
                         if packet[20:24] == spi_init:
-                            
+
                             if encr_alg is not None:
                                 decrypted_packet = self.decapsulate_esp_packet(packet[20:],encr_alg,encr_key,integ_alg,integ_key)
                                 if decrypted_packet is not None:
-                                    
+
                                     os.write(self.tunnel,decrypted_packet)
+                                    self._note_esp_activity(pipe_ike)
                         
                
                 elif sock == pipe_ike:
@@ -2435,23 +2775,32 @@ class swu():
             header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, IKE_SA_INIT, (0,0,1), self.message_id_request)
             payload = self.encode_generic_payload_header(SA,0,self.encode_payload_type_n(RESERVED,b'',COOKIE,self.cookie_received_bytes)) 
             
-        payload += self.encode_generic_payload_header(KE,0,self.encode_payload_type_sa(self.sa_list))        
-        
-        payload += self.encode_generic_payload_header(NINR,0,self.encode_payload_type_ke())  
+        payload += self.encode_generic_payload_header(KE,0,self.encode_payload_type_sa(self.sa_list))
+
+        payload += self.encode_generic_payload_header(NINR,0,self.encode_payload_type_ke())
+
+        # G1: optionally advertise IKEv2 fragmentation (RFC 7383) as the LAST payload. When we do,
+        # whatever payload currently terminates the chain (next_payload=NONE) must instead point to
+        # N, and the new fragmentation notify (no data, protocol RESERVED) becomes the NONE
+        # terminator. Additive/optional: an ePDG that doesn't support it simply ignores the notify.
+        frag = self.fragmentation_enabled
+        last_np = N if frag else NONE
         if self.check_nat == False:
             if cookie == True:
-                payload += self.encode_generic_payload_header(NONE,0,self.nounce)  
-            else:            
-                payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_ninr())        
+                payload += self.encode_generic_payload_header(last_np,0,self.nounce)
+            else:
+                payload += self.encode_generic_payload_header(last_np,0,self.encode_payload_type_ninr())
         else:
             if cookie == True:
-                payload += self.encode_generic_payload_header(N,0,self.nounce)             
+                payload += self.encode_generic_payload_header(N,0,self.nounce)
             else:
-                payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_ninr()) 
-                
-            payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_n(RESERVED,b'',NAT_DETECTION_SOURCE_IP,self.sha1_nat_source())) 
-            payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',NAT_DETECTION_DESTINATION_IP,self.sha1_nat_destination())) 
-        packet = self.set_ike_packet_length(header+payload)        
+                payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_ninr())
+
+            payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_n(RESERVED,b'',NAT_DETECTION_SOURCE_IP,self.sha1_nat_source()))
+            payload += self.encode_generic_payload_header(last_np,0,self.encode_payload_type_n(RESERVED,b'',NAT_DETECTION_DESTINATION_IP,self.sha1_nat_destination()))
+        if frag:
+            payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',IKEV2_FRAGMENTATION_SUPPORTED))
+        packet = self.set_ike_packet_length(header+payload)
         return packet
 
     def create_IKE_AUTH(self):
@@ -2467,7 +2816,14 @@ class swu():
         # avoiding single-SA-per-subscriber conflicts on reconnect. Standard IKEv2 behaviour
         # (strongSwan sends it too).
         payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_n(RESERVED,b'',INITIAL_CONTACT))
-        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',EAP_ONLY_AUTHENTICATION))                
+        # P0-3 (optional, env SWU_PCSCF_RESELECTION_SUPPORT=1): advertise UE support for the
+        # P-CSCF restoration extension (TS 24.302 7.2.2.1) so the ePDG may enable P-CSCF
+        # reselection. Default OFF for carrier compatibility (Telus is CFG/notify-sensitive).
+        # Inserted BEFORE the terminating EAP_ONLY_AUTHENTICATION notify so it stays a mid-chain
+        # Notify (next_payload=N); the final notify remains the sole next_payload=NONE terminator.
+        if os.environ.get("SWU_PCSCF_RESELECTION_SUPPORT", "0") not in ("0", "", "no"):
+            payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_n(RESERVED,b'',P_CSCF_RESELECTION_SUPPORT))
+        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',EAP_ONLY_AUTHENTICATION))
         packet = self.set_ike_packet_length(header+payload)        
         
         encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)     
@@ -2524,6 +2880,41 @@ class swu():
 
         encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
+
+    def answer_INFORMATIONAL_error(self, notify_type):
+        """P2-2: INFORMATIONAL response carrying a single error Notify (e.g. INVALID_SPI) for an
+        ePDG INFORMATIONAL request we cannot satisfy. Responder flags (1,0,1); echoes the request
+        message-id and mirrors the (possibly old) IKE SPIs like answer_INFORMATIONAL_delete."""
+        if self.old_ike_message_received == True:
+            header = self.encode_header(self.ike_spi_initiator_old, self.ike_spi_responder_old, N, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        else:
+            header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        payload = self.encode_generic_payload_header(NONE, 0, self.encode_payload_type_n(RESERVED, b'', notify_type))
+        packet = self.set_ike_packet_length(header + payload)
+        return self.encode_payload_type_sk(packet)
+
+    def map_deleted_esp_spis_to_ue_inbound(self, peer_spi_list):
+        """P2-2: map the ePDG's ESP SPIs from a received DELETE to the UE's corresponding INBOUND
+        SPIs for the response. RFC 7296 1.4.1: a DELETE lists the sender's inbound SPIs (= the SPIs
+        WE send to = self.spi_resp_child); our response must list OUR inbound SPIs (= what the ePDG
+        sends to = self.spi_init_child). Single-bearer mapping: spi_resp_child -> spi_init_child and
+        spi_resp_child_old -> spi_init_child_old. `peer_spi_list` is a list of 4-byte SPIs (as
+        decoded by decode_payload_type_d). Returns (all_known: bool, response_spi_list: list[bytes]).
+        Future multiple-bearer support looks this up per bearer context."""
+        mapping = {}
+        if getattr(self, "spi_resp_child", None) and getattr(self, "spi_init_child", None):
+            mapping[bytes(self.spi_resp_child)] = bytes(self.spi_init_child)
+        if getattr(self, "spi_resp_child_old", None) and getattr(self, "spi_init_child_old", None):
+            mapping[bytes(self.spi_resp_child_old)] = bytes(self.spi_init_child_old)
+        response = []
+        all_known = True
+        for spi in peer_spi_list:
+            ue_inbound = mapping.get(bytes(spi))
+            if ue_inbound is None:
+                all_known = False
+            else:
+                response.append(ue_inbound)
+        return (all_known, response)
 
     def answer_INFORMATIONAL_empty(self):
         """Empty INFORMATIONAL response (no payloads). Used to acknowledge a Dead-Peer-Detection
@@ -2586,6 +2977,30 @@ class swu():
             swu_log("received ERROR Notify%s: %s (%d) - %s" % (where, name, code, desc))
         else:
             swu_log("received ERROR Notify%s: %s (%d)" % (where, name, code))
+
+    def _scan_backoff_timer(self, payload_list):
+        """Scan a decoded SK payload list for a BACKOFF_TIMER Notify (3GPP TS 24.302 8.2.9.1) that
+        the ePDG may attach to a reject, and return its value in seconds (or None). Used by the
+        reject-classification path so a network-supplied Tw3 can be surfaced/honoured."""
+        for j in payload_list:
+            if j[0] == N and j[1][1] == BACKOFF_TIMER:
+                ndata = j[1][3]
+                if ndata:
+                    secs, _txt = self.decode_backoff_timer(ndata[-1])
+                    return secs
+        return None
+
+    def note_reject(self, code, payload_list=None):
+        """Record a hard reject Notify for start_ike + the manager: classify its retry policy
+        (7.2.2.2) and capture any attached BACKOFF_TIMER. Also log the classification. Central so
+        every auth-flow error return can call it consistently before returning OTHER_ERROR."""
+        self.reject_reason_code = notify_name(code)
+        self.reject_reason_policy = reject_policy(code)
+        if payload_list is not None:
+            self.reject_backoff_seconds = self._scan_backoff_timer(payload_list)
+        bo = (" backoff=%ss" % self.reject_backoff_seconds) if self.reject_backoff_seconds else ""
+        swu_log("reject classified: %s (%d) policy=%s%s" %
+                (self.reject_reason_code, code, self.reject_reason_policy, bo))
 
     @staticmethod
     def decode_backoff_timer(value_byte):
@@ -2728,14 +3143,28 @@ class swu():
 
 
     def create_INFORMATIONAL_delete(self,protocol,spi_list = b''):
-        
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, D, 2, 0, INFORMATIONAL, (0,0,1), self.message_id_request)        
-        
-        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_d(protocol,spi_list))        
-        packet = self.set_ike_packet_length(header+payload)        
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
+
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, D, 2, 0, INFORMATIONAL, (0,0,1), self.message_id_request)
+
+        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_d(protocol,spi_list))
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
+
+
+    def create_INFORMATIONAL_liveness(self):
+        """G4: an initiator-side Dead-Peer-Detection probe — an empty INFORMATIONAL *request*
+        (no payloads) per RFC 7296 clause 2.4 / 3GPP TS 24.302 clause 7.2.2A. Uses the request
+        message-id counter and initiator flags (0,0,1); a live ePDG must answer with an
+        INFORMATIONAL response bearing the same message-id and responder flags. Distinct from the
+        RFC 3948 NAT-T keepalive (which is unacknowledged and proves nothing about SA liveness).
+        The empty SK payload carries only encrypted padding, exactly like answer_INFORMATIONAL_empty
+        but with a request header."""
+        self.message_id_request += 1
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, NONE, 2, 0, INFORMATIONAL, (0,0,1), self.message_id_request)
+        packet = self.set_ike_packet_length(header)
+        return self.encode_payload_type_sk(packet)
 
 
     def answer_CREATE_CHILD_SA(self):
@@ -2752,14 +3181,48 @@ class swu():
 
 
     def answer_NOTIFY_NO_PROPOSAL_CHOSEN(self):
-        
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, CREATE_CHILD_SA, (1,0,1), self.ike_decoded_header['message_id'])        
-        
-        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(IKE,b'',NO_PROPOSAL_CHOSEN))          
-        packet = self.set_ike_packet_length(header+payload)   
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
-        return encrypted_and_integrity_packet  
+
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, CREATE_CHILD_SA, (1,0,1), self.ike_decoded_header['message_id'])
+
+        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(IKE,b'',NO_PROPOSAL_CHOSEN))
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
+        return encrypted_and_integrity_packet
+
+    def classify_create_child_request(self, payloads):
+        """P2-1: classify an ePDG-initiated CREATE_CHILD_SA request (TS 24.302 / RFC 7296 1.3):
+          "ike_rekey"          - SA protocol ID is IKE (rekey the IKE SA)
+          "esp_rekey"          - SA protocol ID is ESP and a REKEY_SA notify is present
+          "additional_bearer"  - SA protocol ID is ESP with NO REKEY_SA (with or without EPS_QOS/
+                                 TFT): a new/additional child SA we do not support
+          "unknown"            - anything else
+        `payloads` is self.decoded_payload[0][1] (the inner payload list)."""
+        sa_protocol = None
+        has_rekey = False
+        for i in payloads:
+            if i[0] == SA:
+                sa_protocol = i[1][1]        # protocol_id
+            elif i[0] == N and i[1][1] == REKEY_SA:
+                has_rekey = True
+        if sa_protocol == IKE:
+            return "ike_rekey"
+        if sa_protocol == ESP:
+            return "esp_rekey" if has_rekey else "additional_bearer"
+        return "unknown"
+
+    def answer_CREATE_CHILD_SA_error(self, notify_type):
+        """P2-1: respond to an ePDG-initiated CREATE_CHILD_SA we cannot satisfy with a single
+        error Notify (NO_ADDITIONAL_SAS / NO_PROPOSAL_CHOSEN / INVALID_SPI). These are RFC 7296
+        error notifies carrying no 3GPP-specific data. Responder flags (1,0,1); echoes the
+        request's message-id."""
+        header = self.encode_header(
+            self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, CREATE_CHILD_SA,
+            (1, 0, 1), self.ike_decoded_header['message_id'])
+        payload = self.encode_generic_payload_header(
+            NONE, 0, self.encode_payload_type_n(RESERVED, b'', notify_type))
+        packet = self.set_ike_packet_length(header + payload)
+        return self.encode_payload_type_sk(packet)
 
 
     def create_CREATE_CHILD_SA(self, lowest = 0):
@@ -2776,19 +3239,67 @@ class swu():
 
 
     def create_CREATE_CHILD_SA_CHILD(self,lowest = 0):
-        
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (0,0,1), self.message_id_request)        
-          
-        payload = self.encode_generic_payload_header(NINR,0,self.encode_payload_type_sa(self.sa_list_create_child_sa_child)) 
-        payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_ninr(lowest))          
+
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (0,0,1), self.message_id_request)
+
+        payload = self.encode_generic_payload_header(NINR,0,self.encode_payload_type_sa(self.sa_list_create_child_sa_child))
+        payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_ninr(lowest))
         payload += self.encode_generic_payload_header(TSI,0,self.encode_payload_type_n(ESP,self.spi_init_child,REKEY_SA))
-        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())          
-        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_tsr())   
-        
-        packet = self.set_ike_packet_length(header+payload)   
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
-        return encrypted_and_integrity_packet  
+        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())
+        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_tsr())
+
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
+        return encrypted_and_integrity_packet
+
+    def create_CREATE_CHILD_SA_CHILD_pfs(self, lowest = 0):
+        """UE-initiated CHILD_SA (ESP) rekey WITH PFS. Same as create_CREATE_CHILD_SA_CHILD but the
+        proposal carries a D-H transform and the message includes a KE payload, so the new ESP keys
+        are derived from a fresh DH exchange (RFC 7296 2.17). Telus rejects a no-PFS child rekey with
+        NO_PROPOSAL_CHOSEN, so proactive UE rekey must offer PFS. Payload order per RFC 7296:
+        SA, Ni, KEi, TSi, TSr. The DH keypair must already be generated (state_ue_rekey_child)."""
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (0,0,1), self.message_id_request)
+        # next_payload chain: SA -> Ni -> KE -> TSi -> TSr -> (none)
+        payload  = self.encode_generic_payload_header(NINR,0,self.encode_payload_type_sa(self.sa_list_create_child_sa_child))
+        payload += self.encode_generic_payload_header(KE,0,self.encode_payload_type_ninr(lowest))          # Ni
+        payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_ke())                   # KEi
+        payload += self.encode_generic_payload_header(TSI,0,self.encode_payload_type_n(ESP,self.spi_init_child,REKEY_SA))
+        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())
+        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_tsr())
+        packet = self.set_ike_packet_length(header+payload)
+        return self.encode_payload_type_sk(packet)
+
+    def _child_sa_list_with_pfs(self):
+        """Return a copy of the negotiated child proposal with a D-H (MODP_2048) transform appended,
+        for a PFS CHILD_SA rekey. The base proposal (ENCR/INTEG/ESN) is whatever was negotiated at
+        IKE_AUTH; we only add the DH group Telus accepts on rekey (see render.py default_esp note)."""
+        base = [list(t) for t in self.sa_list_negotiated_child[0]]   # shallow-copy transforms
+        # Drop any existing D_H (defensive) then append MODP_2048.
+        base = [t for t in base if not (len(t) >= 1 and t[0] == D_H)]
+        base.append([D_H, MODP_2048_bit])
+        return [base]
+
+    def generate_keying_material_child_pfs(self):
+        """CHILD_SA keymat WITH PFS (RFC 7296 2.17): KEYMAT = prf+(SK_d, g^ir | Ni | Nr), where
+        g^ir is the NEW DH shared secret from this rekey. (The no-PFS variant omits g^ir.) SPIs,
+        algorithm sizes and output slicing are identical to generate_keying_material_child."""
+        STREAM = self.dh_shared_key + self.nounce + self.nounce_received
+        AUTH_KEY_SIZE = self.integ_key_len_bytes.get(self.negotiated_integrity_algorithm_child)
+        ENCR_KEY_SIZE = self.negotiated_encryption_algorithm_key_size_child // 8
+        if self.negotiated_encryption_algorithm_child in (ENCR_AES_GCM_8, ENCR_AES_GCM_12, ENCR_AES_GCM_16):
+            ENCR_KEY_SIZE += 4
+        KEY_LENGHT_TOTAL = 2*AUTH_KEY_SIZE + 2*ENCR_KEY_SIZE
+        KEYMAT = self.prf_plus(self.negotiated_prf, self.SK_D, STREAM, KEY_LENGHT_TOTAL)
+        self.SK_IPSEC_EI = KEYMAT[0:ENCR_KEY_SIZE]
+        self.SK_IPSEC_AI = KEYMAT[ENCR_KEY_SIZE:ENCR_KEY_SIZE+AUTH_KEY_SIZE]
+        self.SK_IPSEC_ER = KEYMAT[ENCR_KEY_SIZE+AUTH_KEY_SIZE:2*ENCR_KEY_SIZE+AUTH_KEY_SIZE]
+        self.SK_IPSEC_AR = KEYMAT[2*ENCR_KEY_SIZE+AUTH_KEY_SIZE:2*ENCR_KEY_SIZE+2*AUTH_KEY_SIZE]
+        print('SK_IPSEC_AI',toHex(self.SK_IPSEC_AI))
+        print('SK_IPSEC_AR',toHex(self.SK_IPSEC_AR))
+        print('SK_IPSEC_EI',toHex(self.SK_IPSEC_EI))
+        print('SK_IPSEC_ER',toHex(self.SK_IPSEC_ER))
+        self.print_esp_sa()
 
     def answer_CREATE_CHILD_SA_CHILD(self,lowest = 0):
         
@@ -2813,27 +3324,14 @@ class swu():
         self.message_id_request = 0
         
         packet = self.create_IKE_SA_INIT(retry, cookie)
-        
+
         self.AUTH_SA_INIT_packet = packet #needed for AUTH Payload in state 4
-        
-        self.send_data(packet)
+
         print('sending IKE_SA_INIT')
-        
-        try:
-        #if True:
-            while True:
-                if self.userplane_mode == ESP_PROTOCOL:
-                    packet, address = self.socket.recvfrom(2000)  
-                    self.decode_ike(packet)
-                    if self.ike_decoded_ok == True: break                
-                else:                 
-                    packet, address = self.socket_nat.recvfrom(2000)                     
-                    self.decode_ike(packet[4:])
-                    if self.ike_decoded_ok == True: break                     
-                
-        except: #timeout          
+        # P2-5: send + await response, retransmitting the same IKE_SA_INIT bytes on timeout.
+        if not self._send_request_await_response(packet):
             return TIMEOUT,'TIMEOUT'
-        
+
         
         if self.ike_decoded_header['exchange_type'] == IKE_SA_INIT:
             print('received IKE_SA_INIT')        
@@ -2859,6 +3357,8 @@ class swu():
                         self.remove_sa_from_list(accepted_dh_group)
                         return REPEAT_STATE,'INVALID_KE_PAYLOAD'
                     elif i[1][1]<16384: #error
+                        self.log_notify_error(i[1][1], "IKE_SA_INIT")
+                        self.note_reject(i[1][1], self.decoded_payload)
                         return OTHER_ERROR,str(i[1][1])
                         
                     elif i[1][1] == COOKIE:
@@ -2881,6 +3381,13 @@ class swu():
                         print('NAT SOURCE CALCULATED',toHex(calculated_nat_detection_source))
                         if received_nat_detection_source != calculated_nat_detection_source:
                             self.userplane_mode = NAT_TRAVERSAL
+
+                    elif i[1][1] == IKEV2_FRAGMENTATION_SUPPORTED:
+                        # G1 (RFC 7383): the ePDG echoes this when it can fragment large IKE
+                        # messages (e.g. an IKE_AUTH bearing a cert chain). We then accept inbound
+                        # SKF fragments and reassemble them (see decode_ike).
+                        self.peer_supports_fragmentation = True
+                        swu_log("ePDG supports IKEv2 fragmentation (RFC 7383)")
                         
             self.generate_keying_material()
             
@@ -2898,24 +3405,11 @@ class swu():
             packet = self.create_IKE_AUTH()
         else:
             packet = self.create_IKE_AUTH_EAP_IDENTITY()
-        self.send_data(packet)
-        print('sending IKE_AUTH (1)')        
+        print('sending IKE_AUTH (1)')
+        # P2-5: send + await, retransmitting the same IKE_AUTH bytes on timeout.
+        if not self._send_request_await_response(packet):
+            return TIMEOUT,'TIMEOUT'
 
-        try:
-        
-            while True:
-                if self.userplane_mode == ESP_PROTOCOL:
-                    packet, address = self.socket.recvfrom(2000)  
-                    self.decode_ike(packet)
-                    if self.ike_decoded_ok == True: break                
-                else:
-                    packet, address = self.socket_nat.recvfrom(2000)  
-                    self.decode_ike(packet[4:])
-                    if self.ike_decoded_ok == True: break                     
-                
-        except: #timeout
-            return TIMEOUT,'TIMEOUT'        
-        
         eap_received = False
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
             print('received IKE_AUTH (1)')             
@@ -2942,6 +3436,7 @@ class swu():
                                      self.identification_responder[1] if self.identification_responder else "?"))
                         else:
                             self.log_notify_error(code, "IKE_AUTH")
+                        self.note_reject(code, self.decoded_payload[0][1])
                         return OTHER_ERROR,str(code)
 
                 elif i[0] == EAP:
@@ -3112,24 +3607,11 @@ class swu():
     def state_3(self):
         self.message_id_request += 1
         packet = self.create_IKE_AUTH_2()
-        self.send_data(packet)
-        print('sending IKE_SA_AUTH (2)')        
+        print('sending IKE_SA_AUTH (2)')
+        # P2-5: send + await, retransmitting the same IKE_AUTH(2) bytes on timeout.
+        if not self._send_request_await_response(packet):
+            return TIMEOUT,'TIMEOUT'
 
-
-        try:
-            while True:
-                if self.userplane_mode == ESP_PROTOCOL:
-                    packet, address = self.socket.recvfrom(2000)  
-                    self.decode_ike(packet)
-                    if self.ike_decoded_ok == True: break                
-                else:
-                    packet, address = self.socket_nat.recvfrom(2000)  
-                    self.decode_ike(packet[4:])
-                    if self.ike_decoded_ok == True: break                     
-                
-        except: #timeout
-            return TIMEOUT,'TIMEOUT'        
-        
         
         eap_received = False
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
@@ -3139,6 +3621,7 @@ class swu():
                 if i[0] == N:    #protocol_id, notify_message_type, spi, notification_data
                     if i[1][1]<16384: #error
                         self.log_notify_error(i[1][1], "IKE_AUTH")
+                        self.note_reject(i[1][1], self.decoded_payload[0][1])
                         return OTHER_ERROR,str(i[1][1])
 
                 elif i[0] == EAP:
@@ -3250,23 +3733,11 @@ class swu():
     def state_4(self):
         self.message_id_request += 1
         packet = self.create_IKE_AUTH_3()
-        self.send_data(packet)
-        print('sending IKE_AUTH (3)')        
-            
-        try:
-            while True:
-                if self.userplane_mode == ESP_PROTOCOL:
-                    packet, address = self.socket.recvfrom(2000)  
-                    self.decode_ike(packet)
-                    if self.ike_decoded_ok == True: break                
-                else:
-                    packet, address = self.socket_nat.recvfrom(2000)  
-                    self.decode_ike(packet[4:])
-                    if self.ike_decoded_ok == True: break                     
-                
-        except: #timeout
-            return TIMEOUT,'TIMEOUT'            
-            
+        print('sending IKE_AUTH (3)')
+        # P2-5: send + await, retransmitting the same IKE_AUTH(3) bytes on timeout.
+        if not self._send_request_await_response(packet):
+            return TIMEOUT,'TIMEOUT'
+
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
             print('received IKE_AUTH (3)')             
             for i in self.decoded_payload[0][1]:
@@ -3275,6 +3746,7 @@ class swu():
                     ntype = i[1][1]
                     if ntype<16384: #error
                         self.log_notify_error(ntype, "IKE_AUTH")
+                        self.note_reject(ntype, self.decoded_payload[0][1])
                         return OTHER_ERROR,str(ntype)
                     elif ntype in (PDN_TYPE_IPv4_ONLY_ALLOWED, PDN_TYPE_IPv6_ONLY_ALLOWED):
                         # The network is telling us only one PDN type is allowed. We request an
@@ -3295,14 +3767,35 @@ class swu():
                         self.ipv6_address_list = self.get_cp_attribute_value(i[1][1],INTERNAL_IP6_ADDRESS)
                         self.dnsv6_address_list = self.get_cp_attribute_value(i[1][1],INTERNAL_IP6_DNS) 
                         self.pcscfv6_address_list = self.get_cp_attribute_value(i[1][1],P_CSCF_IP6_ADDRESS)
+                        # P0-1: INTERNAL_IP6_SUBNET assigns the inner IPv6 as prefix+prefix_len
+                        # (decoded as (type, prefix_str, prefix_len)); keep the length so
+                        # set_routes can derive a stable address inside the prefix.
+                        self.ipv6_subnet_list = [(a[1], a[2]) for a in i[1][1]
+                                                 if a[0] == INTERNAL_IP6_SUBNET and len(a) >= 3]
                         print('IPV4 ADDRESS', self.ip_address_list)
                         print('DNS IPV4 ADDRESS', self.dns_address_list)
                         print('P-CSCF IPV4 ADDRESS', self.pcscf_address_list)
                         print('IPV6 ADDRESS', self.ipv6_address_list)
-                        print('DNS IPV6 ADDRESS', self.dnsv6_address_list)                        
+                        print('DNS IPV6 ADDRESS', self.dnsv6_address_list)
                         print('P-CSCF IPV6 ADDRESS', self.pcscfv6_address_list)
-                        if self.ip_address_list == [] and self.ipv6_address_list == []:
-                            return OTHER_ERROR,'NO IP ADDRESS (IPV4 or IPV6)'                       
+                        print('IPV6 SUBNET', self.ipv6_subnet_list)
+                        # G4.3 (optional, gated): honour a network-supplied liveness period ONLY if
+                        # the ePDG volunteers TIMEOUT_PERIOD_FOR_LIVENESS_CHECK (8.2.4.2, 4-byte
+                        # seconds). We do NOT add it to the default cp_list (Telus is sensitive to
+                        # extra CFG attributes — see the IPv6-only note), so on Telus this never
+                        # fires; it just means a carrier that returns it gets its period respected.
+                        _liveness_attr = self.get_cp_attribute_value(i[1][1], TIMEOUT_PERIOD_FOR_LIVENESS_CHECK)
+                        if _liveness_attr:
+                            try:
+                                val = _liveness_attr[0]
+                                period = struct.unpack("!I", val[:4])[0] if isinstance(val, (bytes, bytearray)) and len(val) >= 4 else int(val)
+                                if period > 0:
+                                    self.liveness_period = float(period)
+                                    swu_log("ePDG supplied liveness period = %ds (TIMEOUT_PERIOD_FOR_LIVENESS_CHECK); adopting" % period)
+                            except Exception as _e:
+                                swu_log("could not parse TIMEOUT_PERIOD_FOR_LIVENESS_CHECK: %r" % _e)
+                        if self.ip_address_list == [] and self.ipv6_address_list == [] and self.ipv6_subnet_list == []:
+                            return OTHER_ERROR,'NO IP ADDRESS (IPV4 or IPV6)'
                     else:
                         #check error
                         return OTHER_ERROR,'NO CP REPLY'                     
@@ -3378,45 +3871,106 @@ class swu():
 
                     elif protocol == ESP:
                         print('received INFORMATIONAL (DELETE SA CHILD)')
-                        packet = self.answer_INFORMATIONAL_delete_CHILD(ESP,self.spi_init_child_old)
-                        self.send_data(packet)
-                        print('answering INFORMATIONAL (DELETE SA CHILD)')
+                        # P2-2: map the ePDG's ESP SPI(s) to OUR inbound SPI(s) for the response.
+                        # An empty SPI list or any unknown SPI -> INVALID_SPI (never blindly delete
+                        # the live SA using a stale spi_init_child_old, as the old code did). All
+                        # known -> reply DELETE ESP listing OUR inbound SPI(s).
+                        if num_spi == 0:
+                            swu_log("ESP DELETE with no SPI; replying INVALID_SPI")
+                            self.send_data(self.answer_INFORMATIONAL_error(INVALID_SPI))
+                        else:
+                            all_known, resp_spis = self.map_deleted_esp_spis_to_ue_inbound(spi_list)
+                            if not all_known:
+                                swu_log("ESP DELETE references unknown SPI(s) %s; replying INVALID_SPI" %
+                                        ",".join(s.hex() for s in spi_list))
+                                self.send_data(self.answer_INFORMATIONAL_error(INVALID_SPI))
+                            else:
+                                self.send_data(self.answer_INFORMATIONAL_delete_CHILD(ESP, b''.join(resp_spis)))
+                                print('answering INFORMATIONAL (DELETE SA CHILD)')
+                                swu_log("ESP DELETE ack: peer SPI(s) %s -> our inbound SPI(s) %s" %
+                                        (",".join(s.hex() for s in spi_list),
+                                         ",".join(s.hex() for s in resp_spis)))
+                                # If the ePDG deleted our CURRENT active ESP SA (single-bearer) the
+                                # dataplane is gone -> tear down for a supervised re-establish
+                                # (fresh EAP-AKA + PIN verify). A delete that only referenced an OLD
+                                # (rekeyed-away) SPI is acked without disturbing the live SA.
+                                current_deleted = bool(getattr(self, "spi_resp_child", None)) and \
+                                    any(bytes(s) == bytes(self.spi_resp_child) for s in spi_list)
+                                if current_deleted or reactivation:
+                                    swu_log("active ESP SA deleted by ePDG%s; tearing down for "
+                                            "supervised re-establish" %
+                                            (" (REACTIVATION requested)" if reactivation else ""))
+                                    self.ike_to_ipsec_encoder.send(bytes([INTER_PROCESS_DELETE_SA]))
+                                    self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA]))
+                                    self.delete_routes()
+                                    exit(1)
                         
                         
     def state_epdg_create_sa(self):
-    
-        isIKE = False
-        isESP = False
-
-        print('\nSTATE ePDG STARTED IKE/IPSEC REKEY:\n----------------------------------')     
-                         
+        """P2-1: handle an ePDG-INITIATED CREATE_CHILD_SA request. Classify it (TS 24.302 / RFC
+        7296) and respond with the correct, unambiguous message instead of the old 'reply
+        NO_PROPOSAL_CHOSEN then start our OWN CHILD rekey' behaviour, which confuses a strict ePDG
+        state machine. We do not support multiple bearers or in-place IKE-SA rekey, so we return a
+        clean error Notify and let the entrypoint supervisor re-establish if the ePDG then tears
+        down — deterministic and self-healing. NOTE: the UE-initiated proactive PFS rekey
+        (_rekey_tick / state_ue_rekey_child) is a SEPARATE path and is unchanged."""
+        print('\nSTATE ePDG CREATE_CHILD_SA:\n----------------------------------')
         print(self.decoded_payload)
-        for i in self.decoded_payload[0][1]:
-            if i[0] == SA: #
-                proposal = i[1][0]
-                protocol_id = i[1][1]
-                spi = i[1][2]
-                
-                if protocol_id == IKE:
-                    isIKE = True
-   
-                elif protocol_id == ESP:
-                    isESP = True
-                    
-            elif i[0] == NINR:
-                self.nounce_received = i[1][0]    
+        payloads = self.decoded_payload[0][1]
+        # Keep the received nonce (some responses/paths reference it) exactly as before.
+        for i in payloads:
+            if i[0] == NINR:
+                self.nounce_received = i[1][0]
 
-        if isIKE == True:
-            print('received CREATE_CHILD_SA (IKE)')
-            self.state_ue_create_sa(-1)
- 
-        if isESP == True:
-            print('received CREATE_CHILD_SA (IPSEC)')
-            packet = self.answer_NOTIFY_NO_PROPOSAL_CHOSEN()
-            self.send_data(packet) 
-            print('answering CREATE_CHILD_SA (IPSEC: NO PROPROSAL CHOSEN)')
-            
-            self.state_ue_create_sa_child() 
+        kind = self.classify_create_child_request(payloads)
+        swu_log("ePDG-initiated CREATE_CHILD_SA classified as: %s" % kind)
+
+        if kind == "ike_rekey":
+            # Accepting an IKE SA rekey safely requires full DH + new-SPI + key rederivation while
+            # retaining the old SA until the DELETE completes; not implemented. Refuse cleanly and
+            # do NOT start our own rekey.
+            swu_log("ePDG IKE SA rekey not supported; replying NO_PROPOSAL_CHOSEN")
+            self.send_data(self.answer_CREATE_CHILD_SA_error(NO_PROPOSAL_CHOSEN))
+        elif kind == "esp_rekey":
+            self._handle_epdg_esp_rekey(payloads)
+        elif kind == "additional_bearer":
+            # We do not advertise IKEV2_MULTIPLE_BEARER_PDN_CONNECTIVITY and do not implement TFT
+            # validation, so refuse an additional bearer with NO_ADDITIONAL_SAS (RFC 7296 3.10.1).
+            swu_log("ePDG additional-bearer CREATE_CHILD_SA not supported; replying NO_ADDITIONAL_SAS")
+            self.send_data(self.answer_CREATE_CHILD_SA_error(NO_ADDITIONAL_SAS))
+        else:
+            swu_log("ePDG CREATE_CHILD_SA of unrecognised type; replying NO_PROPOSAL_CHOSEN")
+            self.send_data(self.answer_CREATE_CHILD_SA_error(NO_PROPOSAL_CHOSEN))
+
+    def _handle_epdg_esp_rekey(self, payloads):
+        """P2-1: an ePDG-initiated ESP CHILD_SA rekey (SA=ESP + REKEY_SA notify). Validate the
+        REKEY_SA SPI against our known ESP SPIs: an unknown SPI gets INVALID_SPI and the live SA is
+        never touched. For a known SPI, full in-place acceptance (new inbound SPI + key
+        rederivation + IPsec-worker switch) is gated behind SWU_ACCEPT_EPDG_ESP_REKEY (default off,
+        unverified against Telus); by default we refuse with NO_PROPOSAL_CHOSEN so the ePDG
+        re-establishes deterministically rather than risking an untested mid-call SA switch."""
+        rekey_spi = None
+        for i in payloads:
+            if i[0] == N and i[1][1] == REKEY_SA:
+                rekey_spi = i[1][2]           # notify SPI = the ePDG's (responder) ESP SPI to rekey
+                break
+        known_spis = [s for s in (getattr(self, "spi_resp_child", None),
+                                  getattr(self, "spi_resp_child_old", None)) if s]
+        if rekey_spi is None or rekey_spi not in known_spis:
+            swu_log("ePDG ESP rekey REKEY_SA SPI %s not recognised; replying INVALID_SPI" %
+                    (rekey_spi.hex() if rekey_spi else "(none)"))
+            self.send_data(self.answer_CREATE_CHILD_SA_error(INVALID_SPI))
+            return
+        if os.environ.get("SWU_ACCEPT_EPDG_ESP_REKEY", "0") not in ("0", "", "no"):
+            # Opt-in placeholder: a full accept path is intentionally not implemented here (cannot
+            # be verified on Telus). If enabled without an implementation, fail safe to a clean
+            # error rather than a half-completed SA switch.
+            swu_log("SWU_ACCEPT_EPDG_ESP_REKEY set but in-place accept is not implemented; "
+                    "replying NO_PROPOSAL_CHOSEN for a supervised re-establish")
+        else:
+            swu_log("ePDG ESP rekey for known SPI %s; not accepting in place -> NO_PROPOSAL_CHOSEN "
+                    "(supervised re-establish)" % rekey_spi.hex())
+        self.send_data(self.answer_CREATE_CHILD_SA_error(NO_PROPOSAL_CHOSEN))
 
 
   
@@ -3437,39 +3991,73 @@ class swu():
         print('sending CREATE_CHILD_SA (IKE)')
 
     def state_ue_create_sa_child(self,lowest = 0): #IPSEC REKEY
-        print('\nSTATE UE STARTED IPSEC REKEY:\n--------------------------')        
+        print('\nSTATE UE STARTED IPSEC REKEY:\n--------------------------')
 
         self.sa_list_create_child_sa_child = self.sa_list_negotiated_child
-                
-        
+
+
         self.message_id_request += 1
         packet = self.create_CREATE_CHILD_SA_CHILD(lowest)
         #send request
         self.send_data(packet)
         print('sending CREATE_CHILD_SA (IPSEC)')
+
+    def state_ue_rekey_child(self):
+        """Proactive UE-initiated CHILD_SA (ESP) rekey WITH PFS (the periodic-rekey path). Builds a
+        child proposal augmented with MODP_2048, generates a fresh DH keypair, and sends
+        CREATE_CHILD_SA [ SA Ni KEi TSi TSr ]. The response is processed by
+        state_epdg_create_sa_response (ESP branch, which folds in the peer KE when present). On
+        NO_PROPOSAL_CHOSEN / TEMPORARY_FAILURE / no-response the caller (_rekey_tick) falls back to a
+        supervised re-establish."""
+        print('\nSTATE UE STARTED PFS IPSEC REKEY:\n--------------------------')
+        swu_log("proactive CHILD_SA rekey (PFS, MODP_2048): sending CREATE_CHILD_SA")
+        self.sa_list_create_child_sa_child = self._child_sa_list_with_pfs()
+        # Fresh DH keypair for this rekey (group 14).
+        self.dh_create_private_key_and_public_bytes(self.iana_diffie_hellman.get(MODP_2048_bit))
+        self.dh_group_num = MODP_2048_bit
+        self.message_id_request += 1
+        packet = self.create_CREATE_CHILD_SA_CHILD_pfs(0)
+        self.send_data(packet)
+        print('sending CREATE_CHILD_SA (IPSEC PFS)')
                 
     def state_epdg_create_sa_response(self):
         isIKE = False
         isESP = False
-        
+        ke_received = False
+        error_notify = None
+
         for i in self.decoded_payload[0][1]:
             if i[0] == SA: #
                 proposal = i[1][0]
                 protocol_id = i[1][1]
                 spi = i[1][2]
-                
+
                 if protocol_id == IKE:
                     isIKE = True
                 elif protocol_id == ESP:
-                    isESP = True               
-                    
+                    isESP = True
+
             elif i[0] == KE:
                 dh_peer_group = i[1][0]
-                dh_peer_public_key_bytes = i[1][1]                            
-                self.dh_calculate_shared_key(dh_peer_public_key_bytes)          
-            
+                dh_peer_public_key_bytes = i[1][1]
+                self.dh_calculate_shared_key(dh_peer_public_key_bytes)
+                ke_received = True
+
             elif i[0] == NINR:
-                self.nounce_received = i[1][0]    
+                self.nounce_received = i[1][0]
+
+            elif i[0] == N and i[1][1] < 16384:   # error-type notify => rekey rejected
+                error_notify = i[1][1]
+
+        # A CREATE_CHILD_SA response carrying an error notify (e.g. NO_PROPOSAL_CHOSEN(14),
+        # TEMPORARY_FAILURE(43)) means our rekey was refused. Do NOT install anything; let the
+        # proactive-rekey caller fall back to a supervised re-establish (handled in _rekey_tick via
+        # the _rekey_outstanding flag) — the SA keeps running on the old keys until then.
+        if error_notify is not None:
+            self.log_notify_error(error_notify, "CREATE_CHILD_SA (rekey) response")
+            self._rekey_outstanding = False
+            self._rekey_failed = True
+            return
 
 
         if isIKE == True:
@@ -3505,8 +4093,13 @@ class swu():
 
             print('NEW CHILD SPI INITIATOR ',toHex(self.spi_init_child))
             print('NEW CHILD SPI RESPONDER',toHex(self.spi_resp_child))
-            
-            self.generate_keying_material_child()
+
+            # PFS rekey (our proactive path) folds the fresh DH secret into the child keymat;
+            # a no-PFS rekey (ePDG-initiated, no KE) uses SK_d + nonces only.
+            if ke_received:
+                self.generate_keying_material_child_pfs()
+            else:
+                self.generate_keying_material_child()
             inter_process_list_start_encoder = [
                 INTER_PROCESS_UPDATE_SA,
                 [
@@ -3533,8 +4126,17 @@ class swu():
             self.ike_to_ipsec_decoder.send(self.encode_inter_process_protocol(inter_process_list_start_decoder))            
             
             #send request
-            self.send_data(packet)        
-            print('sending INFORMATIONAL (DELETE IPSEC old)')            
+            self.send_data(packet)
+            print('sending INFORMATIONAL (DELETE IPSEC old)')
+
+            # Proactive-rekey bookkeeping: the CHILD SA was just refreshed -> restart its rekey
+            # clock and clear the in-flight flag so _rekey_tick schedules the next one.
+            self._child_sa_time = time.monotonic()
+            self._rekey_outstanding = False
+            self._rekey_sent_at = None
+            if self.child_rekey_period > 0:
+                swu_log("CHILD_SA rekey complete; next proactive rekey in ~%d min" %
+                        int(self.child_rekey_period / 60))
 
     def state_connected(self):
         #set udp 4500 socket (self.socket_nat)
@@ -3608,30 +4210,66 @@ class swu():
                 ctl_f = None
         ctl_src = ctl_f if ctl_f is not None else sys.stdin
         socket_list = [ctl_src, self.socket, self.ike_to_ipsec_decoder]
-        
+
+        # G4: seed the liveness clock; reset on every protected IKE message decoded below.
+        self._last_rx = time.monotonic()
+        self._liveness_outstanding = 0
+        # P2-5: start each (re)connection with an EMPTY duplicate-request cache. After an in-process
+        # reauth ('r' control command) the IKE SPIs and SK_* keys change and the ePDG restarts its
+        # message-id sequence, so a response cached under the OLD SA must never be resent for a
+        # colliding (exchange_type, message_id) on the NEW SA (it would carry stale SPIs/ICV and the
+        # real handler — DPD ack / P-CSCF re-register / DELETE — would be wrongly skipped).
+        self._response_cache = {}
+        self._response_cache_order = []
+        # Proactive rekey: start the CHILD-SA clock now (SA was just installed above). Cleared to
+        # None only if rekey is disabled, so _rekey_tick is a no-op.
+        self._child_sa_time = time.monotonic() if self.child_rekey_period > 0 else None
+        self._rekey_outstanding = False
+        self._rekey_sent_at = None
+        self._rekey_failed = False
+        if self.child_rekey_period > 0:
+            swu_log("proactive CHILD_SA rekey enabled: every %d min (0=off via SWU_CHILD_REKEY_MINUTES)" %
+                    int(self.child_rekey_period / 60))
+
         while True:
-            
-            read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [])
-            
+
+            # Wake select() for whichever timer fires first: G4 liveness OR proactive rekey. On a
+            # busy tunnel a packet wakes us sooner; on idle this bounds the sleep so the timers run.
+            _timeouts = [t for t in (
+                self.liveness_period if self.liveness_period > 0 else None,
+                self._rekey_select_timeout(),
+            ) if t is not None]
+            _timeout = min(_timeouts) if _timeouts else None
+            read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [], _timeout)
+
             for sock in read_sockets:
      
                 if sock == self.socket:
 
                         
-                    packet, server_address = self.socket.recvfrom(2000)                    
+                    packet, server_address = self.socket.recvfrom(2000)
                     if server_address[0] == self.server_address[0]: #check server IP address. source port could be different than 500 or 4500, if it's a request reponse must be sent to the same port
-                                  
-                        self.decode_ike(packet)    
+
+                        self.decode_ike(packet)
                         if self.ike_decoded_ok == True:
-                
-                            if self.ike_decoded_header['exchange_type'] == INFORMATIONAL and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 0:
-                                self.state_delete(False)
-                               
+                            # G4: any validly-decoded protected message from the ePDG proves the SA
+                            # is alive — reset the liveness clock and clear any outstanding probe.
+                            self._note_liveness_rx()
+
+                            if self.ike_decoded_header['exchange_type'] == INFORMATIONAL and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 1:
+                                # G4: an INFORMATIONAL *response* (flags[0]==1). This is the ack to
+                                # our own liveness probe (or a rekey/delete response we initiated).
+                                # _note_liveness_rx() above already cleared the pending state; just
+                                # consume it (no responder action).
+                                pass
+                            elif self.ike_decoded_header['exchange_type'] == INFORMATIONAL and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 0:
+                                self._dispatch_epdg_request(lambda: self.state_delete(False))
+
                             elif self.ike_decoded_header['exchange_type'] == CREATE_CHILD_SA and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 0:
-                                self.state_epdg_create_sa()
-                            
+                                self._dispatch_epdg_request(self.state_epdg_create_sa)
+
                             elif self.ike_decoded_header['exchange_type'] == CREATE_CHILD_SA and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 1:
-                                self.state_epdg_create_sa_response() 
+                                self.state_epdg_create_sa_response()
                             
                             
                         
@@ -3642,25 +4280,33 @@ class swu():
                                     
 
                 elif sock == self.ike_to_ipsec_decoder:
-                    pipe_packet = self.ike_to_ipsec_decoder.recv()                     
+                    pipe_packet = self.ike_to_ipsec_decoder.recv()
                     decode_list = self.decode_inter_process_protocol(pipe_packet)
-                    if decode_list[0] == INTER_PROCESS_IKE:
+                    if decode_list[0] == INTER_PROCESS_LIVENESS_RX:
+                        # P2-3: the ESP-decap worker saw protected IPsec traffic -> SA is alive.
+                        self._note_liveness_rx()
+                    elif decode_list[0] == INTER_PROCESS_IKE:
 
                         packet = decode_list[1][0][1]
                         
                         #if received via pipe it was sent to port udp 4500 (exclude 4 initial bytes)
-                        self.decode_ike(packet[4:]) 
+                        self.decode_ike(packet[4:])
 
-                        if self.ike_decoded_ok == True:                           
-                            
-                            if self.ike_decoded_header['exchange_type'] == INFORMATIONAL and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 0:
-                                self.state_delete(False)
-                            
+                        if self.ike_decoded_ok == True:
+                            # G4: protected message received via the ESP-decap pipe -> SA alive.
+                            self._note_liveness_rx()
+
+                            if self.ike_decoded_header['exchange_type'] == INFORMATIONAL and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 1:
+                                # G4: response to our liveness probe (or our rekey/delete). Consume.
+                                pass
+                            elif self.ike_decoded_header['exchange_type'] == INFORMATIONAL and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 0:
+                                self._dispatch_epdg_request(lambda: self.state_delete(False))
+
                             elif self.ike_decoded_header['exchange_type'] == CREATE_CHILD_SA and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 0:
-                                self.state_epdg_create_sa()                        
-                        
+                                self._dispatch_epdg_request(self.state_epdg_create_sa)
+
                             elif self.ike_decoded_header['exchange_type'] == CREATE_CHILD_SA and self.decoded_payload[0][0] == SK and self.ike_decoded_header['flags'][0] == 1:
-                                self.state_epdg_create_sa_response()   
+                                self.state_epdg_create_sa_response()
                         
                         if self.old_ike_message_received == True:
                             self.old_ike_message_received = False
@@ -3689,17 +4335,183 @@ class swu():
                     else:
                         pass
 
+            # G4: after servicing whatever woke select() (or on a plain timeout with no sockets
+            # ready), run the initiator liveness check. On an idle tunnel this is the only thing
+            # that fires and it sends/evaluates the DPD probe.
+            self._liveness_tick()
+            # Proactive CHILD-SA rekey: refresh the ESP SA before it silently ages out on the ePDG.
+            self._rekey_tick()
+
 
                         
     
+
+    def _note_liveness_rx(self):
+        """G4: record that a cryptographically-protected IKE message arrived from the ePDG — the SA
+        is alive. Resets the idle clock and clears any outstanding DPD probe count."""
+        self._last_rx = time.monotonic()
+        if self._liveness_outstanding:
+            swu_log("liveness: peer responded, clearing %d outstanding probe(s)" % self._liveness_outstanding)
+        self._liveness_outstanding = 0
+        self._liveness_probe_mid = None
+
+    def _note_esp_activity(self, pipe_ike):
+        """P2-3: called in the ESP-decap worker after a protected IPsec packet is written to the
+        tun. Tells the IKE main loop (via INTER_PROCESS_LIVENESS_RX) that the SA is alive so a busy
+        ESP tunnel with no IKE traffic does not trip the initiator DPD (TS 24.302 7.2.2A: ANY
+        protected IKEv2 OR IPsec message proves liveness). Throttled to at most once per
+        SWU_ESP_LIVENESS_INTERVAL to avoid flooding the pipe at high throughput. Runs in the forked
+        decap process, so self._esp_liveness_last_tx is that process's own copy."""
+        now = time.monotonic()
+        if (now - self._esp_liveness_last_tx) < self._esp_liveness_min_interval:
+            return
+        self._esp_liveness_last_tx = now
+        try:
+            pipe_ike.send(self.encode_inter_process_protocol([INTER_PROCESS_LIVENESS_RX, []]))
+        except Exception:
+            pass
+
+    def _liveness_tick(self):
+        """G4 (TS 24.302 7.2.2A): if no protected message has arrived for `liveness_period`, send an
+        empty INFORMATIONAL request (an acknowledged Dead-Peer-Detection probe). After
+        `liveness_retries` consecutive unanswered probes, declare the ePDG dead and tear the tunnel
+        down so the entrypoint supervisor re-establishes it. Disabled when liveness_period<=0.
+        Separate from — and complementary to — the RFC 3948 NAT-T keepalive (unacknowledged)."""
+        if self.liveness_period <= 0:
+            return
+        idle = time.monotonic() - (self._last_rx if self._last_rx is not None else time.monotonic())
+        if idle < self.liveness_period:
+            return
+        if self._liveness_outstanding >= self.liveness_retries:
+            swu_log("liveness: %d consecutive DPD probes unanswered (~%ds of silence) -> ePDG "
+                    "declared dead, tearing down for supervised re-establish" %
+                    (self._liveness_outstanding, int(idle)))
+            try:
+                # best-effort DELETE in case the peer is actually still there; kill=False so we
+                # exit ourselves (fresh sockets on restart) rather than lingering.
+                self.state_delete(True, kill=False)
+            except Exception:
+                pass
+            try:
+                swu_write_status("DOWN", reason_code="liveness_timeout", reason_policy="transient")
+                swu_notify("tunnel_down")
+            except Exception:
+                pass
+            exit(1)
+        try:
+            packet = self.create_INFORMATIONAL_liveness()
+            self.send_data(packet)
+            self._liveness_outstanding += 1
+            self._liveness_probe_mid = self.message_id_request
+            swu_log("liveness: sent DPD probe #%d (message_id=%d, idle=%ds, period=%ds)" %
+                    (self._liveness_outstanding, self._liveness_probe_mid, int(idle), int(self.liveness_period)))
+        except Exception as e:
+            swu_log("liveness: probe send failed: %r" % e)
+
+    def _rekey_select_timeout(self):
+        """Seconds until the next proactive-rekey action (rekey due, or in-flight rekey response
+        timeout), so state_connected's select() wakes in time. None when rekey is disabled/idle."""
+        if self.child_rekey_period <= 0 or self._child_sa_time is None:
+            return None
+        now = time.monotonic()
+        if self._rekey_outstanding and self._rekey_sent_at is not None:
+            return max(0.0, self.rekey_response_timeout - (now - self._rekey_sent_at))
+        return max(0.0, self.child_rekey_period - (now - self._child_sa_time))
+
+    def _rekey_tick(self):
+        """Proactive CHILD-SA rekey driver (TS 24.302 7.2.2C / RFC 7296). When the CHILD SA reaches
+        child_rekey_period since establishment, initiate a PFS make-before-break rekey. If the rekey
+        request goes unanswered for rekey_response_timeout, or the ePDG rejected it (error notify,
+        flagged by state_epdg_create_sa_response), fall back to a supervised re-establish — a clean
+        DELETE + exit so the entrypoint supervisor rebuilds the tunnel with a fresh EAP-AKA + PIN
+        verify (never worse than what would happen at the same expiry point without rekey).
+        Disabled when child_rekey_period<=0."""
+        if self.child_rekey_period <= 0 or self._child_sa_time is None:
+            return
+        now = time.monotonic()
+
+        # An in-flight rekey we started: handle rejection or response timeout.
+        if self._rekey_outstanding:
+            if getattr(self, "_rekey_failed", False):
+                swu_log("proactive rekey rejected by ePDG -> supervised re-establish "
+                        "(tunnel refreshes with a fresh EAP-AKA + PIN verify)")
+                self._rekey_teardown("rekey_rejected")
+                return
+            if self._rekey_sent_at is not None and (now - self._rekey_sent_at) >= self.rekey_response_timeout:
+                swu_log("proactive rekey got no response in %ds -> supervised re-establish" %
+                        int(self.rekey_response_timeout))
+                self._rekey_teardown("rekey_timeout")
+                return
+            return   # still waiting for the response
+
+        # Not yet due?
+        if (now - self._child_sa_time) < self.child_rekey_period:
+            return
+
+        # Due: fire a PFS CHILD_SA rekey. On any send error, tear down for supervised re-establish.
+        age = int(now - self._child_sa_time)
+        swu_log("CHILD_SA reached rekey age (~%d min); initiating proactive PFS rekey" % (age // 60))
+        try:
+            self._rekey_failed = False
+            self.state_ue_rekey_child()
+            self._rekey_outstanding = True
+            self._rekey_sent_at = now
+        except Exception as e:
+            swu_log("proactive rekey send failed (%r) -> supervised re-establish" % e)
+            self._rekey_teardown("rekey_send_error")
+
+    def _rekey_teardown(self, reason_code):
+        """Fallback used when a proactive rekey can't complete: best-effort DELETE, publish a
+        transient DOWN, and exit so the entrypoint supervisor re-establishes the tunnel."""
+        try:
+            self.state_delete(True, kill=False)   # DELETE + tear down SAs; we exit ourselves
+        except Exception:
+            pass
+        try:
+            swu_write_status("DOWN", reason_code=reason_code, reason_policy="transient")
+            swu_notify("tunnel_down")
+        except Exception:
+            pass
+        exit(1)
+
+    def _reject_guard(self):
+        """G2: after a failed attach attempt, decide whether to keep looping. If the last reject
+        carried a no_retry policy (subscription/equipment/PLMN — 7.2.2.2), or a backoff policy,
+        stop the tight local loop: write a DOWN status with the classified reason and exit so the
+        entrypoint supervisor (and the manager's health/back-off) space out re-attempts instead of
+        this process hammering the ePDG. Generic/transient errors fall through to the bounded
+        `iterations` loop as before. Returns True if the caller should abort (has already exited)."""
+        policy = self.reject_reason_policy
+        if policy in ("no_retry", "backoff"):
+            reason = self.reject_reason_code or "reject"
+            extra = {"reason_code": reason, "reason_policy": policy}
+            if self.reject_backoff_seconds:
+                extra["backoff"] = self.reject_backoff_seconds
+            if policy == "no_retry":
+                swu_log("attach rejected with no-retry policy (%s); not re-attempting on the same "
+                        "SIM/PLMN — exiting for supervised back-off (durable Tw3 is the manager's "
+                        "job, see control/app/status.py / main.apply_health)" % reason)
+            else:
+                bo = ("%ss" % self.reject_backoff_seconds) if self.reject_backoff_seconds \
+                    else "implementation default (supervised restart cadence)"
+                swu_log("attach rejected with backoff policy (%s); backoff=%s — not busy-looping, "
+                        "exiting for supervised re-attempt" % (reason, bo))
+            swu_write_status("DOWN", **extra)
+            swu_notify("tunnel_down")
+            exit(1)
+        return False
 
     def start_ike(self):
         self.iterations = 2
         self.cookie = False
         while self.iterations>0:
-        
+
             self.iterations -= 1
-        
+            # G2: clear any reject classification from a prior attempt before this one.
+            self.reject_reason_code = None
+            self.reject_reason_policy = None
+            self.reject_backoff_seconds = None
+
             print('\nSTATE 1:\n-------')
             result,info = self.state_1()
             if result in (REPEAT_STATE, TIMEOUT): 
@@ -3724,38 +4536,42 @@ class swu():
                 result,info = self.state_2()
             else:
                 print(self.errors.get(result),':',info)
-                continue                
-            
+                self._reject_guard()
+                continue
+
             if result in (REPEAT_STATE, OK):
                 if result in (REPEAT_STATE,):
                     print(self.errors.get(result),':',info)
                     print('\nSTATE 2 (repeat):\n---------------')
-                    result,info = self.state_2(retry=True)                      
+                    result,info = self.state_2(retry=True)
                 if result in (OK,):
                     print('\nSTATE 3:\n-------')
                     result,info = self.state_3()
             else:
                 print(self.errors.get(result),':',info)
-                continue 
-                
+                self._reject_guard()
+                continue
+
             if result in (OK, REPEAT_STATE):
                 if result in (REPEAT_STATE,):
                     print(self.errors.get(result),':',info)
                     print('\nSTATE 3 (repeat):\n---------------')
-                    result,info = self.state_3()                                    
+                    result,info = self.state_3()
                 if result in (OK,):
                     print('\nSTATE 4:\n-------')
-                    result,info = self.state_4()                   
+                    result,info = self.state_4()
             else:
                 print(self.errors.get(result),':',info)
-                continue 
-                
+                self._reject_guard()
+                continue
+
             if result == OK:
                 print('\nSTATE CONNECTED. Press q to quit, i to rekey ike, c to rekey child sa, r to reauth.\n')
-                self.state_connected()        
+                self.state_connected()
             else:
                 print(self.errors.get(result),':',info)
-                continue 
+                self._reject_guard()
+                continue
             
         exit(1)    
            
@@ -4269,6 +5085,13 @@ def main():
         [INTERNAL_IP6_DNS],
         [P_CSCF_IP6_ADDRESS]
     ]
+    # P2-3 (optional, env SWU_REQUEST_LIVENESS_ATTR=1): also ask the ePDG to supply a liveness
+    # period (TIMEOUT_PERIOD_FOR_LIVENESS_CHECK at length 0 = "UE supports receiving it").
+    # Default OFF: Telus is sensitive to extra CFG attributes and returns NO P-CSCF unless the
+    # request is exactly the strongSwan set (see the IPv6-only note). state_4 already adopts the
+    # returned value if a carrier volunteers one.
+    if os.environ.get("SWU_REQUEST_LIVENESS_ATTR", "0") not in ("0", "", "no"):
+        cp_list.append([TIMEOUT_PERIOD_FOR_LIVENESS_CHECK])
 
     ts_list_initiator = [
         [TS_IPV4_ADDR_RANGE,ANY,0,65535,'0.0.0.0','255.255.255.255'],
@@ -4409,8 +5232,17 @@ def main():
     try:
         a.start_ike()
     finally:
-        # start_ike only returns/raises when the tunnel could not be (re)established.
-        swu_write_status("DOWN")
+        # start_ike only returns/raises when the tunnel could not be (re)established. Preserve any
+        # G2 reject classification the auth flow recorded so the manager/WebUI keep the accurate
+        # reason (and so _reject_guard's DOWN+reason isn't clobbered by a bare DOWN here).
+        _extra = {}
+        if getattr(a, "reject_reason_code", None):
+            _extra["reason_code"] = a.reject_reason_code
+            if getattr(a, "reject_reason_policy", None):
+                _extra["reason_policy"] = a.reject_reason_policy
+            if getattr(a, "reject_backoff_seconds", None):
+                _extra["backoff"] = a.reject_backoff_seconds
+        swu_write_status("DOWN", **_extra)
         swu_notify("tunnel_down")
     
     

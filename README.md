@@ -34,7 +34,7 @@ The control-plane WebUI — dashboard, browser softphone, and SMS messaging (lig
 
 The gateway has two planes:
 
-1. **`vowifi/engine`** (per-SIM, always a Docker container): a pure-Python SWu IKEv2/IPsec client (`swu_ike.py`, based on [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)) for the ePDG tunnel (IKEv2 + EAP-AKA, userspace ESP) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The tunnel client carries VoWiFi resilience: it verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA authentication, sends NAT-T keepalives to hold the tunnel open when idle, re-syncs the P-CSCF into PJSIP on reconnect, answers the ePDG's IKEv2 `DEVICE_IDENTITY`/DPD/P-CSCF-restoration requests, and records every received 3GPP Notify — so it rekeys/re-auths and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)).
+1. **`vowifi/engine`** (per-SIM, always a Docker container): a pure-Python SWu IKEv2/IPsec client (`swu_ike.py`, based on [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)) for the ePDG tunnel (IKEv2 + EAP-AKA, userspace ESP) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The tunnel client carries VoWiFi resilience: it verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA authentication, sends NAT-T keepalives to hold the tunnel open when idle, runs an initiator-side liveness/DPD check to detect a silently-dead ePDG, re-syncs the P-CSCF into PJSIP on reconnect, advertises IKEv2 fragmentation (RFC 7383) and reassembles fragmented ePDG responses (fragmenting its own oversized messages too), classifies reject Notifies per 3GPP TS 24.302 §7.2.2.2 (honouring an attached back-off timer instead of hammering the network), answers the ePDG's IKEv2 `DEVICE_IDENTITY`/DPD/P-CSCF-restoration requests, and records every received 3GPP Notify — so it rekeys/re-auths and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)).
 2. **control plane** (singleton): FastAPI manager + React WebUI dashboard. Manages engine containers via the Docker SDK and reads the SIM via pyscard over the host pcscd socket.
 
 The control plane runs in one of two **deploy modes** (chosen at install time):
@@ -206,12 +206,16 @@ IKE + SIP credentials succeeded, but IMS-AKA (`REGISTER`) fails. Check the IMSI/
 **Tunnel drops after a while, or a call drops mid-session:**  
 Handled automatically by the Python SWu tunnel client. Behind NAT the ESP-in-UDP flow would
 otherwise be dropped by the router/conntrack when idle, so the client sends periodic NAT-T
-keepalives to hold it open. Carriers also periodically rekey or force a full re-authentication;
-because the client re-verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA
-run, and a supervisor restarts it on any exit, the tunnel recovers on its own (a brief media
-blip) instead of dying on a locked card — and the newly assigned P-CSCF is re-synced into PJSIP
-so calls/SMS keep routing. No action needed; watch it in the IKE (SWu) log
-(`VoWiFi: VERIFY CHV1 ok`, `tunnel CONNECTED`).
+keepalives to hold it open. It also runs an **initiator-side liveness check** (RFC 7296 /
+3GPP TS 24.302 §7.2.2A): after an idle period (`SWU_LIVENESS_PERIOD`, default 20 s) it sends an
+acknowledged empty `INFORMATIONAL` probe, and if several consecutive probes go unanswered
+(`SWU_LIVENESS_RETRIES`, default 4) it declares the ePDG dead and tears the tunnel down so the
+supervisor re-establishes it — instead of sitting "connected" on a black-holed tunnel. Carriers
+also periodically rekey or force a full re-authentication; because the client re-verifies the SIM
+PIN (CHV1) in its own PC/SC connection on every EAP-AKA run, and a supervisor restarts it on any
+exit, the tunnel recovers on its own (a brief media blip) instead of dying on a locked card — and
+the newly assigned P-CSCF is re-synced into PJSIP so calls/SMS keep routing. No action needed;
+watch it in the IKE (SWu) log (`VoWiFi: VERIFY CHV1 ok`, `tunnel CONNECTED`, `liveness: …`).
 
 **Diagnosing an unexpected tunnel drop:**  
 The SWu client records **every** IKEv2 Notify the ePDG sends (3GPP TS 24.302 error + status
@@ -220,6 +224,26 @@ an extra `UNHANDLED Notify …` line carrying the full payload hex — so when a
 tunnel down for a non-obvious reason (backoff timer, PLMN/RAT restriction, reactivation request,
 a vendor-private code, …), the cause is captured in the IKE (SWu) log rather than lost. Look for
 `received Notify:` / `UNHANDLED Notify` around the disconnect.
+
+**SWu client — 3GPP TS 24.302 conformance & non-goals:**  
+The client implements the parts of TS 24.302 that matter for a stable single-PDN VoWiFi attach:
+EAP-AKA over IKEv2; IPv6-only CFG for the P-CSCF (accepting either an `INTERNAL_IP6_ADDRESS` or an
+`INTERNAL_IP6_SUBNET` prefix, from which a stable inner address is derived); `DEVICE_IDENTITY`;
+P-CSCF restoration (plus optional reselection-support advertisement, `SWU_PCSCF_RESELECTION_SUPPORT`);
+IKEv2 fragmentation (RFC 7383) — advertised, with inbound reassembly **and** outbound fragmentation
+of an oversized message; reject-Notify back-off classification (§7.2.2.2); initiator liveness/DPD
+refreshed by both IKE and ESP traffic (§7.2.2A); correct handling of ePDG-initiated `CREATE_CHILD_SA`
+(classified as IKE-rekey / ESP-rekey / additional-bearer and answered with the right Notify) and
+`DELETE` (SPI-mapped response, `INVALID_SPI` on an unknown SPI, `REACTIVATION_REQUESTED_CAUSE`
+honoured); IKE request retransmission with responder-side duplicate-request suppression; and an
+env-selectable APN-FQDN IDr (§7.2.2.1, `SWU_IDR_MODE=fqdn`; the Telus-verified bare-APN form is the
+default). The following are **conscious non-goals** (out of scope for this gateway — where the
+network requests them the client refuses cleanly and the supervisor re-establishes): in-place
+IKE-SA / ePDG-initiated ESP-SA rekey *acceptance* (a UE-initiated proactive ESP rekey with PFS is
+done instead); multiple-bearer PDN (additional bearers are safely refused with `NO_ADDITIONAL_SAS`;
+no EPS-QoS/TFT); ePDG AUTH-payload signature verification (EAP-AKA `AT_MAC` already gives mutual auth
+in practice); MOBIKE / `UPDATE_SA_ADDRESSES` (the host has a stable wired IP); multiple-authentication
+/ external-AAA (PAP/CHAP); and emergency sessions / N1-mode-5GS.
 
 **Audio one-way or none:**  
 - **Browser softphone silent**: hard-refresh (Ctrl+Shift+R) to load the latest WebUI bundle (the audio attach fix). Check the browser Console for `audioblocked` or autoplay errors.
