@@ -2516,6 +2516,27 @@ class swu():
         packet = self.set_ike_packet_length(header+payload)
         return self.encode_payload_type_sk(packet)
 
+    def encode_configuration_payload_reply(self, cfg_type, attribute_types):
+        """Encode a Configuration Payload (CP) with the given cfg_type (CFG_REPLY/CFG_ACK) that
+        echoes each attribute type with LENGTH 0 (no value). Used for the untrusted-WLAN P-CSCF
+        restoration procedure (3GPP TS 24.302 clause 7.2.3.2 / TS 23.380): the ePDG sends a
+        CFG_REQUEST with P_CSCF_IP*_ADDRESS attributes and the UE must reply CFG_REPLY echoing
+        those attribute types with zero-length value. Does NOT touch self.cp_list (which holds the
+        initial IKE_AUTH request attributes)."""
+        payload_cp = bytes([cfg_type]) + b'\x00\x00\x00'
+        for at in attribute_types:
+            payload_cp += struct.pack("!H", at) + struct.pack("!H", 0)   # type + length 0
+        return payload_cp
+
+    def answer_INFORMATIONAL_cfg_reply(self, attribute_types):
+        """INFORMATIONAL response carrying a CFG_REPLY that echoes the requested P-CSCF (and any
+        other) attribute types with length 0 — the acknowledgement half of the ePDG-initiated
+        P-CSCF restoration procedure (see encode_configuration_payload_reply)."""
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, CP, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        payload = self.encode_generic_payload_header(NONE, 0, self.encode_configuration_payload_reply(CFG_REPLY, attribute_types))
+        packet = self.set_ike_packet_length(header + payload)
+        return self.encode_payload_type_sk(packet)
+
     def log_notify_error(self, code, context=""):
         """Log a received Private/RFC7296 error-type Notify with its friendly name + description
         (3GPP TS 24.302 Table 8.1.2.2-1). Central place so every auth-flow error site renders the
@@ -2549,6 +2570,8 @@ class swu():
         a DELETE (those go through state_delete). Covers:
           - Dead-Peer-Detection liveness check (empty request)  -> empty response  [RFC 7296 2.4]
           - DEVICE_IDENTITY request (empty value)               -> answer IMEISV/IMEI [TS 24.302 7.2.6]
+          - P-CSCF restoration: CFG_REQUEST with P_CSCF addrs   -> CFG_REPLY (len-0) + re-register
+                                                                   [TS 24.302 7.2.3.2 / TS 23.380]
           - REACTIVATION_REQUESTED_CAUSE (usually with DELETE, handled there)
           - any other status notify (bearer mod, PTI, ...)      -> acknowledge with empty response
         Every payload is logged with its friendly name so operators can see what the ePDG asked.
@@ -2557,8 +2580,11 @@ class swu():
         device_identity_requested = False
         saw_notify = False
         payload_names = []
+        cfg_request = None          # (cfg_type, attribute_list) if a CP is present
         for i in self.decoded_payload[0][1]:
-            if i[0] == N:
+            if i[0] == CP:
+                cfg_request = i[1]  # [cfg_type, attribute_list]
+            elif i[0] == N:
                 saw_notify = True
                 ntype = i[1][1]
                 ndata = i[1][3]
@@ -2579,7 +2605,15 @@ class swu():
                         secs, txt = self.decode_backoff_timer(ndata[-1])
                     swu_log("INFORMATIONAL: BACKOFF_TIMER = %s" % (txt or "?"))
 
-        # A DEVICE_IDENTITY request wins: answer with our identity.
+        # P-CSCF restoration (ePDG-initiated modification): a CFG_REQUEST carrying P-CSCF address
+        # attribute(s). Per TS 24.302 7.2.3.2 the UE MUST answer with a CFG_REPLY echoing those
+        # attribute types with length 0, then restore (re-register) — the new P-CSCF value, when
+        # provided, becomes the active one. Handle this BEFORE DEVICE_IDENTITY: a restoration
+        # message is its own exchange.
+        if cfg_request is not None:
+            return self.handle_pcscf_restoration(cfg_request)
+
+        # A DEVICE_IDENTITY request wins over a plain status ack: answer with our identity.
         if device_identity_requested:
             swu_log("INFORMATIONAL request: ePDG asked for DEVICE_IDENTITY; answering")
             self.send_data(self.answer_INFORMATIONAL_device_identity())
@@ -2595,6 +2629,64 @@ class swu():
         swu_log("INFORMATIONAL request (DPD liveness check); answering")
         self.send_data(self.answer_INFORMATIONAL_empty())
         return True
+
+    def handle_pcscf_restoration(self, cfg_request):
+        """P-CSCF restoration over untrusted WLAN (3GPP TS 24.302 clause 7.2.3.2, TS 23.380).
+        cfg_request = [cfg_type, attribute_list]; attribute_list entries are (type, value...) as
+        decoded by decode_payload_type_cp (length-0 attrs decode to (type, b'')).
+
+        The UE must:
+          1) reply with an INFORMATIONAL response containing a CFG_REPLY that echoes EVERY
+             requested attribute type with length 0 (no value), and
+          2) apply the restoration: if the ePDG supplied a new P-CSCF address, adopt it and
+             re-render pjsip + re-register so SIP signalling uses the restored P-CSCF; if no
+             address was supplied, just trigger a re-register against the current P-CSCF."""
+        cfg_type = cfg_request[0]
+        attrs = cfg_request[1] if len(cfg_request) > 1 else []
+        attr_types = [a[0] for a in attrs]
+        # New P-CSCF address(es) supplied in the request, if any (value present).
+        new_pcscf6 = [a[1] for a in attrs if a[0] == P_CSCF_IP6_ADDRESS and len(a) > 1 and a[1]]
+        new_pcscf4 = [a[1] for a in attrs if a[0] == P_CSCF_IP4_ADDRESS and len(a) > 1 and a[1]]
+        names = [self.cp_attr_name(t) for t in attr_types]
+        swu_log("INFORMATIONAL request: P-CSCF restoration (CFG_REQUEST %s); replying CFG_REPLY "
+                "(len 0) + restoring" % ", ".join(names))
+
+        # 1) Acknowledge with a CFG_REPLY echoing the requested attribute types at length 0.
+        self.send_data(self.answer_INFORMATIONAL_cfg_reply(attr_types))
+
+        # 2) Apply the restoration. Prefer a v6 P-CSCF (Telus/IMS is v6), fall back to v4.
+        new_pcscf = (new_pcscf6[0] if new_pcscf6 else (new_pcscf4[0] if new_pcscf4 else None))
+        if new_pcscf:
+            # Adopt the new P-CSCF at the head of the appropriate list so bring-up/reconnect
+            # reporting stays consistent, then push it to pjsip (idempotent if unchanged).
+            if new_pcscf6:
+                self.pcscfv6_address_list = [new_pcscf] + [a for a in getattr(self, "pcscfv6_address_list", []) if a != new_pcscf]
+            else:
+                self.pcscf_address_list = [new_pcscf] + [a for a in getattr(self, "pcscf_address_list", []) if a != new_pcscf]
+            swu_log("P-CSCF restoration: new P-CSCF %s" % new_pcscf)
+            swu_write_pcscf(new_pcscf)
+            swu_notify("pcscf", new_pcscf)
+            swu_apply_pcscf(new_pcscf)
+        else:
+            # No new address: restoration is a re-register against the current P-CSCF.
+            swu_log("P-CSCF restoration: no new address supplied; re-registering")
+            try:
+                subprocess.call(["asterisk", "-rx", "pjsip send register volte_ims"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                swu_log("re-register failed: %r" % e)
+        return True
+
+    @staticmethod
+    def cp_attr_name(t):
+        """Friendly name for a Configuration Payload attribute type (for logging)."""
+        return {
+            INTERNAL_IP4_ADDRESS: "INTERNAL_IP4_ADDRESS", INTERNAL_IP4_DNS: "INTERNAL_IP4_DNS",
+            INTERNAL_IP6_ADDRESS: "INTERNAL_IP6_ADDRESS", INTERNAL_IP6_DNS: "INTERNAL_IP6_DNS",
+            P_CSCF_IP4_ADDRESS: "P_CSCF_IP4_ADDRESS", P_CSCF_IP6_ADDRESS: "P_CSCF_IP6_ADDRESS",
+        }.get(t, "CFG_ATTR_%d" % t)
+
+
 
 
     def create_INFORMATIONAL_delete(self,protocol,spi_list = b''):
