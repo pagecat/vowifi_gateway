@@ -34,7 +34,7 @@ The control-plane WebUI — dashboard, browser softphone, and SMS messaging (lig
 
 The gateway has two planes:
 
-1. **`vowifi/engine`** (per-SIM, always a Docker container): patched strongSwan-epdg (IPsec/IKEv2 EAP-AKA) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The strongSwan build carries VoWiFi resilience patches: the IPsec CHILD-SA rekey offers PFS (`modp2048`), and EAP-AKA re-authentication re-verifies the SIM PIN (CHV1) in its own PC/SC connection — so the tunnel rekeys in place and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)).
+1. **`vowifi/engine`** (per-SIM, always a Docker container): a pure-Python SWu IKEv2/IPsec client (`swu_ike.py`, based on [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)) for the ePDG tunnel (IKEv2 + EAP-AKA, userspace ESP) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The tunnel client carries VoWiFi resilience: it verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA authentication, sends NAT-T keepalives to hold the tunnel open when idle, and re-syncs the P-CSCF into PJSIP on reconnect — so it rekeys/re-auths and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)). A patched strongSwan-epdg is still built into the image as a rollback path.
 2. **control plane** (singleton): FastAPI manager + React WebUI dashboard. Manages engine containers via the Docker SDK and reads the SIM via pyscard over the host pcscd socket.
 
 The control plane runs in one of two **deploy modes** (chosen at install time):
@@ -58,7 +58,7 @@ sudo ./install.sh install --mode docker
 
 The installer:
 - Installs Docker (via `get.docker.com` if missing) + host pcscd, **version-locked** to `PCSC_VERSION`
-- Builds the engine image from source (~10–20 min on a Pi; compiles Asterisk + strongSwan; bakes `engine/patches/*`)
+- Builds the engine image from source (~10–20 min on a Pi; compiles Asterisk + the Python SWu tunnel deps + strongSwan for rollback; bakes `engine/patches/*`)
 - **local mode**: compiles the WebUI in a throwaway Node container, creates a Python venv (`control/.venv`), and starts the `vowifi-control` systemd service
 - **docker mode**: builds the `vowifi/control` image and starts the control plane in a privileged container
 - Autostart is enabled; prints `https://<host-lan-ip>:8443` — open it in your browser
@@ -203,12 +203,14 @@ Wrong PIN, or the SIM locked (PUK needed). Re-provision with the correct PIN; if
 IKE + SIP credentials succeeded, but IMS-AKA (`REGISTER`) fails. Check the IMSI/Ki/OPc read correctly (dashboard → instance → USIM tab shows them). If Ki/OPc are wrong, the SIM can't auth; verify them with your carrier or a known-good SIM toolkit.
 
 **Tunnel drops after a while, or a call drops mid-session:**  
-Handled automatically by the engine's strongSwan resilience patches. Carriers periodically
-rekey the IPsec CHILD-SA, and some ePDGs (e.g. Telus) reject a rekey without PFS — the engine
-offers a PFS (`modp2048`) proposal so the SA rekeys in place instead of being torn down. If the
-carrier still forces a full re-establishment, strongSwan re-verifies the SIM PIN before
-re-authenticating, so the tunnel recovers on its own (a brief media blip) instead of dying on a
-locked card. No action needed; watch it in the engine/IKE logs (`VoWiFi: VERIFY CHV1 ok`).
+Handled automatically by the Python SWu tunnel client. Behind NAT the ESP-in-UDP flow would
+otherwise be dropped by the router/conntrack when idle, so the client sends periodic NAT-T
+keepalives to hold it open. Carriers also periodically rekey or force a full re-authentication;
+because the client re-verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA
+run, and a supervisor restarts it on any exit, the tunnel recovers on its own (a brief media
+blip) instead of dying on a locked card — and the newly assigned P-CSCF is re-synced into PJSIP
+so calls/SMS keep routing. No action needed; watch it in the IKE (SWu) log
+(`VoWiFi: VERIFY CHV1 ok`, `tunnel CONNECTED`).
 
 **Audio one-way or none:**  
 - **Browser softphone silent**: hard-refresh (Ctrl+Shift+R) to load the latest WebUI bundle (the audio attach fix). Check the browser Console for `audioblocked` or autoplay errors.

@@ -54,9 +54,14 @@ log "starting SWu IKEv2 tunnel (epdg=$SWU_EPDG apn=$SWU_APN reader=$USIM_READER_
 : > "$VOWIFI_RUNDIR/charon.log"      # fresh IKE log for control-plane classification
 rm -f "$VOWIFI_RUNDIR/swu.ctl" "$VOWIFI_RUNDIR/swu_status.json"
 
+# swu_ike is very chatty (per-packet IKE decode dumps). Send ITS stdout+stderr ONLY to the IKE
+# log (run/charon.log) so it does not intermix with Asterisk's console on the container stdout
+# (docker logs) — the manager surfaces the IKE log and the Asterisk log as two separate views.
+# The supervisor's own status lines still go to the container stdout via log().
 (
   backoff=4
   while true; do
+    log "swu_ike starting"
     python3 -u /usr/local/bin/swu_ike.py \
         -m "${USIM_READER_INDEX:-0}" \
         -s "$SWU_SOURCE" \
@@ -64,7 +69,7 @@ rm -f "$VOWIFI_RUNDIR/swu.ctl" "$VOWIFI_RUNDIR/swu_status.json"
         -a "${SWU_APN:-ims}" \
         -I "$USIM_IMSI" \
         -M "$SWU_MCC" \
-        -N "$SWU_MNC"
+        -N "$SWU_MNC" >> "$VOWIFI_RUNDIR/charon.log" 2>&1
     rc=$?
     log "swu_ike exited (rc=$rc); reconnecting in ${backoff}s"
     sleep "$backoff"; backoff=$((backoff*2)); [ "$backoff" -gt 60 ] && backoff=60

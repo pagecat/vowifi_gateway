@@ -52,15 +52,12 @@ SWU_WRITE_RESOLV = os.environ.get("SWU_WRITE_RESOLV", "0") not in ("0", "", "no"
 
 
 def swu_log(msg):
-    """Print + append to run/charon.log (control-plane classify_ike/charon_log read this)."""
+    """Emit a tagged status line. swu_ike's stdout is redirected to run/charon.log by the
+    entrypoint, so a plain print() lands in the IKE log (which control-plane classify_ike /
+    charon_log read) without intermixing into Asterisk's console. Falls back to appending
+    directly only if stdout isn't already the IKE log (e.g. the netns probe run)."""
     line = "[swu_ike] " + str(msg)
     print(line, flush=True)
-    try:
-        os.makedirs(SWU_RUNDIR, exist_ok=True)
-        with open(os.path.join(SWU_RUNDIR, "charon.log"), "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
 
 
 def swu_write_status(state, **extra):
@@ -1831,23 +1828,40 @@ class swu():
         
         return None
 
-    def encapsulate_ipsec(self,args):  
+    def encapsulate_ipsec(self,args):
 
         pipe_ike = args[0]
         socket_list = [self.tunnel, pipe_ike, self.socket_esp]
         encr_alg = None
         integ_alg = None
         sqn = 1
-        
-        
-        while True:           
-            read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [])           
-            for sock in read_sockets:    
+
+        # NAT-T keepalive (VoWiFi engine addition): behind NAT (docker bridge / home router) the
+        # ESP-in-UDP:4500 flow has a conntrack/NAT mapping that the kernel drops after ~30-120s
+        # of silence, after which inbound ESP from the ePDG can no longer reach us and the tunnel
+        # goes silently dead on idle. strongSwan sends an RFC 3948 NAT-keepalive (a single 0xFF
+        # byte to the peer's 4500) every ~20s to hold the mapping open; the upstream emulator
+        # sends nothing. Wake the select() loop on a timer and emit the keepalive when idle in
+        # NAT-traversal mode. (In raw-ESP mode there is no UDP flow, so no keepalive is needed.)
+        keepalive_interval = float(os.environ.get("SWU_NATT_KEEPALIVE", "20") or 20)
+        last_keepalive = time.time()
+
+        while True:
+            timeout = keepalive_interval if keepalive_interval > 0 else None
+            read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [], timeout)
+            if keepalive_interval > 0 and self.userplane_mode == NAT_TRAVERSAL and \
+                    (time.time() - last_keepalive) >= keepalive_interval:
+                try:
+                    self.socket_nat.sendto(b'\xff', self.server_address_nat)
+                except Exception:
+                    pass
+                last_keepalive = time.time()
+            for sock in read_sockets:
                 if sock == self.tunnel:
                     tap_packet = os.read(self.tunnel, 1514)
-                    
+
                     if encr_alg is not None:
-                        
+
                         encrypted_packet = self.encapsulate_esp_packet(tap_packet,encr_alg,encr_key,integ_alg,integ_key,spi_resp,sqn)
                         if encrypted_packet is not None:
                             sqn += 1

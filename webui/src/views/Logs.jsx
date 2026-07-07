@@ -70,7 +70,7 @@ export default function Logs({ selected, instances, cards, setSelected }) {
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center' }}>
         {['engine', 'charon'].map((t) => (
           <button key={t} className={`btn ${tab === t ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab(t)}>
-            {t === 'engine' ? 'Asterisk / engine' : 'strongSwan (IKE)'}
+            {t === 'engine' ? 'Asterisk / engine' : 'SWu tunnel (IKE)'}
           </button>
         ))}
         <button className="btn btn-ghost" onClick={load}>Refresh</button>
