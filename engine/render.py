@@ -135,7 +135,6 @@ def main():
                       keep_trailing_newline=True)
 
     outputs = {
-        "epdg.conf.j2": "/usr/local/etc/swanctl/conf.d/epdg.conf",
         "asterisk.conf.j2": "/etc/asterisk/asterisk.conf",
         "modules.conf.j2": "/etc/asterisk/modules.conf",
         "logger.conf.j2": "/etc/asterisk/logger.conf",
@@ -164,6 +163,16 @@ def main():
         f.write(f"USIM_ICCID={cfg.get('iccid','')}\n")
         f.write(f"VOWIFI_ID={ctx['id']}\n")
         f.write(f"MANAGER_URL={ctx['manager_url']}\n")
+        # SWu (python IKEv2/IPsec) launch params — consumed by entrypoint.sh to start
+        # swu_ike.py in place of strongSwan. Reader is addressed by index for swu_ike's
+        # smartcard path; source is the container IP; ePDG FQDN is resolved by swu_ike.
+        f.write(f"USIM_READER_INDEX={cfg.get('reader_index', 0)}\n")
+        f.write(f"USIM_IMSI={ctx['imsi']}\n")
+        f.write(f"SWU_SOURCE={ctx['local_addr']}\n")
+        f.write(f"SWU_EPDG={ctx['epdg']}\n")
+        f.write(f"SWU_APN={cfg.get('apn','ims')}\n")
+        f.write(f"SWU_MCC={ctx['mcc']}\n")
+        f.write(f"SWU_MNC={ctx['mnc']}\n")
     print(f"[render] env -> {env_path}")
 
 

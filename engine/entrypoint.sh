@@ -1,6 +1,14 @@
 #!/bin/bash
-# Engine entrypoint: render config -> hold PIN -> bring up ePDG tunnel -> discover
-# P-CSCF -> start Asterisk (IMS registration + voice/SMS).
+# Engine entrypoint: render config -> hold PIN -> bring up the ePDG (SWu) tunnel with the
+# pure-Python IKEv2/IPsec implementation (swu_ike.py) -> discover P-CSCF -> start Asterisk
+# (IMS registration + voice/SMS).
+#
+# SWu tunnel: swu_ike.py (fasferraz/SWu-IKEv2, patched) replaces strongSwan-epdg. It does
+# IKEv2 + EAP-AKA (verifying the SIM PIN in its own PC/SC connection), userspace ESP over a
+# tun device named "ipsec0" (so pjsip's bind_interface is unchanged), assigns the IPv6 inner
+# address, and requests the IPv6 P-CSCF. A supervisor restarts it on exit; because every fresh
+# start re-runs EAP-AKA WITH the PIN verify, the tunnel self-heals after a rekey/reauth teardown
+# (the failure mode strongSwan could not recover from).
 #
 # PC/SC: this container is a pcscd CLIENT — it talks to the HOST pcscd via the bind-mounted
 # /run/pcscd socket. The pcsc-lite client library is pinned to the same version as the host
@@ -17,9 +25,12 @@ log "rendering configs..."
 python3 /usr/local/bin/render.py || { log "render failed"; exit 1; }
 # shellcheck disable=SC1091
 set -a; . "$VOWIFI_RUNDIR/engine.env"; set +a
-export USIM_PIN USIM_READER VOWIFI_ID MANAGER_URL VOWIFI_RUNDIR
+export USIM_PIN USIM_READER USIM_READER_INDEX USIM_IMSI VOWIFI_ID MANAGER_URL VOWIFI_RUNDIR
+export SWU_SOURCE SWU_EPDG SWU_APN SWU_MCC SWU_MNC
 
 # --- 2. Start PIN keeper and wait for the SIM to be usable ------------------------
+# pin_keeper holds CHV1 verified for ami_usim's SIP IMS-AKA. swu_ike verifies the PIN itself
+# in its own connection for EAP-AKA, so both auth paths work on PIN-enabled SIMs.
 log "starting pin_keeper (reader=$USIM_READER)..."
 python3 -u /usr/local/bin/pin_keeper.py &
 KEEPER_PID=$!
@@ -38,51 +49,48 @@ wait_pin() {
 }
 wait_pin || true
 
-# --- 3. Bring up strongSwan / ePDG tunnel ----------------------------------------
-log "starting strongSwan..."
-ipsec start
-sleep 2
-swanctl --load-creds || true
-swanctl --load-conns || true
-swanctl --initiate --child ims || true
+# --- 3. Bring up the SWu (python IKEv2/IPsec) tunnel, supervised ------------------
+log "starting SWu IKEv2 tunnel (epdg=$SWU_EPDG apn=$SWU_APN reader=$USIM_READER_INDEX)..."
+: > "$VOWIFI_RUNDIR/charon.log"      # fresh IKE log for control-plane classification
+rm -f "$VOWIFI_RUNDIR/swu.ctl" "$VOWIFI_RUNDIR/swu_status.json"
 
-# reconnect/backoff loop (like the reference)
 (
   backoff=4
   while true; do
-    sleep 5
-    if ! swanctl --list-sas 2>/dev/null | grep -q '^ims:'; then
-      log "ims SA down; re-initiating (backoff=$backoff)"
-      if swanctl --initiate --child ims 2>/dev/null; then
-        backoff=4
-      else
-        sleep "$backoff"; backoff=$((backoff*2)); [ "$backoff" -gt 120 ] && backoff=120
-      fi
-    fi
+    python3 -u /usr/local/bin/swu_ike.py \
+        -m "${USIM_READER_INDEX:-0}" \
+        -s "$SWU_SOURCE" \
+        -d "$SWU_EPDG" \
+        -a "${SWU_APN:-ims}" \
+        -I "$USIM_IMSI" \
+        -M "$SWU_MCC" \
+        -N "$SWU_MNC"
+    rc=$?
+    log "swu_ike exited (rc=$rc); reconnecting in ${backoff}s"
+    sleep "$backoff"; backoff=$((backoff*2)); [ "$backoff" -gt 60 ] && backoff=60
   done
 ) &
+SWU_PID=$!
 
-# --- 4. Wait for the tunnel, then discover P-CSCF and (re)render pjsip -------------
-if [ -z "$(cat "$VOWIFI_RUNDIR/pcscf" 2>/dev/null)" ]; then
-  log "waiting for IMS tunnel to establish..."
-  for _ in $(seq 1 90); do
-    swanctl --list-sas 2>/dev/null | grep -q 'INSTALLED' && break
-    sleep 1
-  done
-  log "waiting for P-CSCF discovery..."
-  for _ in $(seq 1 30); do
-    # charon filelog line: "... received P-CSCF server IP 2001:568:ffff:3002::5"
-    addr=$(grep -aoE 'received P-CSCF server IP [0-9a-fA-F:.]+' "$VOWIFI_RUNDIR/charon.log" 2>/dev/null \
-           | head -1 | awk '{print $NF}')
-    if [ -n "$addr" ]; then
-      log "discovered P-CSCF: $addr"
-      printf '%s' "$addr" > "$VOWIFI_RUNDIR/pcscf"
-      /usr/local/bin/notify.py pcscf "$addr" 2>/dev/null || true
-      python3 /usr/local/bin/render.py || true   # re-render pjsip.conf with pcscf
-      break
-    fi
-    sleep 1
-  done
+# --- 4. Wait for the tunnel, then (re)render pjsip with the discovered P-CSCF ------
+log "waiting for SWu tunnel to establish..."
+for _ in $(seq 1 90); do
+  st=$(python3 -c "import json;print(json.load(open('$VOWIFI_RUNDIR/swu_status.json'))['state'])" 2>/dev/null || echo "")
+  [ "$st" = "CONNECTED" ] && { log "SWu tunnel CONNECTED"; break; }
+  sleep 1
+done
+
+log "waiting for P-CSCF discovery..."
+for _ in $(seq 1 30); do
+  [ -s "$VOWIFI_RUNDIR/pcscf" ] && break
+  sleep 1
+done
+addr=$(cat "$VOWIFI_RUNDIR/pcscf" 2>/dev/null)
+if [ -n "$addr" ]; then
+  log "discovered P-CSCF: $addr"
+  python3 /usr/local/bin/render.py || true   # re-render pjsip.conf with pcscf
+else
+  log "no P-CSCF discovered yet - continuing (manager will surface tunnel state)"
 fi
 
 # --- 5. Start USIM<->AMI bridge and Asterisk -------------------------------------

@@ -94,7 +94,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
 
     if dev_mounts:
         eng = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "engine")
-        for f in ["pin_keeper.py", "ami_usim.py", "render.py", "notify.py"]:
+        for f in ["pin_keeper.py", "ami_usim.py", "render.py", "notify.py", "swu_ike.py"]:
             volumes[os.path.join(eng, f)] = {"bind": f"/usr/local/bin/{f}", "mode": "ro"}
         volumes[os.path.join(eng, "entrypoint.sh")] = {"bind": "/entrypoint.sh", "mode": "ro"}
         volumes[os.path.join(eng, "strongswan.conf")] = {"bind": "/usr/local/etc/strongswan.conf", "mode": "ro"}
@@ -175,7 +175,14 @@ def read_pcscf(iid: str) -> str | None:
 
 
 def tunnel_installed(iid: str) -> bool:
-    """True if the ims CHILD_SA is INSTALLED (checked via swanctl in the container)."""
+    """True if the ims tunnel is up.
+
+    SWu (python) engine: the swu_ike daemon writes run/swu_status.json {state: CONNECTED}.
+    Fallback (legacy strongSwan image): check swanctl for an INSTALLED ims CHILD_SA.
+    """
+    st = read_run_json(iid, "swu_status.json")
+    if st is not None:
+        return st.get("state") == "CONNECTED"
     try:
         c = _client().containers.get(container_name(iid))
         rc, out = c.exec_run("swanctl --list-sas")

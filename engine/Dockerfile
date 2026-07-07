@@ -34,6 +34,7 @@ RUN dnf -y update && \
     popt-devel libical-devel spandsp-devel openldap-devel codec2-devel fftw-devel libsndfile-devel \
     unbound-devel wget subversion libresample-devel binutils-devel libsrtp-devel gsm-devel iproute \
     procps-ng net-tools python3-pysocks python3-requests python3-pyscard python3-jinja2 \
+    python3-devel \
     meson ninja-build perl-podlators systemd-devel \
     tcpdump bind-utils iputils
 
@@ -79,6 +80,14 @@ RUN git clone --depth=1 --branch jolly/work https://gitea.osmocom.org/ims-volte-
 
 RUN pip install panoramisk
 
+# SWu (python IKEv2/IPsec) tunnel dependencies. swu_ike.py replaces strongSwan for the ePDG
+# tunnel; it needs pycryptodome/cryptography (IKE + ESP crypto), pyserial (imported by the
+# upstream emulator), and mitshell's CryptoMobile + card (USIM/Milenage helpers). strongSwan is
+# still built above and kept in the image as a rollback path.
+RUN pip install pyserial pycryptodome cryptography \
+    "git+https://github.com/mitshell/CryptoMobile.git" \
+    "git+https://github.com/mitshell/card.git"
+
 # strongSwan charon plugin toggles (from reference)
 COPY p-cscf.conf     /usr/local/etc/strongswan.d/charon/p-cscf.conf
 COPY osmo-epdg.conf  /usr/local/etc/strongswan.d/charon/osmo-epdg.conf
@@ -88,6 +97,7 @@ COPY strongswan.conf /usr/local/etc/strongswan.conf
 COPY ims.updown      /usr/local/etc/ims.updown
 COPY pin_keeper.py   /usr/local/bin/pin_keeper.py
 COPY ami_usim.py     /usr/local/bin/ami_usim.py
+COPY swu_ike.py      /usr/local/bin/swu_ike.py
 COPY render.py       /usr/local/bin/render.py
 COPY notify.py       /usr/local/bin/notify.py
 COPY templates/      /opt/vowifi/templates/
