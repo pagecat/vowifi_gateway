@@ -26,17 +26,29 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   // the reader picker never lists a reader that has been unplugged.
   useEffect(() => { api.readers().then((r) => setReaders(r.readers)).catch(() => {}) }, [cards.map((c) => c.name).join(',')])
   useEffect(() => { if (selected) setForm({ ...emptyInstance(), ...selected }) }, [selected?.id])
+  // Keep the reader selection valid for the CURRENT hardware. A stored reader_index can be
+  // stale — saved when more readers were attached — and point past the live reader list; the
+  // <select> then has no matching option and "Detect card" probes a phantom reader ("No SIM
+  // card in reader N"). Clamp any out-of-range index back onto a reader that actually exists.
+  useEffect(() => {
+    if (!readers.length) return
+    setForm((f) => (f.reader_index >= readers.length || f.reader_index < 0)
+      ? { ...f, reader_index: 0 } : f)
+  }, [readers.length])
   // Keep the "PIN saved?" indicator in sync when it changes server-side (delete-PIN,
   // start-with-PIN) without a full line switch — mirror the fresh value onto the form.
   useEffect(() => { if (selected) setForm((f) => ({ ...f, has_pin: selected.has_pin })) }, [selected?.has_pin])
 
   const upd = (patch) => setForm((f) => ({ ...f, ...patch }))
   const updSip = (patch) => setForm((f) => ({ ...f, sip: { ...f.sip, ...patch } }))
+  // The reader index to act on, clamped to a reader that currently exists (never probe a
+  // stale/out-of-range index that would report a phantom empty reader).
+  const readerIdx = () => (form.reader_index >= 0 && form.reader_index < readers.length) ? form.reader_index : 0
 
   const detect = async () => {
     setPinMsg('Detecting…')
     try {
-      const c = await api.detect(form.reader_index || 0)
+      const c = await api.detect(readerIdx())
       setCard(c)
       if (!c.present) {
         setPinMsg('No SIM card in this reader.')
@@ -54,7 +66,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const verifyPin = async () => {
     setPinMsg('Verifying…')
     try {
-      const r = await api.verifyPin(pin, form.reader_index || 0)
+      const r = await api.verifyPin(pin, readerIdx())
       setPinMsg(r.ok ? 'PIN OK ✓' : `Failed: ${r.error} (${r.tries} tries left)`)
       if (r.ok) {
         const p = { pin }

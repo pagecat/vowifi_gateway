@@ -633,6 +633,13 @@ async def api_instances():
         st = apply_health(str(inst["id"]), inst, st)
         safe = {k: v for k, v in inst.items() if k != "pin"}
         safe["has_pin"] = bool(inst.get("pin"))
+        # Report the reader index that PHYSICALLY holds this line's SIM right now (ICCID-matched
+        # against the live monitor) instead of the stored one. PC/SC indices shift when readers
+        # are unplugged, so a stored index can be stale and make the SIM-config "Detect card"
+        # button probe a reader that no longer exists ("No SIM card in reader N").
+        live_idx = _reader_index_for_instance(inst)
+        if live_idx is not None:
+            safe["reader_index"] = live_idx
         out.append({**safe, "status": st})
     return {"instances": out}
 
