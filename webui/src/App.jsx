@@ -135,16 +135,18 @@ export default function App() {
         </div>
       </aside>
 
-      <main style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', padding: 24 }}>
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 20, gap: 16, flexShrink: 0 }}>
+      <main style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 16, flexShrink: 0, padding: '24px 24px 0' }}>
           <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0, textTransform: 'capitalize' }}>{view}</h1>
           {/* per-page SIM selectors (SimSelector) handle multi-SIM switching on the views that
               operate on a single line — softphone / messages / logs / SIM config */}
         </div>
         {/* Single bounded scroll region. Document-flow views (Dashboard/Settings/Logs) scroll
             here; app-like views (Messages/Softphone) fill it with height:100% and scroll their
-            own inner lists instead, so the page height never grows with list length. */}
-        <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+            own inner lists instead, so the page height never grows with list length. The
+            padding also gives card outlines/shadows room so overflow:auto doesn't clip them
+            (e.g. the Dashboard active-reader ring on the top/left edge). */}
+        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '6px 24px 24px' }}>
           {View && <View instances={instances} cards={cards} noReaders={noReaders} cardsKnown={cardsKnown} selected={sel} setSelected={setSelected} refresh={refresh} subscribe={subscribe} showToast={showToast} setView={setView} />}
         </div>
       </main>
