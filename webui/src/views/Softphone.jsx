@@ -245,16 +245,18 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   ) : null
 
   return (
-    <div>
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       {/* Persistent remote-audio sink: JsSIP writes the remote MediaStream here. autoPlay +
           a stable DOM element + unlockAudio() on the first click = reliable playback. */}
       <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} />
-      <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
-      <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gap: 16 }}>
+      <div style={{ flexShrink: 0 }}>
+        <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
       {IncomingOverlay}
       <style>{`@keyframes ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>
       {/* ---- Phone panel (Google-Voice style) ---- */}
-      <div className="card" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column' }}>
+      <div className="card" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>Softphone</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: regColor }}>
@@ -362,8 +364,8 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
       </div>
 
       {/* ---- Recent calls ---- */}
-      <div className="card" style={{ padding: 20 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+      <div className="card" style={{ padding: 20, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexShrink: 0 }}>
           <div style={{ fontSize: 15, fontWeight: 600 }}>Recent calls</div>
           {calls.length > 0 && (
             callSelMode ? (
@@ -384,7 +386,7 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
             )
           )}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0, overflow: 'auto' }}>
           {calls.length === 0 && <div style={{ fontSize: 13, color: 'var(--text-mute)' }}>No calls yet.</div>}
           {calls.map((c) => {
             const s = (c.status || '').toLowerCase()

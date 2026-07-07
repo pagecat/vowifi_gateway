@@ -111,10 +111,12 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   )
 
   return (
-    <div>
-      <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 16, height: 'calc(100vh - 196px)' }}>
-      <div className="card" style={{ padding: 12, overflow: 'auto' }}>
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ flexShrink: 0 }}>
+        <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
+      <div className="card" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
         <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]) }}>+ New message</button>
         {threads.length > 0 &&
           <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, color: '#ef4444', fontSize: 12 }}
@@ -134,8 +136,8 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         {threads.length === 0 && <div style={{ color: 'var(--text-mute)', fontSize: 13, padding: 8 }}>No conversations yet.</div>}
       </div>
 
-      <div className="card" style={{ display: 'flex', flexDirection: 'column', padding: 0 }}>
-        <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+      <div className="card" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
+        <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
           {peer ? <span className="mono" style={{ fontWeight: 600, flex: 1 }}>{peer}</span>
             : <input placeholder="Recipient number e.g. +1..." value={newTo} onChange={(e) => setNewTo(e.target.value)} style={{ maxWidth: 300, flex: 1 }} />}
           {peer && msgs.length > 0 && (
@@ -157,7 +159,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
             )
           )}
         </div>
-        <div style={{ flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {msgs.map((m) => {
             const failed = m.status === 'failed'
             const checked = selIds.has(m.id)
@@ -192,7 +194,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
             )
           })}
         </div>
-        <div style={{ display: 'flex', gap: 8, padding: 12, borderTop: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', gap: 8, padding: 12, borderTop: '1px solid var(--border)', flexShrink: 0 }}>
           <input placeholder="Type a message…" value={text} onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && send()} />
           <button className="btn btn-primary" disabled={sending || (!peer && !newTo)} onClick={send}>Send</button>
