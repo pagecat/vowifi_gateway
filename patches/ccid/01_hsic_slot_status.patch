@@ -1,5 +1,5 @@
 diff --git a/src/ccid.h b/src/ccid.h
-index 11a5e88..e893ffe 100644
+index 11a5e88..f2a8c31 100644
 --- a/src/ccid.h
 +++ b/src/ccid.h
 @@ -122,6 +122,16 @@ typedef struct
@@ -8,13 +8,13 @@ index 11a5e88..e893ffe 100644
  
 +	/*
 +	 * HSIC CCID-Reader slot status management
-+	 * The reader always answers "no ICC present" to PC_to_RDR_GetSlotStatus,
-+	 * even while a card is inserted and powered.  Its interrupt endpoint DOES
-+	 * send correct RDR_to_PC_NotifySlotChange messages, so card presence is
-+	 * tracked from those instead.
-+	 * -1 = no notification seen yet, 0 = absent, 1 = present
++	 * GetSlotStatus always reports "no ICC present".  Presence is verified
++	 * by IccPowerOn/ATR on the IFDHICCPresence tick.  NotifySlotChange only
++	 * sets hsic_presence_pending (debounce); the tick clears it and probes.
++	 * notified_presence: -1 = not yet probed, 0 = absent, 1 = present
 +	 */
 +	int notified_presence;
++	unsigned char hsic_presence_pending;
 +
  	/*
  	 * bVoltageSupport (bit field)
@@ -28,65 +28,82 @@ index 11a5e88..e893ffe 100644
  #define VENDOR_KAPELSE 0x2947
  #define VENDOR_GEMALTO 0x08E6
 diff --git a/src/ccid_usb.c b/src/ccid_usb.c
-index 557f4d4..24e42e6 100644
+index 557f4d4..8c3e1a2 100644
 --- a/src/ccid_usb.c
 +++ b/src/ccid_usb.c
-@@ -816,6 +816,7 @@ again:
+@@ -816,6 +816,8 @@ again:
  				usbDevice[reader_index].ccid.bInterfaceProtocol = usb_interface->altsetting->bInterfaceProtocol;
  				usbDevice[reader_index].ccid.bNumEndpoints = usb_interface->altsetting->bNumEndpoints;
  				usbDevice[reader_index].ccid.dwSlotStatus = IFD_ICC_PRESENT;
 +				usbDevice[reader_index].ccid.notified_presence = -1;
++				usbDevice[reader_index].ccid.hsic_presence_pending = 0;
  				usbDevice[reader_index].ccid.bVoltageSupport = device_descriptor[5];
  				usbDevice[reader_index].ccid.sIFD_serial_number = NULL;
  				usbDevice[reader_index].ccid.gemalto_firmware_features = NULL;
-@@ -1636,6 +1637,12 @@ int InterruptRead(int reader_index, int timeout /* in ms */)
+@@ -1636,6 +1638,11 @@ int InterruptRead(int reader_index, int timeout /* in ms */)
  				{
  					case RDR_to_PC_NotifySlotChange:
  						DEBUG_XXD("NotifySlotChange: ", buffer, actual_length);
-+						/* Remember the notified state of slot 0 (bit 0 of
-+						 * bmSlotICCState) for readers whose GetSlotStatus
-+						 * is broken (HSIC CCID-Reader) */
-+						if (actual_length >= 2)
-+							usbDevice[reader_index].ccid.notified_presence =
-+								buffer[1] & 1;
++						/* HSIC: debounce slot-change notifies; the
++						 * IFDHICCPresence tick verifies by ATR */
++						if (HSIC_CCID_READER ==
++							usbDevice[reader_index].ccid.readerID)
++							usbDevice[reader_index].ccid.hsic_presence_pending = 1;
  						break;
  					case RDR_to_PC_HardwareError:
  						DEBUG_XXD("HardwareError: ", buffer, actual_length);
 diff --git a/src/ifdhandler.c b/src/ifdhandler.c
-index b746dfb..12eb08d 100644
+index b746dfb..a4e7b92 100644
 --- a/src/ifdhandler.c
 +++ b/src/ifdhandler.c
-@@ -2056,6 +2056,35 @@ EXTERNAL RESPONSECODE IFDHICCPresence(DWORD Lun)
+@@ -1960,6 +1960,31 @@ EXTERNAL RESPONSECODE IFDHControl(DWORD Lun, DWORD dwControlCode,
+ } /* IFDHControl */
+ 
+ 
++/*
++ * HSIC CCID-Reader: GetSlotStatus lies; probe presence with IccPowerOn/ATR.
++ * Saves whether the card was powered, restores that state afterwards.
++ */
++static void hsic_update_presence(unsigned int reader_index,
++	_ccid_descriptor *ccid_descriptor)
++{
++	unsigned char atr_probe[MAX_ATR_SIZE];
++	unsigned int atr_probe_len = sizeof(atr_probe);
++	int was_powered;
++
++	was_powered = CcidSlots[reader_index].bPowerFlags & MASK_POWERFLAGS_PUP;
++	ccid_descriptor->hsic_presence_pending = 0;
++
++	if (IFD_SUCCESS == CmdPowerOn(reader_index, &atr_probe_len,
++			atr_probe, VOLTAGE_AUTO))
++		ccid_descriptor->notified_presence = 1;
++	else
++		ccid_descriptor->notified_presence = 0;
++
++	if (!was_powered)
++		(void)CmdPowerOff(reader_index);
++}
++
++
+ EXTERNAL RESPONSECODE IFDHICCPresence(DWORD Lun)
+ {
+ 	/*
+@@ -2056,6 +2081,20 @@ EXTERNAL RESPONSECODE IFDHICCPresence(DWORD Lun)
  			break;
  	}
  
 +	if ((HSIC_CCID_READER == ccid_descriptor->readerID)
 +		&& (IFD_ICC_NOT_PRESENT == return_value))
 +	{
-+		/* This reader has a broken PC_to_RDR_GetSlotStatus: bStatus always
-+		 * reports "no ICC present", even while a card is inserted, powered
-+		 * and exchanging APDUs.  Its interrupt endpoint DOES send correct
-+		 * RDR_to_PC_NotifySlotChange messages, so trust the state learned
-+		 * from them instead.  Right after startup (before any notification
-+		 * was received) probe by powering the card: a successful power on
-+		 * means a card is present. */
++		/* Broken GetSlotStatus: verify presence on tick via IccPowerOn/ATR.
++		 * NotifySlotChange only sets hsic_presence_pending; initial probe
++		 * runs when notified_presence is still unknown (-1). */
++		if (ccid_descriptor->hsic_presence_pending
++			|| (-1 == ccid_descriptor->notified_presence))
++			hsic_update_presence(reader_index, ccid_descriptor);
++
 +		if (1 == ccid_descriptor->notified_presence)
 +			return_value = IFD_ICC_PRESENT;
-+		else if (-1 == ccid_descriptor->notified_presence)
-+		{
-+			unsigned char atr_probe[64];
-+			unsigned int atr_probe_len = sizeof(atr_probe);
-+
-+			if (IFD_SUCCESS == CmdPowerOn(reader_index, &atr_probe_len,
-+				atr_probe, VOLTAGE_AUTO))
-+			{
-+				(void)CmdPowerOff(reader_index);
-+				ccid_descriptor->notified_presence = 1;
-+				return_value = IFD_ICC_PRESENT;
-+			}
-+			else
-+				ccid_descriptor->notified_presence = 0;
-+		}
 +	}
 +
  #if 0

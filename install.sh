@@ -69,7 +69,8 @@ PCSC_SOURCE_BUILT=0
 # NOT installed by default — run `sudo ./install.sh patch` to build + install it. Needed only
 # for the HSIC CCID-Reader (1d99:0016): its firmware always answers "no ICC present" to
 # GetSlotStatus even while a card is inserted and powered, so stock libccid never powers
-# the card. The patch tracks presence from the reader's (correct) NotifySlotChange interrupts.
+# the card. NotifySlotChange only sets a pending flag; IFDHICCPresence tick probes
+# via IccPowerOn/ATR (debounced) and restores prior power state.
 # Keep this >= 1.6.2: that release added 1d99:0016 to the supported-reader table, so the
 # built driver recognizes the VID/PID out of the box (older/distro libccid < 1.6.2 would
 # additionally need the device whitelisted by hand in the bundle's Info.plist).
@@ -253,8 +254,8 @@ ensure_pcscd() {
 # marker + logs), remaining args = patch filenames (under patches/ccid/) to apply in order.
 # Patch sets (see the `patch*` subcommands):
 #   01_hsic_slot_status.patch   HSIC 1d99:0016 broken GetSlotStatus — firmware always reports
-#                               "no ICC present", so presence is tracked from the reader's
-#                               NotifySlotChange interrupts. Base fix; safe for every card.
+#                               "no ICC present". NotifySlotChange sets pending; IFDHICCPresence
+#                               tick probes via IccPowerOn/ATR (debounced). Base fix; safe for all cards.
 #   02_hsic_malformed_atr.patch HSIC firmware drops the final TCK byte from the ATR; this
 #                               patch synthesizes it at power-on (ISO 7816-3 XOR) and falls back
 #                               to relaxed validation if repair fails. Fixes SCardConnect 607
