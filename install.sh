@@ -114,6 +114,35 @@ svc_enable_start() {
   fi
 }
 
+# Ensure pcscd is running AND set to start on boot. pcscd ships differently across distros:
+# some socket-activate it (pcscd.socket starts the daemon on first client), some don't enable
+# it at all (seen on Armbian) — so a plain `systemctl enable --now pcscd` may leave it stopped
+# and not persistent. We enable both the socket and the service, start the daemon now, and
+# verify it actually came up (falling back to a manual daemon launch if the units don't exist).
+enable_pcscd_autostart() {
+  if have systemctl; then
+    # Enable the socket (on-boot autostart, incl. socket-activated setups) and the service.
+    systemctl enable pcscd.socket 2>/dev/null || true
+    systemctl enable pcscd.service 2>/dev/null || systemctl enable pcscd 2>/dev/null || true
+    # Start now: the socket triggers the daemon on first use; also start the service directly
+    # for distros where the service isn't socket-activated.
+    systemctl start pcscd.socket 2>/dev/null || true
+    systemctl start pcscd.service 2>/dev/null || systemctl start pcscd 2>/dev/null || true
+    # Verify. If neither the daemon nor its socket is present, force the service up once.
+    if ! systemctl is-active --quiet pcscd 2>/dev/null && [ ! -S /run/pcscd/pcscd.comm ]; then
+      systemctl restart pcscd.service 2>/dev/null || systemctl restart pcscd 2>/dev/null || true
+    fi
+  else
+    svc_enable_start pcscd
+  fi
+  # Last-resort: if systemd units are absent/broken but the binary exists, launch it detached so
+  # the reader is usable this session (autostart on non-systemd hosts is best-effort).
+  if [ ! -S /run/pcscd/pcscd.comm ] && have pcscd && ! pgrep -x pcscd >/dev/null 2>&1; then
+    mkdir -p /run/pcscd
+    pcscd 2>/dev/null || true   # daemonizes by default; harmless if a unit already owns it
+  fi
+}
+
 data_dir_abs() { CDPATH= cd -- "$VOWIFI_DATA_DIR" 2>/dev/null && pwd -P || printf '%s' "$VOWIFI_DATA_DIR"; }
 
 # ------------------------------------------------------------------ deploy-mode state
@@ -191,7 +220,7 @@ ensure_pcscd() {
     # Install the CCID USB driver from the distro (its IFDHandler ABI is stable across pcscd
     # 2.x, so the distro driver works with our source-built pcscd), plus build deps.
     info "host pcscd is '${installed_ver:-none}', pinning to $PCSC_VERSION (building from source)…"
-    if   have apt-get; then pkg_install ccid libudev-dev libsystemd-dev meson ninja-build flex pkg-config gcc wget ca-certificates
+    if   have apt-get; then pkg_install libccid libudev-dev libsystemd-dev meson ninja-build flex pkg-config gcc wget ca-certificates
     elif have dnf || have yum; then pkg_install ccid systemd-devel meson ninja-build flex pkgconf-pkg-config gcc perl-podlators wget
     elif have pacman;  then pkg_install ccid meson ninja flex pkgconf gcc wget
     elif have zypper;  then pkg_install pcsc-ccid systemd-devel meson ninja flex pkg-config gcc wget
@@ -200,10 +229,14 @@ ensure_pcscd() {
     _build_pcsclite_host
     PCSC_SOURCE_BUILT=1
   fi
-  svc_enable_start pcscd
-  # Some distros socket-activate pcscd (starts on first client); the socket may not exist until
-  # a reader is used. That's fine.
-  [ -S /run/pcscd/pcscd.comm ] || warn "pcscd socket /run/pcscd/pcscd.comm not present yet — plug in a reader; it appears on first use"
+  enable_pcscd_autostart
+  # pcscd may be socket-activated (daemon starts on first client), so the socket can be absent
+  # until a reader is used — that's fine. If it IS present, confirm; else just note it.
+  if [ -S /run/pcscd/pcscd.comm ] || { have systemctl && systemctl is-active --quiet pcscd 2>/dev/null; }; then
+    info "host pcscd running + set to start on boot"
+  else
+    warn "pcscd not active yet — it is enabled for boot and will start on first reader use"
+  fi
 }
 
 _build_pcsclite_host() {
@@ -388,6 +421,15 @@ cmd_install() {
   need_root
   resolve_mode
   info "VoWiFi gateway install — repo: $REPO_DIR  (mode: ${B}$MODE${N})"
+  # The engine image compiles Asterisk + strongSwan + pcsc-lite from source. On low-power ARM
+  # boards (Raspberry Pi, Armbian SBCs) this first build can take 30+ minutes — only once, since
+  # later installs reuse the built image. Warn up front so a long, quiet build isn't mistaken
+  # for a hang.
+  if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
+    warn "the engine image builds from source (Asterisk + strongSwan). On low-power ARM machines"
+    warn "this can take 30+ minutes — this is normal, please be patient. It runs only once;"
+    warn "later installs/reloads reuse the built image."
+  fi
   ensure_docker
   ensure_pcscd
   ensure_engine_image

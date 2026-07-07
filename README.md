@@ -261,6 +261,7 @@ Released under the [MIT License](LICENSE). The build pulls in third-party compon
 | MCC-MNC | Carrier | Status | Notes |
 |---------|---------|--------|-------|
 | 302-220 | Telus (CA) | ✓ works | ePDG auto-derived from IMSI, full two-way voice + SMS |
+| 234 (EE) | CTExcel (UK, on EE) | ✓ works | China Telecom MVNO on EE's UK network |
 | 310-260 | T-Mobile (US) | untested | should work; ePDG auto-derived from IMSI |
 
 Any VoWiFi-capable SIM should work without configuration (ePDG/realm derived from the IMSI, SMSC from the SIM). Reports of additional working carriers welcome.
