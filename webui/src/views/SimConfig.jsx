@@ -3,7 +3,7 @@ import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 
 const emptyInstance = () => ({
-  id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', pin: '', reader: '',
+  id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '',
   reader_index: 0, msisdn: '', smsc: '', enabled: true,
   sip: { listen_addr: '0.0.0.0', transport: 'udp', external: [], webrtc: { enable: true } },
   debug: { asterisk: true, charon: false },
@@ -171,6 +171,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           <Field label="MCC"><input value={form.mcc} onChange={(e) => upd({ mcc: e.target.value })} /></Field>
           <Field label="MNC"><input value={form.mnc} onChange={(e) => upd({ mnc: e.target.value })} /></Field>
           <Field label="IMEI"><input className="mono" value={form.imei} onChange={(e) => upd({ imei: e.target.value })} placeholder="35123456-789012-3" /></Field>
+          <Field label="IMEISV"><input className="mono" value={form.imeisv || ''} onChange={(e) => upd({ imeisv: e.target.value.replace(/[^0-9]/g, '') })} maxLength={16} placeholder="auto from IMEI (DEVICE_IDENTITY)" /></Field>
           <Field label="Phone number (MSISDN)"><input className="mono" value={form.msisdn} onChange={(e) => upd({ msisdn: e.target.value })} placeholder="auto-learned" /></Field>
           <Field label="SMS centre (SMSC)">
             <div style={{ display: 'flex', gap: 12, marginBottom: 6, fontSize: 13 }}>

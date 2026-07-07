@@ -332,6 +332,31 @@ def delete_instance(iid: str):
     save(data)
 
 
+def normalize_imei(imei: str) -> str:
+    """Strip any formatting (dashes/spaces) from an IMEI and return just the digits."""
+    return "".join(ch for ch in (imei or "") if ch.isdigit())
+
+
+def imeisv_from_imei(imei: str, imeisv: str = "", svn: str = "00") -> str:
+    """Return a 16-digit IMEISV.
+
+    IMEISV = 14-digit IMEI base (TAC+SNR, i.e. the IMEI WITHOUT its Luhn check digit) + a
+    2-digit SVN (Software Version Number). If the caller supplied an explicit IMEISV we honour
+    it (digits only, padded/truncated to 16); otherwise we derive it from the IMEI's first 14
+    digits and append the given SVN (default '00'). Used to answer the ePDG's DEVICE_IDENTITY
+    request. Returns '' if there is no usable IMEI/IMEISV.
+    """
+    isv = "".join(ch for ch in (imeisv or "") if ch.isdigit())
+    if isv:
+        return (isv + "0" * 16)[:16]
+    digits = normalize_imei(imei)
+    if not digits:
+        return ""
+    base14 = digits[:14].ljust(14, "0")   # drop the 15th (check) digit; TAC+SNR = 14 digits
+    svn2 = ("".join(ch for ch in (svn or "") if ch.isdigit()) or "00")[:2].rjust(2, "0")
+    return base14 + svn2
+
+
 def render_instance_json(inst: dict, settings: dict) -> dict:
     """Convert a stored instance into the engine /config/instance.json contract."""
     ports = inst.get("ports", _alloc_ports(inst.get("index", 0)))
@@ -343,6 +368,10 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         "mcc": inst["mcc"],
         "mnc": inst["mnc"],
         "imei": inst.get("imei", ""),
+        # IMEISV (16 digits) for the ePDG DEVICE_IDENTITY response. Explicit stored value wins;
+        # otherwise auto-derive from the IMEI (14-digit base + '00' SVN). Empty stays empty
+        # (swu_ike then derives its own or falls back).
+        "imeisv": inst.get("imeisv", "") or imeisv_from_imei(inst.get("imei", ""), inst.get("imeisv", "")),
         "pin": inst.get("pin", ""),
         "reader": inst.get("reader") or f"imsi:{inst['imsi']}",
         "iccid": inst.get("iccid", ""),

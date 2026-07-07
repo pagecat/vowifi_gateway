@@ -10,7 +10,7 @@ const PORT_RE = /^\d{1,5}$/
 export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) {
   const simSmsc = card.smsc || ''
   const [f, setF] = useState({
-    name: '', imei: '', webrtc: true, transport: 'udp', listen_addr: '0.0.0.0',
+    name: '', imei: '', imeisv: '', webrtc: true, transport: 'udp', listen_addr: '0.0.0.0',
     user_agent: 'iOS/26.6 iPhone',
     smscMode: simSmsc ? 'auto' : 'manual',   // force manual if the SIM didn't yield one
     smscManual: '',
@@ -48,7 +48,7 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
     try {
       const body = {
         reader_index: card.index, reader: card.name,   // name re-resolves the index server-side
-        pin: f.pin, imei: f.imei, name: f.name,
+        pin: f.pin, imei: f.imei, imeisv: f.imeisv.trim() || undefined, name: f.name,
         smsc: f.smscMode === 'manual' ? f.smscManual.trim() : undefined,   // undefined => backend reads SIM
         webrtc: f.webrtc,
         port_mode: f.portMode,
@@ -98,6 +98,9 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
                 onChange={(e) => upd({ pin: e.target.value.replace(/[^0-9]/g, '') })} placeholder="4–8 digits" /></div>
           )}
           <div><label>IMEI — required</label><input className="mono" value={f.imei} onChange={(e) => upd({ imei: e.target.value })} placeholder="35123456-789012-3" /></div>
+          <div><label>IMEISV — optional</label><input className="mono" value={f.imeisv} onChange={(e) => upd({ imeisv: e.target.value.replace(/[^0-9]/g, '') })} maxLength={16} placeholder="auto from IMEI + random SVN" />
+            <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>16 digits, for the carrier's DEVICE_IDENTITY request. Leave blank to auto-generate (14-digit IMEI + 2-digit software version).</div>
+          </div>
 
           <div>
             <label>SMS centre (SMSC)</label>

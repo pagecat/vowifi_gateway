@@ -13,6 +13,7 @@ import base64
 import ipaddress
 import logging
 import os
+import random
 import re
 import time
 from contextlib import asynccontextmanager
@@ -104,6 +105,11 @@ def _match_instance_by_iccid(iccid):
         if i.get("iccid") == iccid:
             return i
     return None
+
+
+def _random_svn() -> str:
+    """Random 2-digit Software Version Number for an auto-derived IMEISV."""
+    return f"{random.randint(0, 99):02d}"
 
 
 def _find_running_by_reader(name: str):
@@ -556,8 +562,9 @@ def _preflight_pin(inst: dict) -> dict:
 @app.post("/api/provision")
 async def api_provision(body: dict):
     """Provision a detected card: verify PIN, read identity, create the line and start it.
-    Required: pin, imei. Optional: name, smsc, reader_index, reader (name), sip, webrtc, id,
-    port_mode ('auto'|'manual'), sip_port (int, when manual)."""
+    Required: pin, imei. Optional: imeisv (auto-derived from imei if blank), name, smsc,
+    reader_index, reader (name), sip, webrtc, id, port_mode ('auto'|'manual'), sip_port
+    (int, when manual)."""
     idx = await asyncio.to_thread(_resolve_reader_index, body)
     pin = body.get("pin", "")
     c = await asyncio.to_thread(sim.read_card, idx, pin or None)
@@ -577,7 +584,12 @@ async def api_provision(body: dict):
         "id": str(body.get("id") or (len(cfg.list_instances()) + 1)),
         "name": body.get("name") or f"{c.mcc}-{c.mnc}",
         "imsi": c.imsi, "mcc": c.mcc, "mnc": c.mnc, "iccid": c.iccid,
-        "imei": body.get("imei", ""), "pin": pin,
+        "imei": body.get("imei", ""),
+        # IMEISV for DEVICE_IDENTITY: user value if provided, else auto-derive (14-digit IMEI
+        # base + random 2-digit SVN) so each line looks like a distinct handset build.
+        "imeisv": (body.get("imeisv") or "").strip()
+                  or cfg.imeisv_from_imei(body.get("imei", ""), svn=_random_svn()),
+        "pin": pin,
         "reader": f"imsi:{c.imsi}",
         "reader_index": idx,  # store the physical reader index for USB device passthrough
         "smsc": smsc,

@@ -42,6 +42,25 @@ def container_ipv4():
         s.close()
 
 
+def imeisv_from_imei(imei, imeisv="", svn="00"):
+    """Return a 16-digit IMEISV for the ePDG DEVICE_IDENTITY response.
+
+    Explicit IMEISV wins (digits only, padded/truncated to 16). Otherwise derive it from the
+    IMEI's first 14 digits (TAC+SNR, i.e. the IMEI without its check digit) + a 2-digit SVN
+    (default '00'). Mirrors control/app/config.imeisv_from_imei so a hand-authored instance.json
+    (no imeisv field) still gets a valid value. Returns '' if there is no usable IMEI/IMEISV.
+    """
+    isv = "".join(ch for ch in str(imeisv or "") if ch.isdigit())
+    if isv:
+        return (isv + "0" * 16)[:16]
+    digits = "".join(ch for ch in str(imei or "") if ch.isdigit())
+    if not digits:
+        return ""
+    base14 = digits[:14].ljust(14, "0")
+    svn2 = ("".join(ch for ch in str(svn or "") if ch.isdigit()) or "00")[:2].rjust(2, "0")
+    return base14 + svn2
+
+
 def build_context(cfg):
     mcc = str(cfg["mcc"])
     mnc = str(cfg["mnc"]).zfill(3)
@@ -168,6 +187,11 @@ def main():
         # smartcard path; source is the container IP; ePDG FQDN is resolved by swu_ike.
         f.write(f"USIM_READER_INDEX={cfg.get('reader_index', 0)}\n")
         f.write(f"USIM_IMSI={ctx['imsi']}\n")
+        # IMEI / IMEISV for the ePDG DEVICE_IDENTITY response. imeisv falls back to a value
+        # derived from the IMEI if the instance didn't carry one (hand-authored config).
+        imei_digits = "".join(ch for ch in str(cfg.get("imei", "")) if ch.isdigit())
+        f.write(f"SWU_IMEI={imei_digits}\n")
+        f.write(f"SWU_IMEISV={cfg.get('imeisv') or imeisv_from_imei(cfg.get('imei',''))}\n")
         f.write(f"SWU_SOURCE={ctx['local_addr']}\n")
         f.write(f"SWU_EPDG={ctx['epdg']}\n")
         f.write(f"SWU_APN={cfg.get('apn','ims')}\n")

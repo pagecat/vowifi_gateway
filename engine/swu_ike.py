@@ -363,6 +363,41 @@ APN_AMBR                                = 42094
 EXTENDED_APN_AMBR                       = 42095
 N1_MODE_CAPABILITY                      = 51015
 
+# Reverse lookup: IKEv2 Notify Message Type value -> name, for debug logging of received
+# Notify payloads (helps diagnose ePDG behaviour and prepares for fuller 3GPP support). Only
+# genuine Notify Message Types are listed (RFC 7296 + 3GPP TS 24.302 / IANA), so protocol-ID
+# and transform constants that happen to share integer values are not confused for notifies.
+NOTIFY_TYPE_NAMES = {
+    1: "UNSUPPORTED_CRITICAL_PAYLOAD", 4: "INVALID_IKE_SPI", 5: "INVALID_MAJOR_VERSION",
+    7: "INVALID_SYNTAX", 9: "INVALID_MESSAGE_ID", 11: "INVALID_SPI",
+    14: "NO_PROPOSAL_CHOSEN", 17: "INVALID_KE_PAYLOAD", 24: "AUTHENTICATION_FAILED",
+    34: "SINGLE_PAIR_REQUIRED", 35: "NO_ADDITIONAL_SAS", 36: "INTERNAL_ADDRESS_FAILURE",
+    37: "FAILED_CP_REQUIRED", 38: "TS_UNACCEPTABLE", 39: "INVALID_SELECTORS",
+    40: "UNACCEPTABLE_ADDRESSES", 41: "UNEXPECTED_NAT_DETECTED", 43: "TEMPORARY_FAILURE",
+    44: "CHILD_SA_NOT_FOUND",
+    # 3GPP / private-use error range
+    8192: "PDN_CONNECTION_REJECTION", 8193: "MAX_CONNECTION_REACHED",
+    8244: "NO_APN_SUBSCRIPTION", 9001: "USER_UNKNOWN", 9002: "NO_APN_SUBSCRIPTION",
+    9003: "AUTHORIZATION_REJECTED", 9006: "ILLEGAL_ME", 10500: "NETWORK_FAILURE",
+    11001: "RAT_TYPE_NOT_ALLOWED", 11005: "IMEI_NOT_ACCEPTED", 11011: "PLMN_NOT_ALLOWED",
+    11055: "UNAUTHENTICATED_EMERGENCY_NOT_SUPPORTED",
+    # status range (>= 16384)
+    16384: "INITIAL_CONTACT", 16385: "SET_WINDOW_SIZE", 16386: "ADDITIONAL_TS_POSSIBLE",
+    16387: "IPCOMP_SUPPORTED", 16388: "NAT_DETECTION_SOURCE_IP",
+    16389: "NAT_DETECTION_DESTINATION_IP", 16390: "COOKIE", 16391: "USE_TRANSPORT_MODE",
+    16392: "HTTP_CERT_LOOKUP_SUPPORTED", 16393: "REKEY_SA",
+    16394: "ESP_TFC_PADDING_NOT_SUPPORTED", 16395: "NON_FIRST_FRAGMENTS_ALSO",
+    16417: "EAP_ONLY_AUTHENTICATION", 40961: "REACTIVATION_REQUESTED_CAUSE",
+    41041: "BACKOFF_TIMER", 41101: "DEVICE_IDENTITY", 41112: "EMERGENCY_SUPPORT",
+    41134: "EMERGENCY_CALL_NUMBERS", 41288: "NBIFOM_GENERIC_CONTAINER",
+    41304: "P_CSCF_RESELECTION_SUPPORT", 41501: "PTI", 42014: "EPS_QOS",
+    42015: "EXTENDED_EPS_QOS", 42017: "TFT", 42020: "MODIFIED_BEARER",
+    42094: "APN_AMBR", 42095: "EXTENDED_APN_AMBR", 51015: "N1_MODE_CAPABILITY",
+}
+
+def notify_name(value):
+    return NOTIFY_TYPE_NAMES.get(value, "UNKNOWN")
+
 #IKEv2 Authenticaton Method
 RSA_DIGITAL_SIGNATURE             = 1
 SHARED_KEY_MESSAGE_INTEGRITY_CODE = 2
@@ -533,6 +568,10 @@ class swu():
         self.check_nat = True
         self.device_identity_requested = False
         self.device_identity_type = None
+        # Per-instance IMEI/IMEISV for the ePDG DEVICE_IDENTITY response. Default to the module
+        # constants (upstream behaviour) until set_device_identity() overrides them.
+        self.imei = IMEI
+        self.imeisv = IMEISV
 
         self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
 #       self.set_identification(IDR,ID_FQDN, self.apn + '.apn.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
@@ -1110,10 +1149,27 @@ class swu():
         spi = b''
         notification_data = b''
         if data[1]!= 0: #spi present
-            spi = data[4:4+data[1]]            
+            spi = data[4:4+data[1]]
         if len(data)>4 +data[1]: #notification data present
             notification_data = data[4+data[1]:]
-        return [data[0],struct.unpack("!H", data[2:4])[0],spi,notification_data] # protocol_id, notify_message_type, spi, notification_data    
+        # Debug: log every received IKEv2 Notify (type name + code, protocol, and data hex).
+        # Helps diagnose ePDG behaviour (errors, BACKOFF_TIMER, DEVICE_IDENTITY, P-CSCF-reselect,
+        # …) and is groundwork for fuller 3GPP TS 24.302 handling. Goes to the IKE (charon) log.
+        try:
+            ntype = struct.unpack("!H", data[2:4])[0]
+            proto = data[0]
+            klass = "ERROR" if ntype < 16384 else "STATUS"
+            extra = ""
+            if notification_data:
+                hexd = notification_data.hex()
+                extra = " data=" + (hexd if len(hexd) <= 64 else hexd[:64] + "...")
+            if spi:
+                extra += " spi=" + spi.hex()
+            swu_log("received Notify: %s (%d, %s) protocol=%d%s" %
+                    (notify_name(ntype), ntype, klass, proto, extra))
+        except Exception:
+            pass
+        return [data[0],struct.unpack("!H", data[2:4])[0],spi,notification_data] # protocol_id, notify_message_type, spi, notification_data
         
     def decode_payload_type_d(self, data):
         spi = b''
@@ -1291,8 +1347,25 @@ class swu():
         if type == TSR: self.ts_list_responder = ts_list    
 
     def set_cp_list(self, cp_list):
-         self.cp_list = cp_list    
-         
+         self.cp_list = cp_list
+
+    def set_device_identity(self, imei, imeisv=""):
+        """Set the IMEI / IMEISV used to answer the ePDG's DEVICE_IDENTITY request.
+
+        IMEI: digits only (a formatted '35212721-360029-6' is accepted and stripped).
+        IMEISV: 16 digits; if blank, derive it from the IMEI's first 14 digits (TAC+SNR, i.e.
+        without the check digit) + a '00' SVN. Empty IMEI keeps the module defaults so a bare
+        run still works."""
+        imei_d = "".join(ch for ch in str(imei or "") if ch.isdigit())
+        isv_d = "".join(ch for ch in str(imeisv or "") if ch.isdigit())
+        if imei_d:
+            self.imei = imei_d
+        if isv_d:
+            self.imeisv = (isv_d + "0" * 16)[:16]
+        elif imei_d:
+            self.imeisv = (imei_d[:14].ljust(14, "0")) + "00"
+        swu_log("device identity set: IMEI=%s IMEISV=%s" % (self.imei, self.imeisv))
+
     def set_identification(self,payload_type, id_type,value):
         if payload_type == IDI: self.identification_initiator = (id_type, value)
         if payload_type == IDR: self.identification_responder = (id_type, value)        
@@ -1506,13 +1579,17 @@ class swu():
         Format: [2 bytes length][1 byte identity type][BCD encoded IMEI/IMEISV]
         Identity type 0x01 = IMEI (15 digits, padded with F to 16)
         Identity type 0x02 = IMEISV (16 digits)
+        Uses the per-instance self.imei / self.imeisv (set via set_device_identity).
         """
         if self.device_identity_type == 0x02:
             identity_type = 0x02
-            digits = IMEISV
+            digits = (self.imeisv or IMEISV)
         else:  # 0x01 or fallback
             identity_type = 0x01
-            digits = IMEI + 'F'  # pad 15-digit IMEI to 16 chars with trailing F
+            imei = (self.imei or IMEI)
+            digits = imei[:15] + 'F'  # pad 15-digit IMEI to 16 chars with trailing F
+        swu_log("answering DEVICE_IDENTITY (type=0x%02x) with %s" %
+                (identity_type, digits.rstrip('F')))
 
         bcd = b''
         for i in range(0, len(digits), 2):
@@ -3913,9 +3990,13 @@ def main():
     parser.add_option("-K", "--ki", dest="ki", help="ki for Milenage (if not using option -m)")    
     parser.add_option("-P", "--op", dest="op", help="op for Milenage (if not using option -m)")    
     parser.add_option("-C", "--opc", dest="opc", help="opc for Milenage (if not using option -m)") 
-    parser.add_option("-n", "--netns", dest="netns", help="Name of network namespace for tun device")  
-    parser.add_option("-S", "--sqn", dest="sqn", help="SQN (6 hex bytes)")        
-    
+    parser.add_option("-n", "--netns", dest="netns", help="Name of network namespace for tun device")
+    parser.add_option("-S", "--sqn", dest="sqn", help="SQN (6 hex bytes)")
+    parser.add_option("-E", "--imei", dest="imei", default="",
+                      help="IMEI (15 digits) for the ePDG DEVICE_IDENTITY response")
+    parser.add_option("-V", "--imeisv", dest="imeisv", default="",
+                      help="IMEISV (16 digits) for DEVICE_IDENTITY; auto-derived from IMEI if blank")
+
     (options, args) = parser.parse_args()
     
     try:
@@ -3932,6 +4013,7 @@ def main():
     a.set_ts_list(TSI, ts_list_initiator)
     a.set_ts_list(TSR, ts_list_responder)
     a.set_cp_list(cp_list)
+    a.set_device_identity(options.imei, options.imeisv)
 
     # VoWiFi engine addition: clean shutdown. On SIGTERM/SIGINT send an IKE DELETE so the ePDG
     # frees the SA immediately -- a hard kill leaves a lingering SA that makes the NEXT
