@@ -2813,7 +2813,8 @@ class swu():
                         else:
                             self.log_notify_error(code, "IKE_AUTH")
                         return OTHER_ERROR,str(code)
-   
+
+                elif i[0] == EAP:
                     if i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
                         if i[1][3] in (AKA_Challenge, AKA_Reauthentication):
                             
