@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
+import PushInfoModal from './PushInfoModal.jsx'
 
 export default function Settings() {
   const [s, setS] = useState(null)
   const [msg, setMsg] = useState('')
+  const [info, setInfo] = useState('')   // '' | 'webhook' | 'telegram' — which help modal is open
 
   useEffect(() => { api.settings().then(setS).catch(() => {}) }, [])
   if (!s) return <div style={{ color: 'var(--text-dim)' }}>Loading…</div>
@@ -11,6 +13,13 @@ export default function Settings() {
   const upd = (patch) => setS((x) => ({ ...x, ...patch }))
   const updTls = (patch) => setS((x) => ({ ...x, tls: { ...x.tls, ...patch } }))
   const updDebug = (patch) => setS((x) => ({ ...x, debug: { ...x.debug, ...patch } }))
+  // webhook / telegram helpers: patch the channel object and its nested `events` map.
+  const wh = s.webhook || { enabled: false, url: '', events: {} }
+  const tg = s.telegram || { enabled: false, bot_token: '', chat_id: '', events: {} }
+  const updWh = (patch) => setS((x) => ({ ...x, webhook: { ...wh, ...patch } }))
+  const updWhEv = (k, v) => setS((x) => ({ ...x, webhook: { ...wh, events: { ...(wh.events || {}), [k]: v } } }))
+  const updTg = (patch) => setS((x) => ({ ...x, telegram: { ...tg, ...patch } }))
+  const updTgEv = (k, v) => setS((x) => ({ ...x, telegram: { ...tg, events: { ...(tg.events || {}), [k]: v } } }))
 
   const save = async () => {
     try { await api.saveSettings(s); setMsg('Saved. Restart the control surface for TLS/port changes, and re-provision a line for ring-timeout changes, to take effect.') }
@@ -72,10 +81,68 @@ export default function Settings() {
         </div>
       </div>
 
+      <div className="card" style={{ padding: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <h3 style={{ marginTop: 0, marginBottom: 0 }}>Webhook push</h3>
+          <button className="btn btn-ghost" style={{ padding: '2px 9px', fontSize: 12, borderRadius: 20 }}
+            title="Payload format & notes" onClick={() => setInfo('webhook')}>ⓘ Format</button>
+        </div>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', margin: '8px 0 12px' }}>
+          POST a JSON body to your URL when an incoming SMS or call arrives. Click <b>ⓘ Format</b> for
+          the exact payload.
+        </div>
+        <label><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={!!wh.enabled}
+          onChange={(e) => updWh({ enabled: e.target.checked })} />Enable webhook push</label>
+        <div style={{ marginTop: 12, opacity: wh.enabled ? 1 : .5 }}>
+          <label>Webhook URL</label>
+          <input className="mono" value={wh.url || ''} disabled={!wh.enabled}
+            onChange={(e) => updWh({ url: e.target.value })} placeholder="https://example.com/hook" />
+          <div style={{ marginTop: 10, fontSize: 13, color: 'var(--text-mute)' }}>Events to push</div>
+          <div style={{ display: 'flex', gap: 18, marginTop: 6 }}>
+            <label><input type="checkbox" style={{ width: 'auto', marginRight: 7 }} disabled={!wh.enabled}
+              checked={wh.events?.incoming_call !== false} onChange={(e) => updWhEv('incoming_call', e.target.checked)} />Incoming call</label>
+            <label><input type="checkbox" style={{ width: 'auto', marginRight: 7 }} disabled={!wh.enabled}
+              checked={wh.events?.incoming_sms !== false} onChange={(e) => updWhEv('incoming_sms', e.target.checked)} />Incoming SMS</label>
+          </div>
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <h3 style={{ marginTop: 0, marginBottom: 0 }}>Telegram push</h3>
+          <button className="btn btn-ghost" style={{ padding: '2px 9px', fontSize: 12, borderRadius: 20 }}
+            title="Message format & setup" onClick={() => setInfo('telegram')}>ⓘ Format</button>
+        </div>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', margin: '8px 0 12px' }}>
+          Send incoming SMS/calls to a Telegram chat or channel via a bot. Click <b>ⓘ Format</b> for
+          setup and the message layout.
+        </div>
+        <label><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={!!tg.enabled}
+          onChange={(e) => updTg({ enabled: e.target.checked })} />Enable Telegram push</label>
+        <div style={{ marginTop: 12, opacity: tg.enabled ? 1 : .5 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div><label>Bot token</label>
+              <input className="mono" value={tg.bot_token || ''} disabled={!tg.enabled}
+                onChange={(e) => updTg({ bot_token: e.target.value })} placeholder="123456:ABC-DEF..." /></div>
+            <div><label>Chat / Channel ID</label>
+              <input className="mono" value={tg.chat_id || ''} disabled={!tg.enabled}
+                onChange={(e) => updTg({ chat_id: e.target.value })} placeholder="-1001234567890 or 12345678" /></div>
+          </div>
+          <div style={{ marginTop: 10, fontSize: 13, color: 'var(--text-mute)' }}>Events to push</div>
+          <div style={{ display: 'flex', gap: 18, marginTop: 6 }}>
+            <label><input type="checkbox" style={{ width: 'auto', marginRight: 7 }} disabled={!tg.enabled}
+              checked={tg.events?.incoming_call !== false} onChange={(e) => updTgEv('incoming_call', e.target.checked)} />Incoming call</label>
+            <label><input type="checkbox" style={{ width: 'auto', marginRight: 7 }} disabled={!tg.enabled}
+              checked={tg.events?.incoming_sms !== false} onChange={(e) => updTgEv('incoming_sms', e.target.checked)} />Incoming SMS</label>
+          </div>
+        </div>
+      </div>
+
       <div>
         <button className="btn btn-primary" onClick={save}>Save settings</button>
         {msg && <span style={{ marginLeft: 12, color: '#22c55e', fontSize: 13 }}>{msg}</span>}
       </div>
+      {info && <PushInfoModal channel={info} onClose={() => setInfo('')} />}
     </div>
   )
 }

@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
-from . import store, engine, status as status_mod, sim, card
+from . import store, engine, status as status_mod, sim, card, notify_push
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -43,6 +43,7 @@ class Hub:
         self._learning: set[str] = set()     # instances currently learning MSISDN
         self._msisdn_tries: dict[str, int] = {}
         self.health: dict[str, dict] = {}    # per-instance retry/health tracking
+        self._pushed_calls: set[int] = set() # call-record ids already push-notified (dedupe)
 
     def cards_list(self) -> list[dict]:
         """Reader/card entries sorted by current PC/SC index (the UI display order)."""
@@ -1052,6 +1053,7 @@ async def api_engine_event(payload: dict):
             return {"ok": True, "dropped": "internal_signalling"}
         rec = store.add_message(iid, "in", sender, text)
         await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+        _dispatch_push(notify_push.EV_INCOMING_SMS, iid, sender, text)
     elif event == "sms_out" and len(args) >= 2:
         pass  # already stored by the send path
     elif event == "call_in":
@@ -1064,6 +1066,19 @@ async def api_engine_event(payload: dict):
         peer = args[0] if args else ""
         rec = store.add_call_deduped(iid, "in", peer, status="ringing")
         await hub.broadcast({"type": "call", "instance": iid, "call": rec})
+        # Push-notify ONCE per real inbound call. IMS re-delivers call_in several times for
+        # one call (VoLTE preconditions / GRUU fork / retransmit); add_call_deduped folds
+        # them into a single record, so key the notification on that record id. An anonymous
+        # first event ('') whose number arrives on a later duplicate would push before the
+        # number is known — so only notify once we have the peer, or after ~4s if it stays
+        # anonymous (caller genuinely withheld it).
+        cid = rec.get("id")
+        if cid is not None and cid not in hub._pushed_calls:
+            if peer or int(time.time()) - int(rec.get("start_ts", 0)) >= 4:
+                hub._pushed_calls.add(cid)
+                if len(hub._pushed_calls) > 512:      # bound the dedupe set
+                    hub._pushed_calls = set(list(hub._pushed_calls)[-256:])
+                _dispatch_push(notify_push.EV_INCOMING_CALL, iid, rec.get("peer") or peer)
     elif event == "call_out" and args:
         rec = store.add_call(iid, "out", args[0], status="dialing")
         await hub.broadcast({"type": "call", "instance": iid, "call": rec})
@@ -1110,6 +1125,22 @@ async def push_status(iid: str):
         await hub.broadcast({"type": "status", "instance": str(iid), **st})
     except Exception as e:  # noqa
         log.debug("push_status error: %r", e)
+
+
+def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):
+    """Fire outbound push notifications (webhook / Telegram) for an incoming event, off the
+    event path so a slow endpoint can't stall engine-event handling. No-op unless a channel
+    is enabled for this event."""
+    inst = cfg.get_instance(iid)
+    if not inst:
+        return
+    settings = cfg.get_settings()
+    wh = settings.get("webhook") or {}
+    tg = settings.get("telegram") or {}
+    if not (wh.get("enabled") or tg.get("enabled")):
+        return
+    asyncio.create_task(
+        asyncio.to_thread(notify_push.dispatch, settings, event, inst, source, text))
 
 
 # ----------------------------- WebSocket -----------------------------

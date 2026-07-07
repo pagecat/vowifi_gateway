@@ -32,6 +32,19 @@ DEFAULTS = {
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
         "ring_timeout": 35,
+        # Outbound push notifications for incoming events (SMS / calls). Both channels are
+        # independent and gated on their own `enabled` flag + per-event checkboxes.
+        "webhook": {
+            "enabled": False,
+            "url": "",
+            "events": {"incoming_sms": True, "incoming_call": True},
+        },
+        "telegram": {
+            "enabled": False,
+            "bot_token": "",
+            "chat_id": "",
+            "events": {"incoming_sms": True, "incoming_call": True},
+        },
     },
     "instances": {},
 }
@@ -101,6 +114,14 @@ def load() -> dict:
             out["settings"]["tls"] = {**DEFAULTS["settings"]["tls"], **data["settings"]["tls"]}
         out["settings"]["retry"] = {**DEFAULTS["settings"]["retry"],
                                     **(data.get("settings", {}).get("retry", {}))}
+        # webhook / telegram: merge one level deep (like tls/retry) so a saved config that
+        # predates these keys — or omits the nested `events` map — still gets full defaults.
+        for key in ("webhook", "telegram"):
+            saved = data.get("settings", {}).get(key, {}) or {}
+            merged = {**DEFAULTS["settings"][key], **saved}
+            merged["events"] = {**DEFAULTS["settings"][key]["events"],
+                                **(saved.get("events", {}) or {})}
+            out["settings"][key] = merged
         out["instances"] = data.get("instances", {})
         return out
 
