@@ -65,6 +65,15 @@ PCSC_VERSION="${PCSC_VERSION:-2.3.3}"
 # Set by ensure_pcscd: 1 if we source-built pcsc-lite on the host (headers already in /usr),
 # 0 if the distro package already matched the pin (need the distro -dev pkg for pyscard headers).
 PCSC_SOURCE_BUILT=0
+# CCID USB driver version, built from source ON THE HOST with local fixes (patches/ccid/*).
+# NOT installed by default — run `sudo ./install.sh patch` to build + install it. Needed only
+# for the HSIC CCID-Reader (1d99:0016): its firmware always answers "no ICC present" to
+# GetSlotStatus even while a card is inserted and powered, so stock libccid never powers
+# the card. The patch tracks presence from the reader's (correct) NotifySlotChange interrupts.
+# Keep this >= 1.6.2: that release added 1d99:0016 to the supported-reader table, so the
+# built driver recognizes the VID/PID out of the box (older/distro libccid < 1.6.2 would
+# additionally need the device whitelisted by hand in the bundle's Info.plist).
+CCID_VERSION="${CCID_VERSION:-1.6.2}"
 
 # ------------------------------------------------------------------ pretty output
 if [ -t 1 ]; then B=$(printf '\033[1m'); G=$(printf '\033[32m'); Y=$(printf '\033[33m'); R=$(printf '\033[31m'); N=$(printf '\033[0m'); else B=; G=; Y=; R=; N=; fi
@@ -237,6 +246,58 @@ ensure_pcscd() {
   else
     warn "pcscd not active yet — it is enabled for boot and will start on first reader use"
   fi
+}
+
+# Build + install the CCID USB driver $CCID_VERSION from source with the fixes under
+# patches/ccid/* applied (currently: HSIC CCID-Reader 1d99:0016 broken GetSlotStatus —
+# the firmware always reports "no ICC present" so presence must be tracked from the
+# reader's NotifySlotChange interrupt messages instead). The build installs into the
+# pcsc-lite usbdropdir, replacing the distro libccid bundle files. Idempotent via a
+# marker file; on apt systems the distro libccid package is held so an upgrade can't
+# clobber the patched driver.
+# OPT-IN: not part of `install` — run `sudo ./install.sh patch` (only needed for readers
+# with the firmware quirks addressed under patches/ccid/*; the stock distro driver is
+# fine for compliant readers).
+ensure_ccid_host() {
+  drivers_dir=$(pkg-config libpcsclite --variable usbdropdir 2>/dev/null || true)
+  [ -n "$drivers_dir" ] || drivers_dir=/usr/lib/pcsc/drivers
+  ccid_marker="$drivers_dir/ifd-ccid.bundle/Contents/.vowifi-ccid-${CCID_VERSION}-patched"
+  if [ -f "$ccid_marker" ]; then
+    info "patched CCID driver $CCID_VERSION already installed ($drivers_dir)"
+    return
+  fi
+  info "building CCID driver $CCID_VERSION from source with patches/ccid/*…"
+  if   have apt-get; then
+    pkg_install meson ninja-build flex gcc pkg-config perl patch wget ca-certificates libusb-1.0-0-dev zlib1g-dev
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install libpcsclite-dev
+  elif have dnf || have yum; then
+    pkg_install meson ninja-build flex gcc pkgconf-pkg-config perl patch wget libusb1-devel zlib-devel
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
+  elif have pacman;  then
+    pkg_install meson ninja flex gcc pkgconf perl patch wget libusb zlib
+  elif have zypper;  then
+    pkg_install meson ninja flex gcc pkg-config perl patch wget libusb-1_0-devel zlib-devel
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
+  elif have apk;     then
+    pkg_install meson ninja flex gcc pkgconfig perl patch wget musl-dev libusb-dev zlib-dev
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-dev
+  fi
+  tmp=$(mktemp -d)
+  ( cd "$tmp" \
+    && { curl -fsSLo ccid.tar.gz "https://github.com/LudovicRousseau/CCID/archive/refs/tags/${CCID_VERSION}.tar.gz" \
+         || wget -qO ccid.tar.gz "https://github.com/LudovicRousseau/CCID/archive/refs/tags/${CCID_VERSION}.tar.gz"; } \
+    && tar xf ccid.tar.gz && cd "CCID-${CCID_VERSION}" \
+    && for p in "$REPO_DIR"/patches/ccid/*.patch; do echo "applying $p"; patch -p1 < "$p" || exit 1; done \
+    && meson setup builddir \
+    && ninja -C builddir && ninja -C builddir install \
+  ) || die "failed to build CCID driver $CCID_VERSION from source"
+  rm -rf "$tmp"
+  touch "$ccid_marker" 2>/dev/null || true
+  # keep a distro libccid upgrade from clobbering the patched bundle files
+  if have apt-mark; then apt-mark hold libccid >/dev/null 2>&1 || true; fi
+  # reload the driver if pcscd is already running
+  if have systemctl; then systemctl restart pcscd 2>/dev/null || true; fi
+  info "patched CCID driver $CCID_VERSION installed to $drivers_dir"
 }
 
 _build_pcsclite_host() {
@@ -587,6 +648,14 @@ cmd_status() {
   docker ps -a --filter "name=^${ENGINE_PREFIX}" --format '  {{.Names}}  {{.Status}}' 2>/dev/null || true
 }
 
+# Opt-in: build + install the patched CCID driver (patches/ccid/*) on the host. Kept out of
+# the default install because it replaces the distro libccid — only needed for quirky readers
+# (e.g. HSIC 1d99:0016, whose GetSlotStatus always reports "no card").
+cmd_patch() {
+  need_root
+  ensure_ccid_host
+}
+
 cmd_logs() {
   resolve_mode
   # `|| true` so that Ctrl-C'ing out of a follow (non-zero exit) doesn't abort the caller —
@@ -667,6 +736,8 @@ ${B}VoWiFi→SIP gateway installer${N}
   $0 uninstall [--purge]  remove vowifi containers/images/service (--purge also deletes data+venv)
   $0 status               show mode + component status
   $0 logs                 follow control-plane logs
+  $0 patch                build + install the patched CCID driver (patches/ccid/*) on the host
+                          — opt-in, only for quirky readers (e.g. HSIC 1d99:0016)
 
 ${B}Modes:${N}
   local  (default) control plane runs natively (venv + systemd 'vowifi-control');
@@ -714,6 +785,7 @@ case "$CMD" in
   uninstall)          cmd_uninstall ;;
   status)             cmd_status ;;
   logs)               cmd_logs ;;
+  patch)              cmd_patch ;;
   "")                 cmd_auto ;;
   -h|--help|help)     usage ;;
   *) err "unknown command: $CMD"; usage; exit 1 ;;

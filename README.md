@@ -139,6 +139,17 @@ sudo ./install.sh uninstall
 
 # Uninstall + delete everything (images, venv, and ./data)
 sudo ./install.sh uninstall --purge
+
+# OPT-IN: build + install a patched CCID driver (patches/ccid/*) on the host, replacing the
+# distro libccid. Only needed for readers with firmware quirks — e.g. the HSIC CCID-Reader
+# (1d99:0016), whose GetSlotStatus always answers "no card" so the stock driver never powers
+# the SIM. Idempotent; safe to re-run. NOT part of the default install.
+# The driver is built from CCID 1.6.2, which already lists 1d99:0016 in its supported-reader
+# table — no manual Info.plist whitelisting needed after `patch`. (Distro libccid older than
+# 1.6.2, e.g. 1.5.x, does NOT know this VID/PID: without `patch` you'd have to add it to the
+# ifdVendorID/ifdProductID/ifdFriendlyName arrays in the driver's Info.plist by hand — and the
+# reader still can't power the SIM, because the GetSlotStatus firmware bug needs the patch.)
+sudo ./install.sh patch
 ```
 
 ---

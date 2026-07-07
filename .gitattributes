@@ -1,0 +1,5 @@
+# Shell scripts and patches are consumed on Linux — keep them LF everywhere,
+# even on Windows checkouts with core.autocrlf=true (CRLF would break bash and
+# `patch -p1`).
+*.sh    text eol=lf
+*.patch text eol=lf
