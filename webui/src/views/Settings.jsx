@@ -82,6 +82,22 @@ export default function Settings() {
       </div>
 
       <div className="card" style={{ padding: 20 }}>
+        <h3 style={{ marginTop: 0 }}>Tunnel</h3>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>
+          How often the gateway proactively rekeys the IPsec (ESP) security association with the
+          carrier's ePDG. IKEv2 does not put a lifetime on the wire, so this is a local policy: the
+          SA is refreshed (seamless make-before-break) before it silently ages out and the carrier
+          stops accepting traffic. <b>0 disables</b> proactive rekey (the SA is only refreshed if
+          the carrier initiates it). Applies after the line is re-provisioned/restarted.
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <div><label>SA rekey interval (minutes, 0 = off)</label>
+            <input type="number" min="0" max="1440" value={s.rekey?.minutes ?? 30}
+              onChange={(e) => upd({ rekey: { ...(s.rekey || {}), minutes: +e.target.value } })} /></div>
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <h3 style={{ marginTop: 0, marginBottom: 0 }}>Webhook push</h3>
           <button className="btn btn-ghost" style={{ padding: '2px 9px', fontSize: 12, borderRadius: 20 }}

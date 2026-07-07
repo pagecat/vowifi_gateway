@@ -196,6 +196,11 @@ def main():
         f.write(f"SWU_APN={cfg.get('apn','ims')}\n")
         f.write(f"SWU_MCC={ctx['mcc']}\n")
         f.write(f"SWU_MNC={ctx['mnc']}\n")
+        # Proactive CHILD-SA rekey period (minutes; 0 = disabled). IKEv2 does not carry SA
+        # lifetime on the wire, so swu_ike uses this local-policy value to rekey the ESP SA
+        # before it silently ages out (3GPP TS 24.302 7.2.2C). Set by the manager from
+        # settings.rekey.minutes (default 30); hand-authored configs may omit it.
+        f.write(f"SWU_CHILD_REKEY_MINUTES={cfg.get('rekey_minutes', 30)}\n")
     print(f"[render] env -> {env_path}")
 
 

@@ -28,6 +28,12 @@ DEFAULTS = {
         "debug": {"asterisk": True, "charon": False, "pcap": False},
         "manager_url": "",          # reachable URL engines POST events to (auto if empty)
         "retry": {"max": 3, "interval": 30},   # auto-retry attempts + seconds per attempt
+        # Proactive IKEv2 SA rekey. IKEv2 does NOT negotiate SA lifetime on the wire (RFC 7296
+        # dropped it), so rekey timing is local policy (3GPP TS 24.302 clause 7.2.2C: use a
+        # configured value, else an implementation value). We rekey the CHILD (ESP) SA every
+        # `minutes` from its establishment. 0 disables proactive rekey (passive only — the SA
+        # is only refreshed if the ePDG initiates a rekey). Default 30 min.
+        "rekey": {"minutes": 30},
         # Outbound ring timeout (s): how long Asterisk lets an outgoing call ring before it
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
@@ -114,6 +120,8 @@ def load() -> dict:
             out["settings"]["tls"] = {**DEFAULTS["settings"]["tls"], **data["settings"]["tls"]}
         out["settings"]["retry"] = {**DEFAULTS["settings"]["retry"],
                                     **(data.get("settings", {}).get("retry", {}))}
+        out["settings"]["rekey"] = {**DEFAULTS["settings"]["rekey"],
+                                    **(data.get("settings", {}).get("rekey", {}))}
         # webhook / telegram: merge one level deep (like tls/retry) so a saved config that
         # predates these keys — or omits the nested `events` map — still gets full defaults.
         for key in ("webhook", "telegram"):
@@ -415,7 +423,23 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
             },
         },
         "debug": inst.get("debug", settings.get("debug", {})),
+        # Proactive CHILD-SA rekey period in minutes (0 = disabled). Per-line override
+        # (inst.rekey_minutes) wins, else the global settings default, else 30. Clamped to 0
+        # (off) or a sane 1..1440 window so a typo can't set an absurd sub-minute rekey storm.
+        "rekey_minutes": _clamp_rekey(inst.get("rekey_minutes",
+                                               (settings.get("rekey", {}) or {}).get("minutes", 30))),
     }
+
+
+def _clamp_rekey(v) -> int:
+    """0 disables proactive rekey; otherwise clamp to 1..1440 minutes."""
+    try:
+        m = int(v)
+    except (TypeError, ValueError):
+        return 30
+    if m <= 0:
+        return 0
+    return max(1, min(1440, m))
 
 
 def write_instance_json(inst: dict, settings: dict) -> str:
