@@ -1,0 +1,101 @@
+diff --git a/src/commands.c b/src/commands.c
+index d8d1ae9..dfc8c31 100644
+--- a/src/commands.c
++++ b/src/commands.c
+@@ -38,6 +38,7 @@
+ #include "ccid_ifdhandler.h"
+ #include "debug.h"
+ #include "utils.h"
++#include "towitoko/atr.h"
+ 
+ /* All the pinpad readers I used are more or less bogus
+  * I use code to change the user command and make the firmware happy */
+@@ -78,6 +79,45 @@ static RESPONSECODE CmdXfrBlockTPDU_T1(unsigned int reader_index,
+ static void i2dw(int value, unsigned char *buffer);
+ static unsigned int bei2i(unsigned char *buffer);
+ 
++#define HSIC_CCID_READER 0x1D990016
++
++/*
++ * HSIC CCID-Reader firmware drops the final TCK byte from the ATR.
++ * Synthesize it (ISO 7816-3: XOR of T0 through last historical byte) so
++ * downstream ATR parsing and PTS negotiation proceed normally.
++ */
++static void hsic_repair_atr(unsigned int reader_index, unsigned char *buffer,
++	unsigned int *length)
++{
++	ATR_t atr;
++	unsigned char tck;
++	unsigned int i, len;
++
++	if (HSIC_CCID_READER != get_ccid_descriptor(reader_index)->readerID)
++		return;
++
++	len = *length;
++	if (len < 2 || len >= MAX_ATR_SIZE)
++		return;
++
++	if (ATR_InitFromArray(&atr, buffer, len) == ATR_OK)
++		return;
++
++	tck = 0;
++	for (i = 1; i < len; i++)
++		tck ^= buffer[i];
++
++	buffer[len] = tck;
++	if (ATR_InitFromArray(&atr, buffer, len + 1) != ATR_OK)
++	{
++		DEBUG_COMM("HSIC CCID-Reader: TCK repair failed, keeping raw ATR");
++		return;
++	}
++
++	*length = len + 1;
++	DEBUG_COMM2("HSIC CCID-Reader: appended missing TCK 0x%02X", tck);
++}
++
+ 
+ /*****************************************************************************
+  *
+@@ -287,6 +327,8 @@ again:
+ 
+ 	memcpy(buffer, resp+10, atr_len);
+ 
++	hsic_repair_atr(reader_index, buffer, nlength);
++
+ 	return return_value;
+ } /* CmdPowerOn */
+ 
+diff --git a/src/ifdhandler.c b/src/ifdhandler.c
+index b746dfb..5112efd 100644
+--- a/src/ifdhandler.c
++++ b/src/ifdhandler.c
+@@ -725,7 +725,29 @@ EXTERNAL RESPONSECODE IFDHSetProtocolParameters(DWORD Lun, DWORD Protocol,
+ 	atr_ret = ATR_InitFromArray(&atr, ccid_slot->pcATRBuffer,
+ 		ccid_slot->nATRLength);
+ 	if (ATR_MALFORMED == atr_ret)
++	{
++		/*
++		 * Fallback when CmdPowerOn TCK repair did not yield a parseable ATR.
++		 * Apply default T=0 parameters so the TPDU engine is armed.
++		 */
++		if (0x1D990016 == ccid_desc->readerID)	/* HSIC CCID-Reader VID:PID */
++		{
++			unsigned char t0_default_param[] = {
++				0x11,	/* Fi/Di = 372/1 (default speed) */
++				0x00,	/* TCCKS: T=0, direct convention */
++				0x00,	/* extra guard time */
++				0x0A,	/* WI (waiting integer) */
++				0x00	/* clock stop */
++			};
++			DEBUG_INFO1("HSIC CCID-Reader: malformed ATR accepted, applying default T=0 parameters");
++			(void)SetParameters(reader_index, 0, sizeof(t0_default_param),
++				t0_default_param);
++			ccid_desc->readTimeout = DEFAULT_COM_READ_TIMEOUT;
++			ccid_desc->cardProtocol = Protocol;
++			return IFD_SUCCESS;
++		}
+ 		return IFD_PROTOCOL_NOT_SUPPORTED;
++	}
+ 
+ 	if (SCARD_PROTOCOL_T0 == Protocol)
+ 		pps[1] |= ATR_PROTOCOL_TYPE_T0;
