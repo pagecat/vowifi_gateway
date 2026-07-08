@@ -243,7 +243,9 @@ EAP-AKA over IKEv2; a CFG (config-request) address family that matches the carri
 `auto` (default) probes families after SIM auth and pins the one that yields a usable PDN (a
 CONNECTED tunnel *with* a P-CSCF), or you can pin `v6`/`v4`/`dual` per line (`SWU_CP_MODE`); for IPv6
 it accepts either an `INTERNAL_IP6_ADDRESS` or an `INTERNAL_IP6_SUBNET` prefix, from which a stable
-inner address is derived, and Asterisk's IMS transport binds the matching family; `DEVICE_IDENTITY`;
+inner address is derived, and Asterisk's IMS transport binds the matching family; on an IPv4 PDN a
+source-based policy route keeps the container's own LAN traffic (the WebRTC WSS softphone, DNS) off the
+full-IPv4 tunnel default while IMS still traverses it; `DEVICE_IDENTITY`;
 P-CSCF restoration (plus optional reselection-support advertisement, `SWU_PCSCF_RESELECTION_SUPPORT`);
 IKEv2 fragmentation (RFC 7383) — advertised, with inbound reassembly **and** outbound fragmentation
 of an oversized message; reject-Notify back-off classification (§7.2.2.2); initiator liveness/DPD
@@ -259,6 +261,10 @@ done instead); multiple-bearer PDN (additional bearers are safely refused with `
 no EPS-QoS/TFT); ePDG AUTH-payload signature verification (EAP-AKA `AT_MAC` already gives mutual auth
 in practice); MOBIKE / `UPDATE_SA_ADDRESSES` (the host has a stable wired IP); multiple-authentication
 / external-AAA (PAP/CHAP); and emergency sessions / N1-mode-5GS.
+
+**Browser softphone won't connect / stuck "connecting":**  
+- Hard-refresh (Ctrl+Shift+R) to load the latest WebUI bundle, and accept the self-signed cert for the line's WSS port (the browser needs a per-port exception; the WebUI port and each line's WebRTC port use the same cert but are trusted separately).
+- On an **IPv4 IMS carrier** (e.g. Vodafone UK) the engine installs a source-based policy route so the tunnel's full-IPv4 default route doesn't blackhole the container's own LAN return traffic (the WSS handshake). This is automatic; if you run a heavily customised network, the table id / rule preference are overridable via `SWU_LAN_BYPASS_TABLE` / `SWU_LAN_BYPASS_PREF`.
 
 **Audio one-way or none:**  
 - **Browser softphone silent**: hard-refresh (Ctrl+Shift+R) to load the latest WebUI bundle (the audio attach fix). Check the browser Console for `audioblocked` or autoplay errors.
