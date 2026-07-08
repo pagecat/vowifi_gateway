@@ -38,6 +38,52 @@ from card.USIM import *
 
 requests.packages.urllib3.disable_warnings()
 
+# --- APDU-level tracing (diagnostic, SWU_APDU_DEBUG, default ON) ------------------------------
+# Wrap pyscard's CardConnection.transmit so every APDU issued in THIS process is logged with the
+# reader, the command hex, the response SW + length, and the elapsed time. The mitshell card.USIM
+# path (return_res_ck_ik -> USIM().authenticate()) and swu_ike's own PIN path both go through
+# CardConnection.transmit, so this pinpoints exactly which APDU blocks/errs during EAP-AKA SIM
+# authentication. Only swu_ike's process is patched (pin_keeper / ami_usim are separate processes),
+# and swu_ike only issues card APDUs during auth, so the log stays targeted. Enable: SWU_APDU_DEBUG=1.
+if os.environ.get("SWU_APDU_DEBUG", "0") not in ("0", "", "no"):
+    try:
+        from smartcard.CardConnection import CardConnection as _CC
+
+        def _make_traced(_orig):
+            def _traced_transmit(self, apdu, *a, **k):
+                try:
+                    _rd = str(self.getReader())
+                except Exception:
+                    _rd = "?"
+                _h = "".join("%02X" % b for b in apdu)
+                print("[apdu] %s --> %s" % (_rd, _h if len(_h) <= 80 else _h[:80] + "..."), flush=True)
+                _t0 = time.time()
+                try:
+                    res = _orig(self, apdu, *a, **k)
+                except Exception as _e:
+                    print("[apdu] %s <!! EXC after %.3fs: %r" % (_rd, time.time() - _t0, _e), flush=True)
+                    raise
+                try:
+                    data, sw1, sw2 = res
+                    print("[apdu] %s <-- sw=%02X%02X %dB (%.3fs)" %
+                          (_rd, sw1, sw2, len(data), time.time() - _t0), flush=True)
+                except Exception:
+                    print("[apdu] %s <-- (%.3fs) %r" % (_rd, time.time() - _t0, res), flush=True)
+                return res
+            return _traced_transmit
+
+        _CC.transmit = _make_traced(_CC.transmit)
+        # PCSCCardConnection may override transmit(); patch it too if so, so nothing is missed.
+        try:
+            from smartcard.pcsc.PCSCCardConnection import PCSCCardConnection as _PCC
+            if "transmit" in _PCC.__dict__:
+                _PCC.transmit = _make_traced(_PCC.__dict__["transmit"])
+        except Exception:
+            pass
+        print("[apdu] APDU tracing installed (SWU_APDU_DEBUG)", flush=True)
+    except Exception as _e:
+        print("[apdu] trace install failed: %r" % _e, flush=True)
+
 # =============================================================================================
 # VoWiFi engine integration (headless daemon glue). These helpers let swu_ike.py run as the
 # engine's tunnel process in place of strongSwan: emit tunnel state + P-CSCF to the run dir,
@@ -657,9 +703,13 @@ class swu():
         self.apn = apn
         self.com_port = modem
         self.default_gateway = default_gateway
-        self.mcc = mcc
-        self.mnc = mnc
-        self.imsi = imsi 
+        # 3GPP TS 23.003: in the NAI realm and every EPC FQDN (mnc<MNC>.mcc<MCC>.3gppnetwork.org,
+        # and the APN-FQDN IDr) the MCC is 3 digits and the MNC MUST be zero-padded to 3 digits.
+        # Normalise once here so all NAI/IDr builders below use the padded form — passing "15"
+        # instead of "015" would otherwise construct a wrong "mnc15" realm and be rejected.
+        self.mcc = str(mcc).zfill(3) if mcc else mcc
+        self.mnc = str(mnc).zfill(3) if mnc else mnc
+        self.imsi = imsi
         
         self.ki = ki
         self.op = op
@@ -787,17 +837,17 @@ class swu():
         self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
         # IDr (the identity of the ePDG we want to reach) is, per 3GPP TS 24.302 clause 7.2.2.1,
         # the APN encoded as an ID_FQDN. Two encodings are seen in the wild:
-        #   "apn"  -> the bare APN (e.g. "ims"). This is the Telus-verified default and stays the
-        #            default because it is empirically proven to attach; do NOT change it lightly.
+        #   "apn"  -> the bare APN (e.g. "ims"). This is the default and stays the default because
+        #            it is the empirically-proven form most carriers' ePDGs accept; do NOT change
+        #            it lightly.
         #   "fqdn" -> the operator-identified APN-FQDN a real UE builds:
-        #            "<apn>.apn.epc.mnc<MNC3>.mcc<MCC3>.pub.3gppnetwork.org" (23.003). MNC must be
-        #            3 digits (Telus is already "220"); a 2-digit MNC must be zero-padded per 23.003.
+        #            "<apn>.apn.epc.mnc<MNC3>.mcc<MCC3>.pub.3gppnetwork.org" (23.003). self.mcc /
+        #            self.mnc are already zero-padded to 3 digits in __init__.
         # Selected by env SWU_IDR_MODE so a carrier that needs the full FQDN can opt in without a
         # code change; falls through to the bare-APN behaviour when unset/invalid.
         idr_mode = os.environ.get("SWU_IDR_MODE", "apn")
         if idr_mode == "fqdn" and self.mcc and self.mnc:
-            mnc3 = self.mnc if len(self.mnc) == 3 else self.mnc.zfill(3)
-            idr_value = "%s.apn.epc.mnc%s.mcc%s.pub.3gppnetwork.org" % (self.apn, mnc3, self.mcc)
+            idr_value = "%s.apn.epc.mnc%s.mcc%s.pub.3gppnetwork.org" % (self.apn, self.mnc, self.mcc)
         else:
             idr_value = self.apn
         self.set_identification(IDR, ID_FQDN, idr_value)
@@ -4882,14 +4932,14 @@ def read_res_ck_ik_2(reader_index,rand,autn):
     if pin and pin.lower() not in ("none", "disabled"):
         return _read_res_ck_ik_pin(reader_index, rand, autn, pin)
 
-    a = USIM(int(reader_index))
-    x = a.authenticate(RAND=toBytes(rand), AUTN=toBytes(autn))
-    if len(x) == 1: #AUTS goes in RES position
-        return toHexString(x[0]).replace(" ", ""), None, None
-    elif len(x) > 2:
-        return toHexString(x[0]).replace(" ", ""),toHexString(x[1]).replace(" ", ""),toHexString(x[2]).replace(" ", "")
-    else:
-        return None, None, None
+    # PIN-disabled: use the explicit reader-by-index path (VERIFY skipped), NOT the upstream
+    # mitshell USIM(int) constructor. That constructor mis-selects the reader: card.ICC.__init__
+    # treats its arg as a reader *name* for CardRequest(readers=[...]) — reader index 0 is FALSY so
+    # it falls back to "any card" and happens to grab reader 0, but a non-zero index passes a bare
+    # int as a reader object and waitforcard() HANGS (blocks before the first APDU). So a PIN-less
+    # SIM on any reader other than 0 could never authenticate. The explicit path addresses
+    # readers()[index] directly and works on every reader.
+    return _read_res_ck_ik_pin(reader_index, rand, autn, None)
 
 
 # --- USIM AKA with CHV1 verify, single connection (VoWiFi engine addition) ------------------
@@ -4980,7 +5030,8 @@ def _read_res_ck_ik_pin(reader_index, rand, autn, pin):
         if not _swu_select_adf_usim(conn):
             print("VoWiFi: ADF.USIM select failed")
             return None, None, None
-        _swu_verify_chv1(conn, pin)
+        if pin:
+            _swu_verify_chv1(conn, pin)
         # AUTHENTICATE (AKA security context): 00 88 00 81 22 10 <RAND> 10 <AUTN>
         apdu = "00880081" + "22" + "10" + rand.upper() + "10" + autn.upper()
         d, s1, s2 = conn.transmit(toBytes(apdu))
@@ -5093,15 +5144,37 @@ def main():
     if os.environ.get("SWU_REQUEST_LIVENESS_ATTR", "0") not in ("0", "", "no"):
         cp_list.append([TIMEOUT_PERIOD_FOR_LIVENESS_CHECK])
 
-    ts_list_initiator = [
-        [TS_IPV4_ADDR_RANGE,ANY,0,65535,'0.0.0.0','255.255.255.255'],
-        [TS_IPV6_ADDR_RANGE,ANY,0,65535,'::','ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff']
-    ]
-
-    ts_list_responder = [
-        [TS_IPV4_ADDR_RANGE,ANY,0,65535,'0.0.0.0','255.255.255.255'],
-        [TS_IPV6_ADDR_RANGE,ANY,0,65535,'::','ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff']        
-    ]
+    # Traffic Selectors. TSi/TSr MUST be consistent with the CFG/PDN address family: on an
+    # IPv6-only PDN (our default CFG requests only IPv6) a real UE offers IPv6-only TS. Some
+    # ePDGs enforce this at the post-EAP CHILD-SA/TS narrowing step and reject a dual-stack TS on
+    # an IPv6-only PDN (RFC 7296 says TS_UNACCEPTABLE(38); Vodafone appears to use a private code).
+    # SWU_TS_MODE controls this:
+    #   auto (default) — derive the families from cp_list: request only what the CFG requests
+    #                    (IPv6-only CFG -> IPv6-only TS; IPv4-only -> IPv4-only; both/neither -> dual)
+    #   dual           — always offer both v4 + v6 (the previous behaviour; escape hatch)
+    #   v4 / v6        — force a single family
+    _TS_V4 = [TS_IPV4_ADDR_RANGE, ANY, 0, 65535, '0.0.0.0', '255.255.255.255']
+    _TS_V6 = [TS_IPV6_ADDR_RANGE, ANY, 0, 65535, '::', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff']
+    _ts_mode = os.environ.get("SWU_TS_MODE", "auto").strip().lower()
+    if _ts_mode not in ("auto", "dual", "v4", "v6"):
+        _ts_mode = "auto"
+    if _ts_mode == "auto":
+        _want_v4 = any(a[0] == INTERNAL_IP4_ADDRESS for a in cp_list[1:])
+        _want_v6 = any(a[0] == INTERNAL_IP6_ADDRESS for a in cp_list[1:])
+        if _want_v6 and not _want_v4:
+            _fams = ("v6",)
+        elif _want_v4 and not _want_v6:
+            _fams = ("v4",)
+        else:
+            _fams = ("v4", "v6")          # both requested, or neither detected -> dual (compat)
+    elif _ts_mode == "dual":
+        _fams = ("v4", "v6")
+    else:
+        _fams = (_ts_mode,)               # "v4" or "v6"
+    _ts = ([list(_TS_V4)] if "v4" in _fams else []) + ([list(_TS_V6)] if "v6" in _fams else [])
+    ts_list_initiator = [list(x) for x in _ts]
+    ts_list_responder = [list(x) for x in _ts]
+    print("[swu_ike] TS families: %s (SWU_TS_MODE=%s)" % (",".join(_fams), _ts_mode))
 
 
     # IKE proposals. Telus' ePDG rejects the emulator's stock SHA1/MD5 list with
