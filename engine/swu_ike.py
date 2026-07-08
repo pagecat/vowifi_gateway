@@ -2172,9 +2172,73 @@ class swu():
         subprocess.call(cmd, shell=shell)
 
 
+    def _install_lan_bypass_policy(self):
+        """Keep the container's own (non-tunnel) traffic on the LAN link when the IPv4 IMS PDN makes
+        the tunnel the default route for ALL IPv4 (the 0.0.0.0/1 + 128.0.0.0/1 routes below).
+
+        Without this, every reply the container sources from its docker-bridge address (SWU_SOURCE,
+        e.g. 172.17.0.3) — DNS lookups AND, crucially, the SYN-ACK/return traffic of any published
+        port (the WebRTC WSS softphone on 8089, external SIP, the manager AMI) — matches a /1 route
+        and is sent into the ePDG, which drops it. Symptom: a LAN client's TCP to the mapped WSS port
+        never completes its handshake (SYN in on eth0, SYN-ACK out on ipsec0, lost), so the softphone
+        can't connect; and container DNS times out (40s).
+
+        Fix with SOURCE-based policy routing (pure iproute2 — no iptables/nft, which aren't in the
+        image): a dedicated table whose default goes via the docker gateway, selected by
+        `ip rule from <container-eth0-ip>`. IMS traffic is sourced from the tunnel INNER address, not
+        the eth0 address, so it is unaffected and still uses the main table's /1 tunnel routes. This
+        is robust even in the pathological case where a LAN client's IP equals the P-CSCF's IP,
+        because the discriminator is the packet's SOURCE (eth0 addr vs inner addr), never the
+        destination. IPv6 IMS PDNs (Telus/EE) only route ::/1 so IPv4 is untouched and this is a
+        no-op there.
+
+        Idempotent (del-before-add). Best-effort: any failure is logged and ignored so it can never
+        block tunnel bring-up."""
+        if self.netns_name:
+            return
+        src = self.source_address
+        gw = self.default_gateway or (self.get_default_gateway_linux() or [None])[0]
+        if not src or not gw:
+            swu_log("LAN-bypass policy skipped (no source addr / gateway)")
+            return
+        table = os.environ.get("SWU_LAN_BYPASS_TABLE", "51820")
+        pref = os.environ.get("SWU_LAN_BYPASS_PREF", "100")
+        # Rebuild cleanly in case a previous attach left stale state.
+        self.exec_in_netns("ip rule del from %s lookup %s pref %s" % (src, table, pref) + " 2>/dev/null")
+        self.exec_in_netns("ip route flush table %s" % table + " 2>/dev/null")
+        self.exec_in_netns("ip route add default via %s dev %s table %s" % (gw, self._lan_egress_iface(), table))
+        self.exec_in_netns("ip rule add from %s lookup %s pref %s" % (src, table, pref))
+        swu_log("LAN-bypass policy: replies sourced from %s -> table %s (default via %s), tunnel "
+                "unaffected (IMS sources from the inner address)" % (src, table, gw))
+        # The source rule fixes REPLY traffic (whose source is already the eth0 addr via DNAT
+        # conntrack). It does NOT fix container-ORIGINATED outbound flows (DNS lookups, the manager
+        # callback): there the kernel does the route lookup BEFORE choosing a source, the tunnel /1
+        # route wins, and it picks the inner address as source -> the `from <eth0>` rule never
+        # matches and the flow still enters the tunnel (DNS -> 40s timeouts, which also delays the
+        # IMS SMS RP-ACK past its correlation window). Keep those destinations off the tunnel by
+        # DESTINATION: pin each resolver nameserver (and they're LAN/RFC1918 anyway) to the LAN gw.
+        for _ns in self._resolver_nameservers_v4():
+            self.exec_in_netns("route add " + _ns + "/32 gw " + gw + " 2>/dev/null")
+
+    def _lan_egress_iface(self):
+        """The container's outbound LAN interface (the one carrying SWU_SOURCE). Almost always eth0
+        in the docker bridge; derived from the source address's owning link so we never hard-code.
+        Parsed in pure Python + `ip` (no awk — the engine image ships iproute but not awk)."""
+        try:
+            out = subprocess.check_output("ip -o -4 addr show", shell=True).decode()
+            token = self.source_address + "/"
+            for line in out.splitlines():
+                # "2: eth0    inet 172.17.0.3/16 brd ... scope global eth0"
+                fields = line.split()
+                if len(fields) >= 4 and fields[2] == "inet" and fields[3].startswith(token):
+                    return fields[1]
+        except Exception:
+            pass
+        return "eth0"
+
     def _resolver_nameservers_v4(self):
-        """IPv4 nameservers from /etc/resolv.conf (VoWiFi engine addition). Used to keep DNS on the
-        LAN link instead of the IPv4 IMS tunnel's default route (see set_routes). Best-effort:
+        """IPv4 nameservers from /etc/resolv.conf. Used by the LAN-bypass policy to keep DNS on the
+        LAN link (by destination) instead of the IPv4 IMS tunnel's default route. Best-effort:
         returns [] on any error so a missing/odd resolv.conf never blocks tunnel bring-up."""
         ns = []
         try:
@@ -2207,23 +2271,20 @@ class swu():
                 else:
                     self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.default_gateway)
 
-            # VoWiFi engine addition: on an IPv4 IMS PDN (e.g. Vodafone UK, cp_mode=v4) the two
-            # /1 routes below make the tunnel the default route for ALL IPv4, which blackholes the
-            # container's LAN DNS server(s) (they sit in 0.0.0.0/1 or 128.0.0.0/1 and get sent into
-            # the ePDG, which drops them -> 40s resolver timeouts). That delays Asterisk's outbound
-            # IMS SMS RP-ACK: its request-URI is the SMSC's IMS-internal FQDN (P-Asserted-Identity)
-            # which never resolves publicly, so the pre-send A/AAAA lookup blocks ~20s and the RP-ACK
-            # reaches the IP-SM-GW after its delivery-report correlation window has expired -> the
-            # SMSC 488s it and re-pushes the same SM forever ("only one SMS keeps arriving"). Pin the
-            # resolver's nameservers to the pre-tunnel default gateway (DNS belongs on the LAN link,
-            # not the carrier tunnel) so name lookups still fail FAST (NXDOMAIN in ms) and the RP-ACK
-            # goes out promptly. An IPv6 IMS PDN (Telus/EE) only routes ::/1 so IPv4 DNS is untouched
-            # -- which is exactly why those lines never showed this bug.
+            # VoWiFi engine addition: on an IPv4 IMS PDN (e.g. Vodafone UK, cp_mode=v4) the two /1
+            # routes below make the tunnel the default route for ALL IPv4. That blackholes every
+            # packet the container sources from its docker-bridge address (SWU_SOURCE): DNS lookups
+            # (-> 40s timeouts, delaying the IMS SMS RP-ACK past its correlation window so the SMSC
+            # 488s it and re-pushes the same SM forever) AND the return traffic of any published port
+            # (the WebRTC WSS softphone, external SIP, AMI) — a LAN client's SYN-ACK goes out ipsec0
+            # and is lost, so the softphone can never connect. Fix both at once with SOURCE-based
+            # policy routing: traffic sourced from the container's LAN address goes out the LAN link,
+            # while IMS traffic (sourced from the tunnel INNER address) still uses the /1 tunnel
+            # routes. Robust even if a LAN client's IP equals the P-CSCF's (the discriminator is the
+            # source address, not the destination). IPv6 PDNs (Telus/EE) only route ::/1 so IPv4 is
+            # untouched and this is a no-op there.
             if not self.netns_name:
-                _gw = self.default_gateway or self.get_default_gateway_linux()[0]
-                if _gw:
-                    for _ns in self._resolver_nameservers_v4():
-                        self.exec_in_netns("route add " + _ns + "/32 gw " + _gw)
+                self._install_lan_bypass_policy()
 
             self.exec_in_netns("route add -net 0.0.0.0/1 gw " + self.ip_address_list[0])
             self.exec_in_netns("route add -net 128.0.0.0/1 gw " + self.ip_address_list[0])
@@ -2321,10 +2382,18 @@ class swu():
         if self.netns_name:
             subprocess.call("ip netns del %s" % self.netns_name, shell=True)
         else:
-            self.exec_in_netns("route del " + self.server_address[0] + "/32", shell=True)  
-            os.close(self.tunnel) 
+            # Tear down the IPv4 LAN-bypass policy (source rule + dedicated table) if it was
+            # installed, so a re-establish starts clean and nothing leaks across attaches.
+            src = getattr(self, "source_address", None)
+            if src:
+                table = os.environ.get("SWU_LAN_BYPASS_TABLE", "51820")
+                pref = os.environ.get("SWU_LAN_BYPASS_PREF", "100")
+                self.exec_in_netns("ip rule del from %s lookup %s pref %s" % (src, table, pref) + " 2>/dev/null")
+                self.exec_in_netns("ip route flush table %s" % table + " 2>/dev/null")
+            self.exec_in_netns("route del " + self.server_address[0] + "/32", shell=True)
+            os.close(self.tunnel)
             if self.dns_address_list != []:
-                subprocess.call("cp /etc/resolv.backup.conf /etc/resolv.conf", shell=True)        
+                subprocess.call("cp /etc/resolv.backup.conf /etc/resolv.conf", shell=True)
       
 
     def get_default_source_address(self):

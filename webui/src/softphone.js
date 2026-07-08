@@ -14,13 +14,19 @@ export class Softphone {
     this.ua = null
     this.session = null
     this.remoteAudio = audioEl || null
+    this._dead = false                // set true by stop() to inert late JsSIP events
     this._unlocked = false
     this._rec = null
     this._recCtx = null
     this._recChunks = []
   }
 
-  emit(type, data) { try { this.onEvent(type, data) } catch {} }
+  // A stopped Phone must never emit again. JsSIP's ua.stop() fires 'disconnected' (and possibly
+  // 'unregistered') ASYNCHRONOUSLY, ~1s later. When the user switches lines we stop the old Phone
+  // and immediately start a new one for the other reader; without this guard the OLD ua's late
+  // 'disconnected' bleeds into the component's shared setReg and flips the already-registered new
+  // line to red "disconnected". Gate every emit on _dead so a torn-down Phone is inert.
+  emit(type, data) { if (this._dead) return; try { this.onEvent(type, data) } catch {} }
 
   // Point the class at the React-owned <audio> element. Called from the component's ref effect.
   setAudioEl(el) { if (el) this.remoteAudio = el }
@@ -254,6 +260,9 @@ export class Softphone {
   get recording() { return !!this._rec }
 
   stop() {
+    // Mark dead FIRST so any late JsSIP event from ua.stop() (async 'disconnected'/'unregistered')
+    // is swallowed by emit() and cannot clobber a newly-started line's state.
+    this._dead = true
     this.hangup()
     if (this._rec) { try { this._rec.stop() } catch {}; this._rec = null }
     if (this.ua) { try { this.ua.stop() } catch {} this.ua = null }
