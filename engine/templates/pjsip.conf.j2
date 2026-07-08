@@ -107,7 +107,7 @@ transport=volte_ims
 [transport-local]
 type=transport
 protocol=tls
-bind={{ sip_listen }}:{{ sip_tls_port }}
+bind={{ local_bind_addr }}:{{ sip_tls_port }}
 cert_file=/etc/asterisk/certificate.crt
 priv_key_file=/etc/asterisk/certificate.key
 method=tlsv1_2
@@ -122,7 +122,7 @@ external_signaling_address={{ local_ext }}
 [transport-local]
 type=transport
 protocol={{ sip_transport }}
-bind={{ sip_listen }}:{{ sip_udp_port }}
+bind={{ local_bind_addr }}:{{ sip_udp_port }}
 {% if local_ext %}
 external_media_address={{ local_ext }}
 external_signaling_address={{ local_ext }}
@@ -149,6 +149,12 @@ external_signaling_address={{ local_ext }}
 type=endpoint
 context=from-local
 message_context=msg-from-local
+; from_domain gives the From/PAI URI a valid host on the INVITE Asterisk sends to a local client
+; (WebRTC softphone / external SIP). Without it Asterisk defaults the From domain to the container
+; HOSTNAME (a docker id like 03e373936eb4), which JsSIP's strict SIP parser rejects ("error parsing
+; From header") — it drops the whole INVITE, so newRTCSession never fires and the browser softphone
+; shows no incoming-call (Answer/Decline) overlay. The IMS realm is always a valid FQDN.
+from_domain={{ realm }}
 disallow=all
 allow=amr
 allow=ulaw

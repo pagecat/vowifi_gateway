@@ -4,7 +4,7 @@ import { api } from '../api.js'
 // Connection parameters for a STANDARD SIP client (not the browser WebRTC softphone).
 // Maps 1:1 to the fields a generic SIP softphone asks for:
 //   Username / Login  -> the external account's username
-//   Domain            -> gateway host
+//   Domain            -> gateway host:port (the port matters — see the Domain hint)
 //   Password          -> the external account's password
 //   Dial Plan         -> pass numbers straight through (E.164) or map +->00
 // The gateway exposes one SIP endpoint per external account configured on the line
@@ -75,8 +75,8 @@ export default function SipInfoModal({ instance, onClose, setView, setSelected }
               </div>
             ) : (
               <>
-                <Field label="Domain" value={info.domain}
-                  hint="Your account domain — this gateway's address." />
+                <Field label="Domain" value={`${info.domain}:${info.port}`}
+                  hint="Your account domain — this gateway's address. Include the port (:port) — each line uses a different port, and a client that omits it sends calls to the default 5060 and reaches the wrong line (registration may still work, but dialing fails)." />
                 <Field label="Username" value={acct.username}
                   hint="Your account username." />
                 <Field label="Login" value={acct.username}
@@ -85,7 +85,7 @@ export default function SipInfoModal({ instance, onClose, setView, setSelected }
                   hint="Your account password." />
                 <div style={{ display: 'flex', gap: 12 }}>
                   <div style={{ flex: 1 }}><Field label="Port" value={info.port}
-                    hint="Append to Domain if your client needs it explicitly." /></div>
+                    hint="This line's port. Already included in Domain above; set it here too if your client has a separate port field." /></div>
                   <div style={{ flex: 1 }}><Field label="Transport" value={String(info.transport).toUpperCase()} /></div>
                 </div>
                 <Field label="Server / Proxy (Domain:Port)" value={`${info.domain}:${info.port}`}

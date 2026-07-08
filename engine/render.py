@@ -22,7 +22,46 @@ TPL_DIR = os.environ.get("VOWIFI_TPL", "/opt/vowifi/templates")
 CFG_PATH = os.environ.get("VOWIFI_INSTANCE", "/config/instance.json")
 
 
+def _default_gateway_ipv4():
+    """The container's default-route next hop (the docker bridge gateway, e.g. 172.17.0.1), read
+    from /proc/net/route. Used to source-probe the docker-bridge interface reliably even when an
+    IPv4 VoWiFi tunnel has made itself the default route. Returns "" if not found."""
+    try:
+        with open("/proc/net/route") as fh:
+            for line in fh.readlines()[1:]:
+                f = line.strip().split()
+                # Iface Destination Gateway Flags ... ; destination 00000000 = default route,
+                # skip the tunnel (ipsecN/tunN) — we want the bridge (eth0) default.
+                if len(f) >= 3 and f[1] == "00000000" and int(f[3], 16) & 2:
+                    if f[0].startswith(("ipsec", "tun")):
+                        continue
+                    gw = f[2]
+                    # little-endian hex -> dotted quad
+                    return ".".join(str((int(gw, 16) >> (8 * i)) & 0xFF) for i in range(4))
+    except Exception:
+        pass
+    return ""
+
+
 def container_ipv4():
+    """The container's own docker-bridge IPv4 (e.g. 172.17.0.3). MUST be the bridge address, never
+    the VoWiFi tunnel inner IP: it is used as the IKE source (SWU_SOURCE) and as the local SIP
+    transport bind, both of which must sit on the docker bridge. A public-IP connect() probe would
+    pick the tunnel's inner IP once an IPv4 PDN has made the tunnel the default route (the re-render
+    after P-CSCF discovery runs post-tunnel), so probe the DOCKER GATEWAY instead — that next hop is
+    always reached over the bridge, so the chosen source is the bridge IP."""
+    gw = _default_gateway_ipv4()
+    if gw:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((gw, 9))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+        finally:
+            s.close()
     try:
         out = subprocess.check_output(["hostname", "-I"], text=True).split()
         for tok in out:
@@ -121,6 +160,16 @@ def build_context(cfg):
         "ami_secret": cfg.get("ami_secret", "changeme"),
         "manager_url": cfg.get("manager_url", ""),
         "sip_listen": sip.get("listen_addr", "0.0.0.0"),
+        # Bind address for the LOCAL SIP transport (external clients). Binding to the container's
+        # own docker-bridge IP (not 0.0.0.0) makes Asterisk SOURCE its replies from that address:
+        # DNAT rewrites an inbound LAN-client packet's destination to this IP, so the socket still
+        # receives it, and the reply is sourced from it. This matters on an IPv4 IMS PDN, where the
+        # SWu tunnel is the default route for ALL IPv4: a reply from a 0.0.0.0-bound UDP socket has
+        # its source chosen by a fresh route lookup (-> the tunnel inner IP) and gets blackholed into
+        # the ePDG, so a LAN SIP/UDP client's registration never completes. Sourcing from the
+        # container IP lets the engine's source-based LAN-bypass policy route the reply out the LAN
+        # link. Falls back to 0.0.0.0 if the container IP can't be determined.
+        "local_bind_addr": (cfg.get("local_addr") or container_ipv4() or "0.0.0.0"),
         "sip_tls_port": sip.get("tls_port", 5061),
         "sip_udp_port": sip.get("udp_port", 5060),
         "sip_transport": sip.get("transport", "udp"),  # udp|tcp|tls

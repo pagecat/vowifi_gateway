@@ -21,12 +21,7 @@ export class Softphone {
     this._recChunks = []
   }
 
-  // A stopped Phone must never emit again. JsSIP's ua.stop() fires 'disconnected' (and possibly
-  // 'unregistered') ASYNCHRONOUSLY, ~1s later. When the user switches lines we stop the old Phone
-  // and immediately start a new one for the other reader; without this guard the OLD ua's late
-  // 'disconnected' bleeds into the component's shared setReg and flips the already-registered new
-  // line to red "disconnected". Gate every emit on _dead so a torn-down Phone is inert.
-  emit(type, data) { if (this._dead) return; try { this.onEvent(type, data) } catch {} }
+  emit(type, data) { try { this.onEvent(type, data) } catch {} }
 
   // Point the class at the React-owned <audio> element. Called from the component's ref effect.
   setAudioEl(el) { if (el) this.remoteAudio = el }
@@ -98,7 +93,12 @@ export class Softphone {
       contact_uri: `sip:${prov.username}@${domain};transport=wss`,
     })
     this.ua.on('connected', () => this.emit('ws', 'connected'))
-    this.ua.on('disconnected', () => this.emit('ws', 'disconnected'))
+    // Only the 'disconnected' event is gated on _dead: ua.stop() (called when the user switches
+    // lines) fires 'disconnected' ASYNCHRONOUSLY ~1s later, and without this guard that late event
+    // from the torn-down UA would flip the already-registered NEW line's status to red. All other
+    // events (incoming, registered, …) must always pass — gating them broke the incoming-call
+    // Answer/Decline overlay.
+    this.ua.on('disconnected', () => { if (!this._dead) this.emit('ws', 'disconnected') })
     this.ua.on('registered', () => this.emit('registered', true))
     this.ua.on('unregistered', () => this.emit('registered', false))
     this.ua.on('registrationFailed', (e) => this.emit('regfail', (e && e.cause) || 'failed'))
