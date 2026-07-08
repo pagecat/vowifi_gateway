@@ -25,7 +25,7 @@ python3 /usr/local/bin/render.py || { log "render failed"; exit 1; }
 # shellcheck disable=SC1091
 set -a; . "$VOWIFI_RUNDIR/engine.env"; set +a
 export USIM_PIN USIM_READER USIM_READER_INDEX USIM_IMSI VOWIFI_ID MANAGER_URL VOWIFI_RUNDIR
-export SWU_SOURCE SWU_EPDG SWU_APN SWU_MCC SWU_MNC SWU_IMEI SWU_IMEISV SWU_CHILD_REKEY_MINUTES
+export SWU_SOURCE SWU_EPDG SWU_APN SWU_MCC SWU_MNC SWU_IMEI SWU_IMEISV SWU_CHILD_REKEY_MINUTES SWU_IDR_MODE
 
 # --- 2. Start PIN keeper and wait for the SIM to be usable ------------------------
 # pin_keeper holds CHV1 verified for ami_usim's SIP IMS-AKA. swu_ike verifies the PIN itself

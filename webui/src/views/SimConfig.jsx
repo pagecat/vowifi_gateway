@@ -4,7 +4,7 @@ import SimSelector from './SimSelector.jsx'
 
 const emptyInstance = () => ({
   id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '',
-  reader_index: 0, msisdn: '', smsc: '', enabled: true,
+  reader_index: 0, msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn',
   sip: { listen_addr: '0.0.0.0', transport: 'udp', external: [], webrtc: { enable: true } },
   debug: { asterisk: true, charon: false },
 })
@@ -190,6 +190,16 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               style={smscMode === 'auto' ? { opacity: .7 } : undefined} />
           </Field>
           <Field label="Reader match"><input className="mono" value={form.reader} onChange={(e) => upd({ reader: e.target.value })} placeholder="imsi:302..." /></Field>
+          <Field label="APN"><input className="mono" value={form.apn ?? 'ims'} onChange={(e) => upd({ apn: e.target.value })} placeholder="ims" /></Field>
+          <Field label="ePDG identity (IDr)">
+            <select value={form.idr_mode ?? 'apn'} onChange={(e) => upd({ idr_mode: e.target.value })}>
+              <option value="apn">Bare APN (default)</option>
+              <option value="fqdn">APN-FQDN</option>
+            </select>
+          </Field>
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
+          IDr is how the APN is presented to the ePDG. <b>Bare APN</b> (just the APN string) is what most carriers' ePDGs expect and is the safe default; <b>APN-FQDN</b> (<code>&lt;apn&gt;.apn.epc.mnc…mcc….pub.3gppnetwork.org</code>) is required only by a few stricter carriers — some networks reject it.
         </div>
 
         <h4 style={{ marginBottom: 6 }}>Local SIP access</h4>

@@ -196,6 +196,11 @@ def main():
         f.write(f"SWU_APN={cfg.get('apn','ims')}\n")
         f.write(f"SWU_MCC={ctx['mcc']}\n")
         f.write(f"SWU_MNC={ctx['mnc']}\n")
+        # ePDG identity (IDr) encoding: 'apn' (default) sends the bare APN — the form most
+        # carriers' ePDGs expect and the proven-safe default; 'fqdn' builds the operator APN-FQDN
+        # (<apn>.apn.epc.mnc<MNC3>.mcc<MCC3>.pub.3gppnetwork.org) that a minority of stricter
+        # ePDGs require. Consumed by swu_ike.py's SWU_IDR_MODE. See config.normalize_idr_mode.
+        f.write(f"SWU_IDR_MODE={cfg.get('idr_mode','apn')}\n")
         # Proactive CHILD-SA rekey period (minutes; 0 = disabled). IKEv2 does not carry SA
         # lifetime on the wire, so swu_ike uses this local-policy value to rekey the ESP SA
         # before it silently ages out (3GPP TS 24.302 7.2.2C). Set by the manager from

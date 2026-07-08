@@ -12,6 +12,8 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
   const [f, setF] = useState({
     name: '', imei: '', imeisv: '', webrtc: true, transport: 'udp', listen_addr: '0.0.0.0',
     user_agent: 'iOS/26.6 iPhone',
+    apn: 'ims',                              // VoWiFi APN (default IMS APN)
+    idrMode: 'apn',                          // ePDG IDr encoding: 'apn' (bare, default) | 'fqdn'
     smscMode: simSmsc ? 'auto' : 'manual',   // force manual if the SIM didn't yield one
     smscManual: '',
     portMode: 'auto',                        // 'auto' (conflict-checked) | 'manual'
@@ -49,6 +51,7 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
       const body = {
         reader_index: card.index, reader: card.name,   // name re-resolves the index server-side
         pin: f.pin, imei: f.imei, imeisv: f.imeisv.trim() || undefined, name: f.name,
+        apn: f.apn.trim() || 'ims', idr_mode: f.idrMode,
         smsc: f.smscMode === 'manual' ? f.smscManual.trim() : undefined,   // undefined => backend reads SIM
         webrtc: f.webrtc,
         port_mode: f.portMode,
@@ -116,6 +119,20 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
           </div>
 
           <div><label>Device User-Agent (how the line identifies to the carrier)</label><input className="mono" value={f.user_agent} onChange={(e) => upd({ user_agent: e.target.value })} placeholder="iOS/26.6 iPhone" /></div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div><label>APN</label>
+              <input className="mono" value={f.apn} onChange={(e) => upd({ apn: e.target.value })} placeholder="ims" />
+              <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>VoWiFi access point. Default <code>ims</code>.</div>
+            </div>
+            <div><label>ePDG identity (IDr)</label>
+              <select value={f.idrMode} onChange={(e) => upd({ idrMode: e.target.value })}>
+                <option value="apn">Bare APN (default)</option>
+                <option value="fqdn">APN-FQDN</option>
+              </select>
+              <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>How the APN is sent to the ePDG. Most carriers expect the bare APN; a few stricter ones require the full APN-FQDN.</div>
+            </div>
+          </div>
 
           <div>
             <label>Local SIP port mapping</label>

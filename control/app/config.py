@@ -365,6 +365,39 @@ def imeisv_from_imei(imei: str, imeisv: str = "", svn: str = "00") -> str:
     return base14 + svn2
 
 
+def _clamp_rekey(v) -> int:
+    """0 disables proactive rekey; otherwise clamp to 1..1440 minutes."""
+    try:
+        m = int(v)
+    except (TypeError, ValueError):
+        return 30
+    if m <= 0:
+        return 0
+    return max(1, min(1440, m))
+
+
+def normalize_apn(apn: str) -> str:
+    """The APN (access point name) to attach to for VoWiFi. Blank falls back to the standard
+    IMS APN 'ims'. Lowercased and trimmed; a carrier that needs a different APN (e.g. a data
+    APN or a regional IMS APN) can set it explicitly."""
+    a = (apn or "").strip().lower()
+    return a or "ims"
+
+
+def normalize_idr_mode(mode: str) -> str:
+    """How the ePDG identity (IDr) is encoded in IKE_AUTH (3GPP TS 24.302 clause 7.2.2.1):
+      'apn' (default) — the bare APN string (e.g. 'ims'). Most carriers' ePDGs expect this, and
+                        it is the empirically-proven, widely-accepted form.
+      'fqdn'          — the operator APN-FQDN a real UE builds:
+                        <apn>.apn.epc.mnc<MNC3>.mcc<MCC3>.pub.3gppnetwork.org
+                        A minority of stricter ePDGs require this form; note it is rejected by some
+                        networks (they fail EAP with AUTHENTICATION_FAILED on it).
+    Defaults to 'apn' as the safe, widely-accepted form; falls back to 'apn' for any unrecognised
+    value. Set 'fqdn' per-line only for a carrier that needs it."""
+    m = (mode or "").strip().lower()
+    return m if m in ("apn", "fqdn") else "apn"
+
+
 def render_instance_json(inst: dict, settings: dict) -> dict:
     """Convert a stored instance into the engine /config/instance.json contract."""
     ports = inst.get("ports", _alloc_ports(inst.get("index", 0)))
@@ -382,6 +415,11 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         "imeisv": inst.get("imeisv", "") or imeisv_from_imei(inst.get("imei", ""), inst.get("imeisv", "")),
         "pin": inst.get("pin", ""),
         "reader": inst.get("reader") or f"imsi:{inst['imsi']}",
+        # PC/SC reader index the engine addresses the SIM by (passed to swu_ike as -m / pin_keeper
+        # / ami_usim). MUST be emitted: without it the engine's render.py defaults to 0, so a line
+        # on any reader other than 0 authenticates against the wrong physical SIM (USIM AUTHENTICATE
+        # returns 0x9862 "incorrect MAC"). Kept in sync with the live ICCID-matched reader at start.
+        "reader_index": inst.get("reader_index", 0),
         "iccid": inst.get("iccid", ""),
         "msisdn": inst.get("msisdn", ""),
         "smsc": inst.get("smsc", ""),
@@ -428,18 +466,13 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         # (off) or a sane 1..1440 window so a typo can't set an absurd sub-minute rekey storm.
         "rekey_minutes": _clamp_rekey(inst.get("rekey_minutes",
                                                (settings.get("rekey", {}) or {}).get("minutes", 30))),
+        # APN + ePDG-identity (IDr) encoding for the SWu tunnel. apn defaults to the standard IMS
+        # APN 'ims'; idr_mode defaults to 'apn' (the bare-APN form most carriers' ePDGs expect and
+        # the proven-safe default) and may be set to 'fqdn' for the stricter ePDGs that require the
+        # operator APN-FQDN. See swu_ike.py (SWU_APN / SWU_IDR_MODE).
+        "apn": normalize_apn(inst.get("apn", "")),
+        "idr_mode": normalize_idr_mode(inst.get("idr_mode", "")),
     }
-
-
-def _clamp_rekey(v) -> int:
-    """0 disables proactive rekey; otherwise clamp to 1..1440 minutes."""
-    try:
-        m = int(v)
-    except (TypeError, ValueError):
-        return 30
-    if m <= 0:
-        return 0
-    return max(1, min(1440, m))
 
 
 def write_instance_json(inst: dict, settings: dict) -> str:

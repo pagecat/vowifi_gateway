@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import ipaddress
 import logging
 import os
 import random
@@ -564,7 +563,7 @@ async def api_provision(body: dict):
     """Provision a detected card: verify PIN, read identity, create the line and start it.
     Required: pin, imei. Optional: imeisv (auto-derived from imei if blank), name, smsc,
     reader_index, reader (name), sip, webrtc, id, port_mode ('auto'|'manual'), sip_port
-    (int, when manual)."""
+    (int, when manual), apn (default 'ims'), idr_mode ('apn'|'fqdn', default 'apn')."""
     idx = await asyncio.to_thread(_resolve_reader_index, body)
     pin = body.get("pin", "")
     c = await asyncio.to_thread(sim.read_card, idx, pin or None)
@@ -595,6 +594,10 @@ async def api_provision(body: dict):
         "smsc": smsc,
         "msisdn": body.get("msisdn", ""),
         "enabled": True, "sip": sip,
+        # APN + ePDG identity (IDr) encoding for the SWu tunnel. apn defaults to 'ims'; idr_mode
+        # defaults to 'fqdn' (real-UE APN-FQDN form). Normalised in config.render_instance_json.
+        "apn": cfg.normalize_apn(body.get("apn", "")),
+        "idr_mode": cfg.normalize_idr_mode(body.get("idr_mode", "")),
         "debug": body.get("debug") or {"asterisk": True, "charon": False},
     }
     # Port mapping: 'manual' pins the SIP UDP port the user chose (the rest of the block
@@ -727,6 +730,15 @@ async def api_instance_start(iid: str, body: dict | None = None):
 
     settings = cfg.get_settings()
     dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
+    # Address the SIM by the reader that CURRENTLY holds it: resolve the PC/SC index by ICCID
+    # against the live card monitor and persist it if it drifted (readers re-enumerate when
+    # (re)plugged, so a stored index can be stale). Without this a line can end up authenticating
+    # against a different reader's SIM -> USIM AUTHENTICATE 0x9862 "incorrect MAC".
+    live_idx = await asyncio.to_thread(_reader_index_for_instance, inst)
+    if live_idx is not None and live_idx != inst.get("reader_index"):
+        log.info("instance %s: reader index %s -> %s (live ICCID match)",
+                 iid, inst.get("reader_index"), live_idx)
+        inst = cfg.upsert_instance({"id": str(iid), "reader_index": live_idx})
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
     cid = await asyncio.to_thread(engine.start, inst, settings, dev_mounts=dev)
@@ -984,39 +996,6 @@ def api_sipinfo(iid: str, request: Request):
 
 
 # ----------------------------- engine event hook -----------------------------
-def _sip_host(sender: str) -> str | None:
-    """Extract the host part of a SIP URI sender. Handles <...> brackets, an optional
-    user@ part, and bracketed IPv6 hosts (sip:[2001:db8::1]) or bare IPv6."""
-    s = sender.strip().strip("<>")
-    m = re.match(r"sips?:(?:[^@]*@)?(.+)$", s, re.I)
-    if not m:
-        return None
-    host = m.group(1)
-    if host.startswith("["):                       # sip:[ipv6]:port
-        return host[1:].split("]", 1)[0]
-    # bare IPv6 (RFC-illegal in SIP but tolerated): contains multiple ':' -> treat whole as host
-    if host.count(":") >= 2:
-        return host.rsplit(";", 1)[0]
-    return host.split(":", 1)[0].split(";", 1)[0]  # strip :port / ;params for IPv4/FQDN
-
-
-def _is_internal_sms_sender(sender: str) -> bool:
-    """True if an incoming-SMS 'From' looks like an IMS-internal network node rather than a
-    real subscriber: a SIP URI whose host is a bare IP address (e.g. <sip:10.183.150.10> or
-    a P-CSCF IPv6). The carrier's IP-SM-GW / SMSC uses such addresses for non-user
-    signalling MESSAGEs. A genuine sender is an E.164 number or alphanumeric short-code."""
-    if not sender:
-        return False
-    host = _sip_host(sender)
-    if not host:
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
-
-
 def _call_disposition(dialstatus: str, cause: int, direction: str = "out") -> str:
     """Map Asterisk DIALSTATUS + Q.850 hangupcause to a friendly outcome. No retry — a
     rejected/busy/no-answer call is simply recorded as such. Incoming and outgoing read the
@@ -1055,14 +1034,20 @@ async def api_engine_event(payload: dict):
         except Exception:
             text = args[1]
         sender = args[0] or ""
-        # Drop IMS-internal signalling MESSAGEs: the carrier's IP-SM-GW / SMSC sends empty
-        # non-user MESSAGEs whose From is a bare private-IP SIP URI (e.g. <sip:10.183.150.10>)
-        # rather than an E.164 / short-code sender. These are not real texts — filter them so
-        # they neither persist nor surface in the UI. Only drop when BOTH the sender looks
-        # like an internal node AND the body is empty, so a genuine text is never lost.
-        if _is_internal_sms_sender(sender) and not text.strip():
-            log.info("dropping IMS-internal SMS from %r (empty body)", sender)
-            return {"ok": True, "dropped": "internal_signalling"}
+        # Drop inbound MESSAGEs that carry NO human-readable text (empty/whitespace body). Two
+        # real sources produce these, and neither is a text the user should see:
+        #   1. IMS-internal signalling: the carrier's IP-SM-GW / SMSC sends non-user MESSAGEs
+        #      whose From is a bare private-IP SIP URI (e.g. <sip:10.183.150.10>).
+        #   2. Binary / SIM-targeted SMS: OTA "SIM data-download" messages (3GPP TS 23.040
+        #      TP-DCS 0xF6 = 8-bit, message-class 2) and other non-text PDUs — Asterisk decodes
+        #      their user-data to an empty string because there is no displayable text (seen from
+        #      short-codes like 20023). These are operator/service payloads for the SIM, not texts.
+        # A genuine text always has a non-empty decoded body, so dropping on empty-body never
+        # loses a real message. (An empty body with a normal sender is likewise nothing to show.)
+        if not text.strip():
+            log.info("dropping empty-body inbound SMS from %r (internal signalling / binary/OTA "
+                     "SIM message — no displayable text)", sender)
+            return {"ok": True, "dropped": "empty_body"}
         rec = store.add_message(iid, "in", sender, text)
         await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
         _dispatch_push(notify_push.EV_INCOMING_SMS, iid, sender, text)
