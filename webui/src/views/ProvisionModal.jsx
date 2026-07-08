@@ -14,6 +14,7 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
     user_agent: 'iOS/26.6 iPhone',
     apn: 'ims',                              // VoWiFi APN (default IMS APN)
     idrMode: 'apn',                          // ePDG IDr encoding: 'apn' (bare, default) | 'fqdn'
+    cpMode: 'auto',                          // IMS PDN address family: 'auto' (default) | 'dual' | 'v6' | 'v4'
     smscMode: simSmsc ? 'auto' : 'manual',   // force manual if the SIM didn't yield one
     smscManual: '',
     portMode: 'auto',                        // 'auto' (conflict-checked) | 'manual'
@@ -51,7 +52,7 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
       const body = {
         reader_index: card.index, reader: card.name,   // name re-resolves the index server-side
         pin: f.pin, imei: f.imei, imeisv: f.imeisv.trim() || undefined, name: f.name,
-        apn: f.apn.trim() || 'ims', idr_mode: f.idrMode,
+        apn: f.apn.trim() || 'ims', idr_mode: f.idrMode, cp_mode: f.cpMode,
         smsc: f.smscMode === 'manual' ? f.smscManual.trim() : undefined,   // undefined => backend reads SIM
         webrtc: f.webrtc,
         port_mode: f.portMode,
@@ -131,6 +132,15 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
                 <option value="fqdn">APN-FQDN</option>
               </select>
               <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>How the APN is sent to the ePDG. Most carriers expect the bare APN; a few stricter ones require the full APN-FQDN.</div>
+            </div>
+            <div><label>IMS address family (CP)</label>
+              <select value={f.cpMode} onChange={(e) => upd({ cpMode: e.target.value })}>
+                <option value="auto">Auto-detect (recommended)</option>
+                <option value="dual">Dual-stack (IPv4+IPv6)</option>
+                <option value="v6">IPv6 only</option>
+                <option value="v4">IPv4 only</option>
+              </select>
+              <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>Address family of the IMS PDN. <b>Auto</b> discovers it for you (matches known carriers, else probes) — leave this unless you know the carrier needs a specific family. Telus/EE are IPv6; Vodafone UK is IPv4.</div>
             </div>
           </div>
 

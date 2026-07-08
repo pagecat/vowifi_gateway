@@ -102,6 +102,10 @@ def build_context(cfg):
         "msisdn": cfg.get("msisdn", ""),
         "smsc": cfg.get("smsc", ""),
         "pcscf": pcscf,          # explicit or discovered
+        # Address family of the discovered P-CSCF. The IMS core transport must bind the same
+        # family or Asterisk cannot reach the P-CSCF over the tunnel: IPv6 P-CSCF (Telus, EE)
+        # -> bind [::]:5060; IPv4 P-CSCF (Vodafone UK, cp_mode=v4) -> bind 0.0.0.0:5060.
+        "pcscf_is_v6": (":" in pcscf),
         "local_addr": cfg.get("local_addr") or container_ipv4(),
         "ike_proposals": ike.get("proposals", default_ike),
         "esp_proposals": ike.get("esp_proposals", default_esp),
@@ -201,6 +205,12 @@ def main():
         # (<apn>.apn.epc.mnc<MNC3>.mcc<MCC3>.pub.3gppnetwork.org) that a minority of stricter
         # ePDGs require. Consumed by swu_ike.py's SWU_IDR_MODE. See config.normalize_idr_mode.
         f.write(f"SWU_IDR_MODE={cfg.get('idr_mode','apn')}\n")
+        # CFG (config-request) address-family mode: 'auto' (default) walks a discovery ladder and
+        # keeps the family that yields a usable PDN (see swu_ike SWU_CP_MODE / SWU_CP_MODE_ORDER);
+        # 'v6' (Telus/EE), 'v4' (Vodafone UK), 'dual' pin a single family. SWU_CP_MODE_ORDER is the
+        # auto ladder (carrier-DB preference first), computed by config.render_instance_json.
+        f.write(f"SWU_CP_MODE={cfg.get('cp_mode','auto')}\n")
+        f.write(f"SWU_CP_MODE_ORDER={cfg.get('cp_mode_order','v6,dual,v4')}\n")
         # Proactive CHILD-SA rekey period (minutes; 0 = disabled). IKEv2 does not carry SA
         # lifetime on the wire, so swu_ike uses this local-policy value to rekey the ESP SA
         # before it silently ages out (3GPP TS 24.302 7.2.2C). Set by the manager from

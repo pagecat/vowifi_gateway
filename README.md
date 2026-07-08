@@ -190,14 +190,15 @@ Tested clients: **MicroSIP** (Windows), **Zoiper** (multi-platform), Asterisk PJ
 
 ---
 
-## Carrier parameters (no database)
+## Carrier parameters (no required database)
 
-There is **no carrier database** — every carrier-specific value is derived from the SIM or the standard 3GPP naming scheme, so any VoWiFi-capable SIM works without a preset:
+There is **no required carrier database** — every carrier-specific value is derived from the SIM or the standard 3GPP naming scheme, so any VoWiFi-capable SIM works without a preset:
 
 - **ePDG FQDN** — derived from the SIM's IMSI (MCC/MNC): `epdg.epc.mnc<MNC>.mcc<MCC>.pub.3gppnetwork.org`, resolved via DNS.
 - **IMS realm / EAP NAI** — likewise derived: `ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org`.
 - **SMSC** — read from the SIM's **EF_SMSP** (`6F42`, authoritative per-SIM). If the SIM doesn't carry one, provisioning asks you to enter it, and you can always override it per-line in **SIM Config**.
 - **IMEI / IMEISV** — you set the IMEI per line; the IMEISV (used to answer the ePDG's `DEVICE_IDENTITY` request) is auto-derived from it (14-digit IMEI base + a 2-digit software version) unless you provide one explicitly.
+- **IMS address family** — auto-detected per line (see the SWu client notes). A small built-in per-carrier *hint* table (`CARRIER_CP_PREF`) only seeds the probe order to speed up the first attach; it is never required — an unknown carrier just probes the default ladder.
 
 Nothing to preseed or reload — insert the SIM and provision it.
 
@@ -238,8 +239,11 @@ a vendor-private code, …), the cause is captured in the IKE (SWu) log rather t
 
 **SWu client — 3GPP TS 24.302 conformance & non-goals:**  
 The client implements the parts of TS 24.302 that matter for a stable single-PDN VoWiFi attach:
-EAP-AKA over IKEv2; IPv6-only CFG for the P-CSCF (accepting either an `INTERNAL_IP6_ADDRESS` or an
-`INTERNAL_IP6_SUBNET` prefix, from which a stable inner address is derived); `DEVICE_IDENTITY`;
+EAP-AKA over IKEv2; a CFG (config-request) address family that matches the carrier's IMS PDN —
+`auto` (default) probes families after SIM auth and pins the one that yields a usable PDN (a
+CONNECTED tunnel *with* a P-CSCF), or you can pin `v6`/`v4`/`dual` per line (`SWU_CP_MODE`); for IPv6
+it accepts either an `INTERNAL_IP6_ADDRESS` or an `INTERNAL_IP6_SUBNET` prefix, from which a stable
+inner address is derived, and Asterisk's IMS transport binds the matching family; `DEVICE_IDENTITY`;
 P-CSCF restoration (plus optional reselection-support advertisement, `SWU_PCSCF_RESELECTION_SUPPORT`);
 IKEv2 fragmentation (RFC 7383) — advertised, with inbound reassembly **and** outbound fragmentation
 of an oversized message; reject-Notify back-off classification (§7.2.2.2); initiator liveness/DPD
@@ -307,11 +311,15 @@ Released under the [MIT License](LICENSE). The build pulls in third-party compon
 
 | MCC-MNC | Carrier | Status | Notes |
 |---------|---------|--------|-------|
-| 302-220 | Telus (CA) | ✓ works | ePDG auto-derived from IMSI, full two-way voice + SMS |
-| 234 (EE) | CTExcel (UK, on EE) | ✓ works | China Telecom MVNO on EE's UK network |
+| 302-220 | Telus (CA) | ✓ works | ePDG auto-derived from IMSI, full two-way voice + SMS; IPv6 IMS PDN |
+| 234 (EE) | CTExcel (UK, on EE) | ✓ works | China Telecom MVNO on EE's UK network; IPv6 IMS PDN |
+| 234-15 | Vodafone (UK) | ✓ works | IPv4 IMS PDN (needs the IPv4/dual CFG family — auto-detected) |
 | 310-260 | T-Mobile (US) | untested | should work; ePDG auto-derived from IMSI |
 
-Any VoWiFi-capable SIM should work without configuration (ePDG/realm derived from the IMSI, SMSC from the SIM). Reports of additional working carriers welcome.
+Any VoWiFi-capable SIM should work without configuration: the ePDG/realm are derived from the IMSI,
+the SMSC from the SIM, and the IMS address family is **auto-detected** (a per-carrier hint DB seeds
+the probe order, then the client falls back through the remaining families until one attaches). Reports
+of additional working carriers welcome.
 
 ---
 

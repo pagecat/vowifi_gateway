@@ -11,7 +11,11 @@ timer_t1=2000
 [volte_ims]
 type=transport
 protocol=tcp
+{% if pcscf_is_v6 %}
 bind=[::]:5060
+{% else %}
+bind=0.0.0.0:5060
+{% endif %}
 bind_interface=ipsec0
 sec_port_c_min=40000
 sec_port_c_max=44999

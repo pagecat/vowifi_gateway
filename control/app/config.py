@@ -398,6 +398,56 @@ def normalize_idr_mode(mode: str) -> str:
     return m if m in ("apn", "fqdn") else "apn"
 
 
+def normalize_cp_mode(mode: str) -> str:
+    """Address family of the SWu CFG (config) request, which MUST match the carrier's IMS PDN or
+    the ePDG rejects the PDN connection at the final IKE_AUTH (after EAP succeeds):
+      'auto' (default) — try a discovery ladder (carrier-DB preference first) and keep the family
+                         that yields a usable PDN; the engine reports the winner back and the line
+                         is repinned to it. Seamless: no per-carrier knowledge needed from the user.
+      'v6'             — request INTERNAL_IP6_ADDRESS + P_CSCF_IP6_ADDRESS. Telus/EE (IPv6 IMS).
+      'v4'             — request the IPv4 attrs. Vodafone UK (IPv4 IMS; v6-only -> Notify 16375).
+      'dual'           — request both (note dual suppresses Telus's P-CSCF).
+    Defaults to 'auto'; falls back to 'auto' for any unrecognised value."""
+    m = (mode or "").strip().lower()
+    return m if m in ("auto", "v6", "v4", "dual") else "auto"
+
+
+# Carrier CP-mode preference database, keyed by "mcc-mnc" (MNC as stored on the line — may be 2- or
+# 3-digit; render_instance_json tries both). Value = the family a real UE uses on that network, used
+# as the FIRST rung of the auto discovery ladder (a starting hint, NOT a hard override — the ladder
+# still falls back if it fails post-EAP). Extend as new carriers are characterised.
+CARRIER_CP_PREF = {
+    "302-220": "v6",     # Telus (Canada) — IPv6 IMS PDN; v4/dual returns no P-CSCF
+    "234-15":  "dual",   # Vodafone UK — IPv4 IMS PDN; v6-only rejected with private Notify 16375
+    "234-30":  "v6",     # EE (UK) — IPv6 IMS PDN
+    "234-33":  "v6",     # EE/CTExcel MVNO (UK) — IPv6 IMS PDN
+}
+
+# Default auto discovery ladder for carriers not in CARRIER_CP_PREF. v6 first (most VoLTE/VoWiFi IMS
+# cores are IPv6 and connect on attempt 1); dual catches v4/dual-only carriers (e.g. Vodafone); v4
+# last. The DB-preferred family (if any) is moved to the front and deduped by render_instance_json.
+CP_MODE_LADDER_DEFAULT = ["v6", "dual", "v4"]
+
+
+def cp_mode_order_for(mcc: str, mnc: str) -> str:
+    """Compute the comma-separated auto discovery ladder for a line: carrier-DB preference (matched
+    on mcc-mnc, trying both the stored MNC and its 3-digit zfill) first, then the default ladder,
+    deduped. Consumed by the engine as SWU_CP_MODE_ORDER."""
+    order = []
+    pref = None
+    for key in ("%s-%s" % (mcc, mnc), "%s-%s" % (str(mcc).zfill(3), str(mnc).zfill(3)),
+                "%s-%s" % (mcc, str(mnc).lstrip("0") or mnc)):
+        if key in CARRIER_CP_PREF:
+            pref = CARRIER_CP_PREF[key]
+            break
+    if pref:
+        order.append(pref)
+    for m in CP_MODE_LADDER_DEFAULT:
+        if m not in order:
+            order.append(m)
+    return ",".join(order)
+
+
 def render_instance_json(inst: dict, settings: dict) -> dict:
     """Convert a stored instance into the engine /config/instance.json contract."""
     ports = inst.get("ports", _alloc_ports(inst.get("index", 0)))
@@ -472,6 +522,12 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         # operator APN-FQDN. See swu_ike.py (SWU_APN / SWU_IDR_MODE).
         "apn": normalize_apn(inst.get("apn", "")),
         "idr_mode": normalize_idr_mode(inst.get("idr_mode", "")),
+        # SWu CFG request address family (must match the carrier's IMS PDN). Defaults to 'auto'
+        # (discovery ladder + carrier DB); 'v6' Telus/EE, 'v4' Vodafone UK, 'dual' both. When auto,
+        # cp_mode_order gives the engine the discovery ladder (carrier-DB preference first).
+        # See swu_ike.py (SWU_CP_MODE / SWU_CP_MODE_ORDER).
+        "cp_mode": normalize_cp_mode(inst.get("cp_mode", "")),
+        "cp_mode_order": cp_mode_order_for(inst["mcc"], inst["mnc"]),
     }
 
 

@@ -4,7 +4,7 @@ import SimSelector from './SimSelector.jsx'
 
 const emptyInstance = () => ({
   id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '',
-  reader_index: 0, msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn',
+  reader_index: 0, msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn', cp_mode: 'auto',
   sip: { listen_addr: '0.0.0.0', transport: 'udp', external: [], webrtc: { enable: true } },
   debug: { asterisk: true, charon: false },
 })
@@ -197,9 +197,25 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               <option value="fqdn">APN-FQDN</option>
             </select>
           </Field>
+          <Field label="IMS address family (CP)">
+            <select value={form.cp_mode ?? 'auto'} onChange={(e) => upd({ cp_mode: e.target.value })}>
+              <option value="auto">Auto-detect (recommended)</option>
+              <option value="dual">Dual-stack (IPv4+IPv6)</option>
+              <option value="v6">IPv6 only</option>
+              <option value="v4">IPv4 only</option>
+            </select>
+            {form.cp_mode && form.cp_mode !== 'auto' && form.cp_mode_source === 'auto' && (
+              <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 2 }}>
+                Auto-detected: {form.cp_mode.toUpperCase()}. Switch back to Auto-detect to re-probe.
+              </div>
+            )}
+          </Field>
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
           IDr is how the APN is presented to the ePDG. <b>Bare APN</b> (just the APN string) is what most carriers' ePDGs expect and is the safe default; <b>APN-FQDN</b> (<code>&lt;apn&gt;.apn.epc.mnc…mcc….pub.3gppnetwork.org</code>) is required only by a few stricter carriers — some networks reject it.
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
+          <b>IMS address family</b> must match the carrier's IMS PDN. <b>Auto-detect</b> figures it out for you (matches known carriers, else probes families after SIM auth) and pins the one that works — leave this unless you know the carrier needs a specific family. Telus/EE are IPv6; Vodafone UK is IPv4.
         </div>
 
         <h4 style={{ marginBottom: 6 }}>Local SIP access</h4>

@@ -598,6 +598,9 @@ async def api_provision(body: dict):
         # defaults to 'fqdn' (real-UE APN-FQDN form). Normalised in config.render_instance_json.
         "apn": cfg.normalize_apn(body.get("apn", "")),
         "idr_mode": cfg.normalize_idr_mode(body.get("idr_mode", "")),
+        # CFG request address family. Defaults to 'auto' (discovery ladder + carrier DB, seamless);
+        # 'v6' Telus/EE, 'v4' Vodafone UK, 'dual'. Normalised in config.render_instance_json.
+        "cp_mode": cfg.normalize_cp_mode(body.get("cp_mode", "")),
         "debug": body.get("debug") or {"asterisk": True, "charon": False},
     }
     # Port mapping: 'manual' pins the SIP UDP port the user chose (the rest of the block
@@ -1102,6 +1105,21 @@ async def api_engine_event(payload: dict):
             rec = store.update_last_call(iid, direction, None, disp)
         if rec:
             await hub.broadcast({"type": "call", "instance": iid, "call": rec})
+    elif event == "cp_mode_resolved" and args:
+        # CP auto-discovery success: the engine found the address family (v6/v4/dual) that yields a
+        # usable PDN on this carrier. Repin the line from 'auto' to the resolved family so it stops
+        # re-walking the ladder on future starts (fast, deterministic), and record that it was
+        # auto-detected. Only acts on an auto line; a pinned line ignores a stray report.
+        resolved = (args[0] or "").strip().lower()
+        if resolved in ("v6", "v4", "dual"):
+            inst = cfg.get_instance(iid)
+            if inst and cfg.normalize_cp_mode(inst.get("cp_mode", "")) == "auto":
+                try:
+                    cfg.upsert_instance({"id": iid, "cp_mode": resolved, "cp_mode_source": "auto"})
+                    log.info("instance %s: CP auto-discovery resolved to %s (repinned)", iid, resolved)
+                except Exception as e:  # noqa
+                    log.warning("cp_mode_resolved persist failed for %s: %r", iid, e)
+            await hub.broadcast({"type": "engine", "instance": iid, "event": event, "args": args})
     else:
         await hub.broadcast({"type": "engine", "instance": iid, "event": event, "args": args})
     # real-time: any tunnel/registration transition triggers an immediate status push

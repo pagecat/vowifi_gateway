@@ -2172,8 +2172,24 @@ class swu():
         subprocess.call(cmd, shell=shell)
 
 
+    def _resolver_nameservers_v4(self):
+        """IPv4 nameservers from /etc/resolv.conf (VoWiFi engine addition). Used to keep DNS on the
+        LAN link instead of the IPv4 IMS tunnel's default route (see set_routes). Best-effort:
+        returns [] on any error so a missing/odd resolv.conf never blocks tunnel bring-up."""
+        ns = []
+        try:
+            with open("/etc/resolv.conf") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == "nameserver" and "." in parts[1] and ":" not in parts[1]:
+                        if parts[1] not in ns:
+                            ns.append(parts[1])
+        except Exception:
+            pass
+        return ns
+
     def set_routes(self):
-  
+
         self.tunnel = self.open_tun(1)
         if self.netns_name:
             # create netns adn move the tun device into it
@@ -2190,7 +2206,25 @@ class swu():
                     self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.get_default_gateway_linux()[0])
                 else:
                     self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.default_gateway)
-                
+
+            # VoWiFi engine addition: on an IPv4 IMS PDN (e.g. Vodafone UK, cp_mode=v4) the two
+            # /1 routes below make the tunnel the default route for ALL IPv4, which blackholes the
+            # container's LAN DNS server(s) (they sit in 0.0.0.0/1 or 128.0.0.0/1 and get sent into
+            # the ePDG, which drops them -> 40s resolver timeouts). That delays Asterisk's outbound
+            # IMS SMS RP-ACK: its request-URI is the SMSC's IMS-internal FQDN (P-Asserted-Identity)
+            # which never resolves publicly, so the pre-send A/AAAA lookup blocks ~20s and the RP-ACK
+            # reaches the IP-SM-GW after its delivery-report correlation window has expired -> the
+            # SMSC 488s it and re-pushes the same SM forever ("only one SMS keeps arriving"). Pin the
+            # resolver's nameservers to the pre-tunnel default gateway (DNS belongs on the LAN link,
+            # not the carrier tunnel) so name lookups still fail FAST (NXDOMAIN in ms) and the RP-ACK
+            # goes out promptly. An IPv6 IMS PDN (Telus/EE) only routes ::/1 so IPv4 DNS is untouched
+            # -- which is exactly why those lines never showed this bug.
+            if not self.netns_name:
+                _gw = self.default_gateway or self.get_default_gateway_linux()[0]
+                if _gw:
+                    for _ns in self._resolver_nameservers_v4():
+                        self.exec_in_netns("route add " + _ns + "/32 gw " + _gw)
+
             self.exec_in_netns("route add -net 0.0.0.0/1 gw " + self.ip_address_list[0])
             self.exec_in_netns("route add -net 128.0.0.0/1 gw " + self.ip_address_list[0])
         
@@ -4551,79 +4585,205 @@ class swu():
             exit(1)
         return False
 
+    def apply_cp_ts_mode(self, mode):
+        """Build the IKE CFG (CP) config-request + Traffic Selectors for one address-family mode and
+        set them on this object. mode in {'v6','v4','dual'}: v6 = INTERNAL_IP6_ADDRESS/DNS +
+        P_CSCF_IP6_ADDRESS (Telus/EE — IPv6 IMS PDNs); v4 = the IPv4 attrs (Vodafone UK — IPv4 IMS,
+        else private Notify 16375); dual = both (note dual suppresses Telus's P-CSCF). TS families
+        follow the CP families (SWU_TS_MODE=auto). Called once per attach attempt so the auto
+        heuristic can retry a different family in the SAME process (see start_ike)."""
+        if mode not in ("v6", "v4", "dual"):
+            mode = "v6"
+        cp_list = [CFG_REQUEST]
+        if mode in ("v4", "dual"):
+            cp_list += [[INTERNAL_IP4_ADDRESS], [INTERNAL_IP4_DNS], [P_CSCF_IP4_ADDRESS]]
+        if mode in ("v6", "dual"):
+            cp_list += [[INTERNAL_IP6_ADDRESS], [INTERNAL_IP6_DNS], [P_CSCF_IP6_ADDRESS]]
+        # P2-3 (optional): also ask the ePDG to supply a liveness period. Default OFF (Telus is
+        # sensitive to extra CFG attributes and returns NO P-CSCF unless the request is exactly the
+        # strongSwan set); state_4 already adopts a volunteered value.
+        if os.environ.get("SWU_REQUEST_LIVENESS_ATTR", "0") not in ("0", "", "no"):
+            cp_list.append([TIMEOUT_PERIOD_FOR_LIVENESS_CHECK])
+        print("[swu_ike] CP request family: %s" % mode)
+        # Traffic Selectors MUST be consistent with the CFG/PDN address family. SWU_TS_MODE=auto
+        # (default) derives them from cp_list; dual/v4/v6 force it (escape hatch).
+        _TS_V4 = [TS_IPV4_ADDR_RANGE, ANY, 0, 65535, '0.0.0.0', '255.255.255.255']
+        _TS_V6 = [TS_IPV6_ADDR_RANGE, ANY, 0, 65535, '::', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff']
+        _ts_mode = os.environ.get("SWU_TS_MODE", "auto").strip().lower()
+        if _ts_mode not in ("auto", "dual", "v4", "v6"):
+            _ts_mode = "auto"
+        if _ts_mode == "auto":
+            _want_v4 = any(x[0] == INTERNAL_IP4_ADDRESS for x in cp_list[1:])
+            _want_v6 = any(x[0] == INTERNAL_IP6_ADDRESS for x in cp_list[1:])
+            if _want_v6 and not _want_v4:
+                _fams = ("v6",)
+            elif _want_v4 and not _want_v6:
+                _fams = ("v4",)
+            else:
+                _fams = ("v4", "v6")
+        elif _ts_mode == "dual":
+            _fams = ("v4", "v6")
+        else:
+            _fams = (_ts_mode,)
+        _ts = ([list(_TS_V4)] if "v4" in _fams else []) + ([list(_TS_V6)] if "v6" in _fams else [])
+        print("[swu_ike] TS families: %s (SWU_TS_MODE=%s)" % (",".join(_fams), _ts_mode))
+        self.set_cp_list(cp_list)
+        self.set_ts_list(TSI, [list(x) for x in _ts])
+        self.set_ts_list(TSR, [list(x) for x in _ts])
+        self.cp_mode_current = mode
+        # Clear any address/P-CSCF lists from a previous family attempt so _have_pcscf() and the
+        # inner-IP selection never see a stale value carried over across the auto ladder.
+        self.pcscf_address_list = []
+        self.pcscfv6_address_list = []
+        self.ip_address_list = []
+        self.ipv6_address_list = []
+
+    def _have_pcscf(self):
+        """True if the ePDG returned at least one P-CSCF (v4 or v6) in the CFG reply. An empty
+        P-CSCF on a CONNECTED tunnel = unusable IMS (the Telus-on-dual case)."""
+        return bool(getattr(self, "pcscfv6_address_list", []) or getattr(self, "pcscf_address_list", []))
+
+    def _light_delete(self):
+        """Send an IKE DELETE to free the ePDG SA when abandoning a CP family BEFORE state_connected()
+        (no ipsec pipes / routes exist yet, so state_delete's teardown can't be used). Best-effort: a
+        lingering half-SA would otherwise risk NO_PROPOSAL_CHOSEN on the next IKE_SA_INIT."""
+        try:
+            self.message_id_request += 1
+            self.send_data(self.create_INFORMATIONAL_delete(IKE))
+            print('sending INFORMATIONAL (delete IKE) — abandoning CP family %s'
+                  % getattr(self, "cp_mode_current", "?"))
+        except Exception as e:
+            swu_log("light delete failed: %r" % e)
+
+    def _report_resolved_mode(self):
+        """Auto-discovery success: pin the line to the CP family that worked. Cache it locally so an
+        in-container swu restart skips the ladder, and notify the manager so it persists the resolved
+        mode across container recreation (control/app/main.api_engine_event -> overwrites cp_mode)."""
+        if not getattr(self, "cp_mode_auto", False) or getattr(self, "_winner_reported", False):
+            return
+        self._winner_reported = True
+        mode = getattr(self, "cp_mode_current", "")
+        try:
+            with open(os.path.join(SWU_RUNDIR, "cp_mode.resolved"), "w") as f:
+                f.write(mode)
+        except Exception:
+            pass
+        swu_log("CP auto-discovery: family %s works — reporting resolved mode to manager" % mode)
+        swu_notify("cp_mode_resolved", mode)
+
     def start_ike(self):
-        self.iterations = 2
-        self.cookie = False
-        while self.iterations>0:
+        # CP-mode ladder. For an auto line, self.cp_mode_candidates is the ordered family list to try
+        # (e.g. ['v6','dual','v4'], DB-preferred first). Advance to the next family ONLY when SIM auth
+        # SUCCEEDED (EAP-Success) but the PDN was unusable — the final IKE_AUTH was rejected (e.g.
+        # Vodafone 16375) or the ePDG returned NO P-CSCF (Telus-on-dual). A failure before/at EAP is
+        # not a CP problem and does not cycle families. A pinned (non-auto) line has one candidate, so
+        # behaviour is unchanged.
+        candidates = getattr(self, "cp_mode_candidates", None) or [getattr(self, "cp_mode_current", "v6")]
+        mode_idx = 0
+        while mode_idx < len(candidates):
+            self.apply_cp_ts_mode(candidates[mode_idx])
+            advance = False
+            self.iterations = 2
+            self.cookie = False
+            while self.iterations>0:
 
-            self.iterations -= 1
-            # G2: clear any reject classification from a prior attempt before this one.
-            self.reject_reason_code = None
-            self.reject_reason_policy = None
-            self.reject_backoff_seconds = None
+                self.iterations -= 1
+                # G2: clear any reject classification from a prior attempt before this one.
+                self.reject_reason_code = None
+                self.reject_reason_policy = None
+                self.reject_backoff_seconds = None
+                # Auto CP-mode heuristic: track whether EAP-AKA reached EAP-Success this attempt, so a
+                # post-EAP PDN failure can be told apart from a genuine SIM/identity failure.
+                self.eap_succeeded = False
 
-            print('\nSTATE 1:\n-------')
-            result,info = self.state_1()
-            if result in (REPEAT_STATE, TIMEOUT): 
-                print(self.errors.get(result),':',info)
-                print('\nSTATE 1 (retry 1):\n------- -------')
-                result,info = self.state_1(retry=True)
-            elif result in (REPEAT_STATE_COOKIE,):
-                print(self.errors.get(result),':',info)
-                print('\nSTATE 1 (retry 1 with cookie):\n------- -------')            
-                result,info = self.state_1(retry=True, cookie=True)
-                                
-            if result in (REPEAT_STATE, TIMEOUT): 
-                print(self.errors.get(result),':',info)
-                print('\nSTATE 1: (retry 2)\n------- -------')
-                if self.cookie == True:
-                    result,info = self.state_1(retry=True, cookie=True)                
-                else:
+                print('\nSTATE 1:\n-------')
+                result,info = self.state_1()
+                if result in (REPEAT_STATE, TIMEOUT):
+                    print(self.errors.get(result),':',info)
+                    print('\nSTATE 1 (retry 1):\n------- -------')
                     result,info = self.state_1(retry=True)
-                                        
-            if result == OK:
-                print('\nSTATE 2:\n-------')
-                result,info = self.state_2()
-            else:
-                print(self.errors.get(result),':',info)
-                self._reject_guard()
-                continue
-
-            if result in (REPEAT_STATE, OK):
-                if result in (REPEAT_STATE,):
+                elif result in (REPEAT_STATE_COOKIE,):
                     print(self.errors.get(result),':',info)
-                    print('\nSTATE 2 (repeat):\n---------------')
-                    result,info = self.state_2(retry=True)
-                if result in (OK,):
-                    print('\nSTATE 3:\n-------')
-                    result,info = self.state_3()
-            else:
-                print(self.errors.get(result),':',info)
-                self._reject_guard()
-                continue
+                    print('\nSTATE 1 (retry 1 with cookie):\n------- -------')
+                    result,info = self.state_1(retry=True, cookie=True)
 
-            if result in (OK, REPEAT_STATE):
-                if result in (REPEAT_STATE,):
+                if result in (REPEAT_STATE, TIMEOUT):
                     print(self.errors.get(result),':',info)
-                    print('\nSTATE 3 (repeat):\n---------------')
-                    result,info = self.state_3()
-                if result in (OK,):
-                    print('\nSTATE 4:\n-------')
-                    result,info = self.state_4()
-            else:
-                print(self.errors.get(result),':',info)
-                self._reject_guard()
-                continue
+                    print('\nSTATE 1: (retry 2)\n------- -------')
+                    if self.cookie == True:
+                        result,info = self.state_1(retry=True, cookie=True)
+                    else:
+                        result,info = self.state_1(retry=True)
 
-            if result == OK:
-                print('\nSTATE CONNECTED. Press q to quit, i to rekey ike, c to rekey child sa, r to reauth.\n')
-                self.state_connected()
-            else:
-                print(self.errors.get(result),':',info)
-                self._reject_guard()
+                if result == OK:
+                    print('\nSTATE 2:\n-------')
+                    result,info = self.state_2()
+                else:
+                    print(self.errors.get(result),':',info)
+                    self._reject_guard()
+                    continue
+
+                if result in (REPEAT_STATE, OK):
+                    if result in (REPEAT_STATE,):
+                        print(self.errors.get(result),':',info)
+                        print('\nSTATE 2 (repeat):\n---------------')
+                        result,info = self.state_2(retry=True)
+                    if result in (OK,):
+                        print('\nSTATE 3:\n-------')
+                        result,info = self.state_3()
+                else:
+                    print(self.errors.get(result),':',info)
+                    self._reject_guard()
+                    continue
+
+                if result in (OK, REPEAT_STATE):
+                    if result in (REPEAT_STATE,):
+                        print(self.errors.get(result),':',info)
+                        print('\nSTATE 3 (repeat):\n---------------')
+                        result,info = self.state_3()
+                    if result in (OK,):
+                        # EAP-AKA succeeded (EAP-Success received). From here a failure is a PDN/CP
+                        # problem, not a SIM problem — the auto heuristic may retry another family.
+                        self.eap_succeeded = True
+                        print('\nSTATE 4:\n-------')
+                        result,info = self.state_4()
+                else:
+                    print(self.errors.get(result),':',info)
+                    self._reject_guard()
+                    continue
+
+                if result == OK:
+                    # Full attach. On an auto line a CONNECTED tunnel with NO P-CSCF is unusable
+                    # (Telus-on-dual): abandon this family and try the next.
+                    if getattr(self, "cp_mode_auto", False) and not self._have_pcscf():
+                        print('[swu_ike] tunnel established but ePDG returned NO P-CSCF for CP '
+                              'family %s — trying next family' % self.cp_mode_current)
+                        self._light_delete()
+                        advance = True
+                        break
+                    print('\nSTATE CONNECTED. Press q to quit, i to rekey ike, c to rekey child sa, r to reauth.\n')
+                    self._report_resolved_mode()
+                    self.state_connected()
+                else:
+                    # state_4 (final IKE_AUTH) failed. On an auto line, if EAP already succeeded this
+                    # is a post-EAP PDN reject (e.g. 16375) => wrong CP family: advance instead of
+                    # burning the bounded retries re-trying the same family.
+                    if getattr(self, "cp_mode_auto", False) and self.eap_succeeded:
+                        print(self.errors.get(result),':',info)
+                        advance = True
+                        break
+                    print(self.errors.get(result),':',info)
+                    self._reject_guard()
+                    continue
+
+            if advance and mode_idx < len(candidates) - 1:
+                swu_log("CP family %s reached EAP-Success but no usable PDN; falling back to %s"
+                        % (candidates[mode_idx], candidates[mode_idx + 1]))
+                mode_idx += 1
                 continue
-            
-        exit(1)    
+            break
+
+        exit(1)
            
         
 
@@ -5125,56 +5285,46 @@ def https_res_ck_ik(server, rand, autn):
 
 def main():
 
-    # CFG request. Telus assigns an IPv6-only VoWiFi PDN and only returns P_CSCF_IP6_ADDRESS
-    # when the request is IPv6-only (matching a real UE / strongSwan-epdg). When we also asked
-    # for the IPv4 attributes, Telus returned the inner IPv6 address but NO P-CSCF at all, which
-    # left Asterisk with no IMS proxy. Requesting exactly what strongSwan requests
-    # (INTERNAL_IP6_ADDRESS, INTERNAL_IP6_DNS, P_CSCF_IP6_ADDRESS) makes Telus return the P-CSCF.
-    cp_list = [
-        CFG_REQUEST,
-        [INTERNAL_IP6_ADDRESS],
-        [INTERNAL_IP6_DNS],
-        [P_CSCF_IP6_ADDRESS]
-    ]
-    # P2-3 (optional, env SWU_REQUEST_LIVENESS_ATTR=1): also ask the ePDG to supply a liveness
-    # period (TIMEOUT_PERIOD_FOR_LIVENESS_CHECK at length 0 = "UE supports receiving it").
-    # Default OFF: Telus is sensitive to extra CFG attributes and returns NO P-CSCF unless the
-    # request is exactly the strongSwan set (see the IPv6-only note). state_4 already adopts the
-    # returned value if a carrier volunteers one.
-    if os.environ.get("SWU_REQUEST_LIVENESS_ATTR", "0") not in ("0", "", "no"):
-        cp_list.append([TIMEOUT_PERIOD_FOR_LIVENESS_CHECK])
-
-    # Traffic Selectors. TSi/TSr MUST be consistent with the CFG/PDN address family: on an
-    # IPv6-only PDN (our default CFG requests only IPv6) a real UE offers IPv6-only TS. Some
-    # ePDGs enforce this at the post-EAP CHILD-SA/TS narrowing step and reject a dual-stack TS on
-    # an IPv6-only PDN (RFC 7296 says TS_UNACCEPTABLE(38); Vodafone appears to use a private code).
-    # SWU_TS_MODE controls this:
-    #   auto (default) — derive the families from cp_list: request only what the CFG requests
-    #                    (IPv6-only CFG -> IPv6-only TS; IPv4-only -> IPv4-only; both/neither -> dual)
-    #   dual           — always offer both v4 + v6 (the previous behaviour; escape hatch)
-    #   v4 / v6        — force a single family
-    _TS_V4 = [TS_IPV4_ADDR_RANGE, ANY, 0, 65535, '0.0.0.0', '255.255.255.255']
-    _TS_V6 = [TS_IPV6_ADDR_RANGE, ANY, 0, 65535, '::', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff']
-    _ts_mode = os.environ.get("SWU_TS_MODE", "auto").strip().lower()
-    if _ts_mode not in ("auto", "dual", "v4", "v6"):
-        _ts_mode = "auto"
-    if _ts_mode == "auto":
-        _want_v4 = any(a[0] == INTERNAL_IP4_ADDRESS for a in cp_list[1:])
-        _want_v6 = any(a[0] == INTERNAL_IP6_ADDRESS for a in cp_list[1:])
-        if _want_v6 and not _want_v4:
-            _fams = ("v6",)
-        elif _want_v4 and not _want_v6:
-            _fams = ("v4",)
+    # CP+TS address-family mode (per line, from cfg.cp_mode). The CFG config-request family MUST
+    # match the carrier's IMS PDN or the ePDG rejects the PDN after EAP-Success (Telus: no P-CSCF on
+    # a v4/dual request; Vodafone UK: private Notify 16375 on a v6-only request). Modes:
+    #   auto (default) — try a ladder of families and keep the one that yields a USABLE PDN (a
+    #                    CONNECTED tunnel WITH a P-CSCF). Order = SWU_CP_MODE_ORDER (the control plane
+    #                    puts the carrier-DB preference first), default v6,dual,v4. The winning family
+    #                    is reported back so the line stops re-discovering.
+    #   v6 / v4 / dual — pinned single family (no discovery). TS follows CP via SWU_TS_MODE=auto.
+    # The cp_list/ts_list are built per-attempt in swu.apply_cp_ts_mode() (called by start_ike).
+    _cp_mode = os.environ.get("SWU_CP_MODE", "auto").strip().lower()
+    if _cp_mode not in ("auto", "v6", "v4", "dual"):
+        _cp_mode = "auto"
+    _cp_auto = (_cp_mode == "auto")
+    if _cp_auto:
+        # Prefer a family this line already resolved to in a previous run of THIS container (avoids
+        # re-walking the ladder on an in-container swu restart; the manager separately persists it
+        # across container recreation by overwriting cfg.cp_mode).
+        _resolved = None
+        try:
+            with open(os.path.join(SWU_RUNDIR, "cp_mode.resolved")) as _f:
+                _r = _f.read().strip().lower()
+                if _r in ("v6", "v4", "dual"):
+                    _resolved = _r
+        except Exception:
+            _resolved = None
+        if _resolved:
+            _candidates = [_resolved]
+            print("[swu_ike] CP mode auto: using previously-resolved family %s" % _resolved)
         else:
-            _fams = ("v4", "v6")          # both requested, or neither detected -> dual (compat)
-    elif _ts_mode == "dual":
-        _fams = ("v4", "v6")
+            _seen = set(); _candidates = []
+            for m in os.environ.get("SWU_CP_MODE_ORDER", "v6,dual,v4").split(","):
+                m = m.strip().lower()
+                if m in ("v6", "v4", "dual") and m not in _seen:
+                    _seen.add(m); _candidates.append(m)
+            if not _candidates:
+                _candidates = ["v6", "dual", "v4"]
+            print("[swu_ike] CP mode auto: discovery ladder %s" % ",".join(_candidates))
     else:
-        _fams = (_ts_mode,)               # "v4" or "v6"
-    _ts = ([list(_TS_V4)] if "v4" in _fams else []) + ([list(_TS_V6)] if "v6" in _fams else [])
-    ts_list_initiator = [list(x) for x in _ts]
-    ts_list_responder = [list(x) for x in _ts]
-    print("[swu_ike] TS families: %s (SWU_TS_MODE=%s)" % (",".join(_fams), _ts_mode))
+        _candidates = [_cp_mode]
+        print("[swu_ike] CP mode pinned: %s" % _cp_mode)
 
 
     # IKE proposals. Telus' ePDG rejects the emulator's stock SHA1/MD5 list with
@@ -5277,9 +5427,12 @@ def main():
     if options.imsi == DEFAULT_IMSI: a.get_identity()
     a.set_sa_list(sa_list)
     a.set_sa_list_child(sa_list_child)
-    a.set_ts_list(TSI, ts_list_initiator)
-    a.set_ts_list(TSR, ts_list_responder)
-    a.set_cp_list(cp_list)
+    # CP/TS are applied per attach attempt by start_ike() -> apply_cp_ts_mode(), so the auto ladder
+    # can retry a different address family in the same process. Wire the mode decision here.
+    a.cp_mode_auto = _cp_auto
+    a.cp_mode_candidates = _candidates
+    a.cp_mode_current = _candidates[0]
+    a._winner_reported = False
     a.set_device_identity(options.imei, options.imeisv)
 
     # VoWiFi engine addition: clean shutdown. On SIGTERM/SIGINT send an IKE DELETE so the ePDG
