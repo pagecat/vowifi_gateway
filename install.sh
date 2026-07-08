@@ -69,7 +69,8 @@ PCSC_SOURCE_BUILT=0
 # NOT installed by default — run `sudo ./install.sh patch` to build + install it. Needed only
 # for the HSIC CCID-Reader (1d99:0016): its firmware always answers "no ICC present" to
 # GetSlotStatus even while a card is inserted and powered, so stock libccid never powers
-# the card. The patch tracks presence from the reader's (correct) NotifySlotChange interrupts.
+# the card. NotifySlotChange only sets a pending flag; IFDHICCPresence tick probes
+# via IccPowerOn/ATR (debounced) and restores prior power state.
 # Keep this >= 1.6.2: that release added 1d99:0016 to the supported-reader table, so the
 # built driver recognizes the VID/PID out of the box (older/distro libccid < 1.6.2 would
 # additionally need the device whitelisted by hand in the bundle's Info.plist).
@@ -248,25 +249,32 @@ ensure_pcscd() {
   fi
 }
 
-# Build + install the CCID USB driver $CCID_VERSION from source with the fixes under
-# patches/ccid/* applied (currently: HSIC CCID-Reader 1d99:0016 broken GetSlotStatus —
-# the firmware always reports "no ICC present" so presence must be tracked from the
-# reader's NotifySlotChange interrupt messages instead). The build installs into the
-# pcsc-lite usbdropdir, replacing the distro libccid bundle files. Idempotent via a
-# marker file; on apt systems the distro libccid package is held so an upgrade can't
-# clobber the patched driver.
-# OPT-IN: not part of `install` — run `sudo ./install.sh patch` (only needed for readers
-# with the firmware quirks addressed under patches/ccid/*; the stock distro driver is
-# fine for compliant readers).
+# Build + install the CCID USB driver $CCID_VERSION from source with a chosen SET of the
+# fixes under patches/ccid/* applied. Args: $1 = short set label (used for the idempotency
+# marker + logs), remaining args = patch filenames (under patches/ccid/) to apply in order.
+# Patch sets (see the `patch*` subcommands):
+#   01_hsic_slot_status.patch   HSIC 1d99:0016 broken GetSlotStatus — firmware always reports
+#                               "no ICC present". NotifySlotChange sets pending; IFDHICCPresence
+#                               tick probes via IccPowerOn/ATR (debounced). Base fix; safe for all cards.
+#   02_hsic_malformed_atr.patch HSIC firmware drops the final TCK byte from the ATR; this
+#                               patch synthesizes it at power-on (ISO 7816-3 XOR) and falls back
+#                               to relaxed validation if repair fails. Fixes SCardConnect 607
+#                               for (U)SIMs that work on other readers.
+# The build installs into the pcsc-lite usbdropdir, replacing the distro libccid bundle files.
+# Idempotent via a per-set marker file (switching sets rebuilds); on apt systems the distro
+# libccid package is held so an upgrade can't clobber the patched driver.
+# OPT-IN: not part of `install` — run `sudo ./install.sh patch | patch2 | patchall`.
 ensure_ccid_host() {
+  set_label="$1"; shift
+  ccid_patches="$*"
   drivers_dir=$(pkg-config libpcsclite --variable usbdropdir 2>/dev/null || true)
   [ -n "$drivers_dir" ] || drivers_dir=/usr/lib/pcsc/drivers
-  ccid_marker="$drivers_dir/ifd-ccid.bundle/Contents/.vowifi-ccid-${CCID_VERSION}-patched"
+  ccid_marker="$drivers_dir/ifd-ccid.bundle/Contents/.vowifi-ccid-${CCID_VERSION}-${set_label}"
   if [ -f "$ccid_marker" ]; then
-    info "patched CCID driver $CCID_VERSION already installed ($drivers_dir)"
+    info "patched CCID driver $CCID_VERSION (set: $set_label) already installed ($drivers_dir)"
     return
   fi
-  info "building CCID driver $CCID_VERSION from source with patches/ccid/*…"
+  info "building CCID driver $CCID_VERSION from source — patch set '$set_label' ($ccid_patches)…"
   if   have apt-get; then
     pkg_install meson ninja-build flex gcc pkg-config perl patch wget ca-certificates libusb-1.0-0-dev zlib1g-dev
     [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install libpcsclite-dev
@@ -287,17 +295,19 @@ ensure_ccid_host() {
     && { curl -fsSLo ccid.tar.gz "https://github.com/LudovicRousseau/CCID/archive/refs/tags/${CCID_VERSION}.tar.gz" \
          || wget -qO ccid.tar.gz "https://github.com/LudovicRousseau/CCID/archive/refs/tags/${CCID_VERSION}.tar.gz"; } \
     && tar xf ccid.tar.gz && cd "CCID-${CCID_VERSION}" \
-    && for p in "$REPO_DIR"/patches/ccid/*.patch; do echo "applying $p"; patch -p1 < "$p" || exit 1; done \
+    && for p in $ccid_patches; do echo "applying $p"; patch -p1 < "$REPO_DIR/patches/ccid/$p" || exit 1; done \
     && meson setup builddir \
     && ninja -C builddir && ninja -C builddir install \
   ) || die "failed to build CCID driver $CCID_VERSION from source"
   rm -rf "$tmp"
+  # drop any other-set markers so `status`/idempotency reflect the set just installed
+  rm -f "$drivers_dir/ifd-ccid.bundle/Contents/.vowifi-ccid-${CCID_VERSION}-"* 2>/dev/null || true
   touch "$ccid_marker" 2>/dev/null || true
   # keep a distro libccid upgrade from clobbering the patched bundle files
   if have apt-mark; then apt-mark hold libccid >/dev/null 2>&1 || true; fi
   # reload the driver if pcscd is already running
   if have systemctl; then systemctl restart pcscd 2>/dev/null || true; fi
-  info "patched CCID driver $CCID_VERSION installed to $drivers_dir"
+  info "patched CCID driver $CCID_VERSION (set: $set_label) installed to $drivers_dir"
 }
 
 _build_pcsclite_host() {
@@ -651,9 +661,22 @@ cmd_status() {
 # Opt-in: build + install the patched CCID driver (patches/ccid/*) on the host. Kept out of
 # the default install because it replaces the distro libccid — only needed for quirky readers
 # (e.g. HSIC 1d99:0016, whose GetSlotStatus always reports "no card").
+#   patch     base fix only (01) — HSIC presence detection; safe for every card incl. eSIM.
+#   patch2    compatibility fix only (02) — synthesize missing ATR TCK for HSIC reader.
+#   patchall  both (01 + 02).
 cmd_patch() {
   need_root
-  ensure_ccid_host
+  ensure_ccid_host slot 01_hsic_slot_status.patch
+}
+
+cmd_patch2() {
+  need_root
+  ensure_ccid_host atr 02_hsic_malformed_atr.patch
+}
+
+cmd_patchall() {
+  need_root
+  ensure_ccid_host all 01_hsic_slot_status.patch 02_hsic_malformed_atr.patch
 }
 
 cmd_logs() {
@@ -736,8 +759,10 @@ ${B}VoWiFi→SIP gateway installer${N}
   $0 uninstall [--purge]  remove vowifi containers/images/service (--purge also deletes data+venv)
   $0 status               show mode + component status
   $0 logs                 follow control-plane logs
-  $0 patch                build + install the patched CCID driver (patches/ccid/*) on the host
-                          — opt-in, only for quirky readers (e.g. HSIC 1d99:0016)
+  $0 patch                build + install the CCID driver with the base HSIC fix (01) — opt-in,
+                          for the HSIC 1d99:0016 reader (safe for every card, incl. physical eSIM)
+  $0 patch2               add only the ATR-compatibility fix (02) for non-compliant (U)SIM ATRs
+  $0 patchall             apply both CCID patches (01 + 02); use for SIMs that need the ATR fix
 
 ${B}Modes:${N}
   local  (default) control plane runs natively (venv + systemd 'vowifi-control');
@@ -786,6 +811,8 @@ case "$CMD" in
   status)             cmd_status ;;
   logs)               cmd_logs ;;
   patch)              cmd_patch ;;
+  patch2)             cmd_patch2 ;;
+  patchall)           cmd_patchall ;;
   "")                 cmd_auto ;;
   -h|--help|help)     usage ;;
   *) err "unknown command: $CMD"; usage; exit 1 ;;

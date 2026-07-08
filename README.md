@@ -149,7 +149,18 @@ sudo ./install.sh uninstall --purge
 # 1.6.2, e.g. 1.5.x, does NOT know this VID/PID: without `patch` you'd have to add it to the
 # ifdVendorID/ifdProductID/ifdFriendlyName arrays in the driver's Info.plist by hand — and the
 # reader still can't power the SIM, because the GetSlotStatus firmware bug needs the patch.)
-sudo ./install.sh patch
+#
+# There are three patch levels — pick ONE based on your card:
+#   patch      base fix only (01): HSIC card-presence detection. Standards-compliant cards,
+#              incl. physical eSIM, work with just this. RECOMMENDED default.
+#   patch2     compatibility fix only (02): HSIC firmware omits the ATR TCK byte; the patch
+#              synthesizes it at power-on so normal PTS/SCardConnect can proceed.
+#   patchall   both (01 + 02): for such quirky (U)SIMs on the HSIC reader.
+# COMPATIBILITY NOTE: patch2/patchall add HSIC-specific ATR handling. If you use a physical eSIM
+# (or any compliant card), DON'T run `patchall` — just `sudo ./install.sh patch` is enough.
+sudo ./install.sh patch        # base HSIC fix (recommended; fine for physical eSIM)
+sudo ./install.sh patch2       # only the ATR-compatibility fix
+sudo ./install.sh patchall     # both — only for SIMs whose ATR the stock driver rejects
 ```
 
 ---
