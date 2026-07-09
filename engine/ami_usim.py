@@ -26,6 +26,85 @@ RUNDIR = os.environ.get("VOWIFI_RUNDIR", "/run/vowifi")
 USIM_PIN = os.environ.get("USIM_PIN", "")
 
 
+# --- Reader binding by physical USB port -----------------------------------------------------
+# Resolve a reader by its STABLE physical USB port path (USIM_READER_PORT, e.g. "3-2") so the SIP
+# IMS-AKA path addresses the same physical reader as swu_ike/pin_keeper — even when pcscd flips
+# two identical (serial-less) readers' enumeration order. Mirrors control/app/usbreader.py.
+try:
+    from smartcard.scard import (
+        SCardEstablishContext as _SCEstablish, SCardConnect as _SCConnect,
+        SCardGetAttrib as _SCGetAttrib, SCardDisconnect as _SCDisconnect,
+        SCARD_SCOPE_USER as _SC_SCOPE_USER, SCARD_SHARE_DIRECT as _SC_SHARE_DIRECT,
+        SCARD_LEAVE_CARD as _SC_LEAVE, SCARD_PROTOCOL_T0 as _SC_T0,
+        SCARD_PROTOCOL_T1 as _SC_T1, SCARD_ATTR_CHANNEL_ID as _SC_CHANNEL_ID,
+        SCARD_S_SUCCESS as _SC_OK,
+    )
+    _SC_PORT_OK = True
+except Exception:                        # pragma: no cover
+    _SC_PORT_OK = False
+
+
+def _reader_bus_dev(reader_name):
+    if not _SC_PORT_OK:
+        return None
+    hcard = None
+    try:
+        hr, hctx = _SCEstablish(_SC_SCOPE_USER)
+        if hr != _SC_OK:
+            return None
+        hr, hcard, _p = _SCConnect(hctx, reader_name, _SC_SHARE_DIRECT, _SC_T0 | _SC_T1)
+        if hr != _SC_OK:
+            return None
+        hr, val = _SCGetAttrib(hcard, _SC_CHANNEL_ID)
+        if hr != _SC_OK or not val or len(val) < 4:
+            return None
+        v = val[0] | (val[1] << 8) | (val[2] << 16) | (val[3] << 24)
+        if (v >> 16) != 0x0020:
+            return None
+        return (v >> 8) & 0xff, v & 0xff
+    except Exception:
+        return None
+    finally:
+        if hcard is not None:
+            try:
+                _SCDisconnect(hcard, _SC_LEAVE)
+            except Exception:
+                pass
+
+
+def _usb_port_path(bus, devnum):
+    import glob as _glob
+    try:
+        entries = _glob.glob("/sys/bus/usb/devices/*/")
+    except Exception:
+        return None
+    for d in entries:
+        try:
+            with open(d + "busnum") as f:
+                b = int(f.read())
+            with open(d + "devnum") as f:
+                n = int(f.read())
+        except Exception:
+            continue
+        if b == bus and n == devnum:
+            return os.path.basename(d.rstrip("/"))
+    return None
+
+
+def index_for_port(port):
+    if not port:
+        return None
+    try:
+        rlist = readers()
+    except Exception:
+        return None
+    for i, r in enumerate(rlist):
+        bd = _reader_bus_dev(str(r))
+        if bd and _usb_port_path(bd[0], bd[1]) == port:
+            return i
+    return None
+
+
 def _hcard(conn):
     obj = conn
     for _ in range(5):
@@ -188,6 +267,18 @@ def open_usim(reader_spec):
     rlist = readers()
     if not rlist:
         return None
+    # Highest priority: the stable USB-port binding. Open that physical reader directly so we
+    # don't probe/burn PIN tries on the wrong card when indices flipped.
+    port = os.environ.get("USIM_READER_PORT", "").strip()
+    if port and len(rlist) > 1:
+        pidx = index_for_port(port)
+        if pidx is not None and pidx < len(rlist):
+            try:
+                conn = rlist[pidx].createConnection()
+                conn.connect()
+                return conn
+            except Exception:
+                pass
     if isinstance(reader_spec, str) and reader_spec.startswith("imsi:") and len(rlist) > 1:
         target = reader_spec[5:]
         for r in rlist:

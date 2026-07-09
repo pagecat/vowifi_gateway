@@ -24,7 +24,7 @@ log "rendering configs..."
 python3 /usr/local/bin/render.py || { log "render failed"; exit 1; }
 # shellcheck disable=SC1091
 set -a; . "$VOWIFI_RUNDIR/engine.env"; set +a
-export USIM_PIN USIM_READER USIM_READER_INDEX USIM_IMSI VOWIFI_ID MANAGER_URL VOWIFI_RUNDIR
+export USIM_PIN USIM_READER USIM_READER_INDEX USIM_READER_PORT USIM_IMSI VOWIFI_ID MANAGER_URL VOWIFI_RUNDIR
 export SWU_SOURCE SWU_EPDG SWU_APN SWU_MCC SWU_MNC SWU_IMEI SWU_IMEISV SWU_CHILD_REKEY_MINUTES SWU_IDR_MODE SWU_CP_MODE SWU_CP_MODE_ORDER
 
 # --- 2. Start PIN keeper and wait for the SIM to be usable ------------------------
@@ -49,7 +49,7 @@ wait_pin() {
 wait_pin || true
 
 # --- 3. Bring up the SWu (python IKEv2/IPsec) tunnel, supervised ------------------
-log "starting SWu IKEv2 tunnel (epdg=$SWU_EPDG apn=$SWU_APN reader=$USIM_READER_INDEX)..."
+log "starting SWu IKEv2 tunnel (epdg=$SWU_EPDG apn=$SWU_APN reader=$USIM_READER_INDEX port=${USIM_READER_PORT:-none})..."
 : > "$VOWIFI_RUNDIR/charon.log"      # fresh IKE log for control-plane classification
 rm -f "$VOWIFI_RUNDIR/swu.ctl" "$VOWIFI_RUNDIR/swu_status.json"
 

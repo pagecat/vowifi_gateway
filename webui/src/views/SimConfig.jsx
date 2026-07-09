@@ -4,7 +4,7 @@ import SimSelector from './SimSelector.jsx'
 
 const emptyInstance = () => ({
   id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '',
-  reader_index: 0, msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn', cp_mode: 'auto',
+  reader_index: 0, reader_port: '', msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn', cp_mode: 'auto',
   sip: { listen_addr: '0.0.0.0', transport: 'udp', external: [], webrtc: { enable: true } },
   debug: { asterisk: true, charon: false },
 })
@@ -44,6 +44,10 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   // The reader index to act on, clamped to a reader that currently exists (never probe a
   // stale/out-of-range index that would report a phantom empty reader).
   const readerIdx = () => (form.reader_index >= 0 && form.reader_index < readers.length) ? form.reader_index : 0
+  // Stable USB port path of a reader index (from the live card monitor). A line binds to this
+  // port, not the enumeration index, so it sticks to the physical reader socket even when pcscd
+  // re-enumerates two identical readers in a different order.
+  const portForIdx = (i) => (cards.find((c) => c.index === i) || {}).reader_port || ''
 
   const detect = async () => {
     setPinMsg('Detecting…')
@@ -57,6 +61,10 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       const patch = { imsi: c.imsi || form.imsi, mcc: c.mcc || form.mcc, mnc: c.mnc || form.mnc }
       if (c.smsc && smscMode === 'auto') patch.smsc = c.smsc   // SMSC from the SIM (EF_SMSP)
       if (c.imsi) patch.reader = `imsi:${c.imsi}`
+      // Bind the line to the reader's stable physical USB port (from the detected card, else the
+      // live monitor). Persisted so start-time re-resolves the correct index for this socket.
+      const port = c.reader_port || portForIdx(readerIdx())
+      if (port) patch.reader_port = port
       if (!form.id) patch.id = String(instances.length + 1)
       upd(patch)
       setPinMsg(c.imsi ? 'Card read.' : `Card present (enter PIN to read IMSI). ICCID ${c.iccid || '?'}, tries ${c.pin_tries ?? '?'}`)
@@ -128,16 +136,21 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ marginTop: 0 }}>SIM card</h3>
         <Field label="Reader">
-          <select value={form.reader_index} onChange={(e) => upd({ reader_index: +e.target.value })}>
-            {readers.map((r, i) => <option key={i} value={i}>{i}: {r}</option>)}
+          <select value={form.reader_index} onChange={(e) => upd({ reader_index: +e.target.value, reader_port: portForIdx(+e.target.value) || form.reader_port })}>
+            {readers.map((r, i) => <option key={i} value={i}>{i}: {r}{portForIdx(i) ? ` — USB ${portForIdx(i)}` : ''}</option>)}
             {readers.length === 0 && <option>no readers</option>}
           </select>
         </Field>
+        {form.reader_port &&
+          <div className="mono" style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
+            Bound to USB port {form.reader_port} (stable across reader re-enumeration)
+          </div>}
         <button className="btn btn-ghost" style={{ marginTop: 10 }} onClick={detect}>Detect card</button>
         {card && (
           <div className="mono" style={{ fontSize: 12, color: card.present ? 'var(--text-dim)' : '#ef4444', marginTop: 12, lineHeight: 1.6 }}>
             {card.present ? (<>
               ICCID: {card.iccid || '—'}<br />IMSI: {card.imsi || '(locked)'}<br />
+              {card.reader_port && <>USB port: {card.reader_port}<br /></>}
               PIN: {card.pin_enabled ? `enabled, ${card.pin_tries} tries` : 'disabled'}
             </>) : (<>No SIM card in reader {card.reader_index}.</>)}
           </div>

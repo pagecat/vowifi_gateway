@@ -470,6 +470,11 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         # on any reader other than 0 authenticates against the wrong physical SIM (USIM AUTHENTICATE
         # returns 0x9862 "incorrect MAC"). Kept in sync with the live ICCID-matched reader at start.
         "reader_index": inst.get("reader_index", 0),
+        # Stable physical USB port path of the reader (e.g. "3-2"). The engine resolves this back
+        # to a live PC/SC index in-container so its self-heal restarts address the right physical
+        # reader even when pcscd re-enumerates two identical readers in a different order. Empty
+        # -> engine falls back to reader_index. See control/app/usbreader.py.
+        "reader_port": inst.get("reader_port", ""),
         "iccid": inst.get("iccid", ""),
         "msisdn": inst.get("msisdn", ""),
         "smsc": inst.get("smsc", ""),

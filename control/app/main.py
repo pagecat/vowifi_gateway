@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
-from . import store, engine, status as status_mod, sim, card, notify_push
+from . import store, engine, status as status_mod, sim, card, notify_push, usbreader
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -128,7 +128,14 @@ def _find_running_by_reader(name: str):
 async def _on_card_insert(name, idx):
     info = {"index": idx, "name": name, "present": True, "iccid": None,
             "pin_enabled": None, "pin_tries": None, "matched": None, "imsi": None,
-            "mcc": None, "mnc": None, "smsc": None}
+            "mcc": None, "mnc": None, "smsc": None, "reader_port": None}
+    # Resolve the STABLE physical USB port for this reader index (DIRECT connect, no APDU —
+    # safe even if a running engine holds the card). This is the binding a line pins to, so it
+    # survives pcscd re-enumerating two identical readers into a different order.
+    try:
+        info["reader_port"] = await asyncio.to_thread(usbreader.port_for_index, idx)
+    except Exception as e:  # noqa
+        log.debug("reader_port resolve failed for idx %s: %r", idx, e)
     # A running engine may already hold this card (manager restart, or pcscd flapped
     # while the engine kept running) — probing it could clash with the engine's card
     # access. Always map the reader to the running instance whose pin_keeper reports
@@ -251,6 +258,13 @@ async def card_monitor():
                     continue
                 if entry.get("index") != st["index"]:
                     entry["index"] = st["index"]     # indices shift on unplug
+                    # The physical reader behind this name/index may have changed — refresh the
+                    # stable USB port binding so the display + ICCID->port learning stay correct.
+                    try:
+                        entry["reader_port"] = await asyncio.to_thread(
+                            usbreader.port_for_index, st["index"])
+                    except Exception:  # noqa
+                        pass
                     changed = True
                 if bool(entry.get("present")) != st["present"]:
                     if st["present"]:
@@ -508,12 +522,40 @@ def api_ports_suggest():
 
 
 def _reader_index_for_instance(inst: dict) -> int | None:
-    """Find the PC/SC reader index currently holding this instance's SIM (match by ICCID
-    against the live card monitor). Returns None if the card isn't present."""
+    """Resolve the PC/SC reader index this instance should address, preferring the STABLE
+    physical USB port binding over the (unstable) enumeration index/ICCID.
+
+    Priority:
+      1. inst.reader_port -> live index via the USB port map. This is authoritative: it sticks
+         to the physical reader socket even when pcscd flips the indices of two identical
+         readers. It does not require the card to be readable/matched by the monitor.
+      2. ICCID match against the live card monitor (works once the card's identity is known).
+    Returns None if neither resolves (card/reader not present)."""
+    port = inst.get("reader_port")
+    if port:
+        try:
+            idx = usbreader.index_for_port(port)
+        except Exception as e:  # noqa
+            log.debug("port->index resolve failed for %s: %r", port, e)
+            idx = None
+        if idx is not None:
+            return idx
     iccid = inst.get("iccid")
     for c in hub.cards.values():
         if c.get("present") and iccid and c.get("iccid") == iccid:
             return c.get("index")
+    return None
+
+
+def _reader_port_for_instance(inst: dict) -> str | None:
+    """The stable USB port path this instance's SIM currently sits at. Resolved from the live
+    card monitor by ICCID (the port is captured per-reader on each scan). Used to (re)learn /
+    refresh a line's reader_port binding at start time so it self-heals if the SIM was moved."""
+    iccid = inst.get("iccid")
+    if iccid:
+        for c in hub.cards.values():
+            if c.get("present") and c.get("iccid") == iccid and c.get("reader_port"):
+                return c.get("reader_port")
     return None
 
 
@@ -591,6 +633,11 @@ async def api_provision(body: dict):
         "pin": pin,
         "reader": f"imsi:{c.imsi}",
         "reader_index": idx,  # store the physical reader index for USB device passthrough
+        # Stable USB port path of the reader this SIM was provisioned in. This is the primary
+        # binding used at start time (resolved back to a live index), so the line sticks to its
+        # physical reader socket even if pcscd re-enumerates two identical readers in a different
+        # order. Falls back to reader_index/ICCID when absent.
+        "reader_port": c.reader_port or usbreader.port_for_index(idx) or "",
         "smsc": smsc,
         "msisdn": body.get("msisdn", ""),
         "enabled": True, "sip": sip,
@@ -659,6 +706,11 @@ async def api_instances():
         live_idx = _reader_index_for_instance(inst)
         if live_idx is not None:
             safe["reader_index"] = live_idx
+        # Also report the SIM's current USB port (by ICCID from the live monitor) so the UI can
+        # show the stable binding and re-persist it if the SIM was moved to another reader socket.
+        live_port = _reader_port_for_instance(inst)
+        if live_port:
+            safe["reader_port"] = live_port
         out.append({**safe, "status": st})
     return {"instances": out}
 
@@ -733,15 +785,30 @@ async def api_instance_start(iid: str, body: dict | None = None):
 
     settings = cfg.get_settings()
     dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
-    # Address the SIM by the reader that CURRENTLY holds it: resolve the PC/SC index by ICCID
-    # against the live card monitor and persist it if it drifted (readers re-enumerate when
-    # (re)plugged, so a stored index can be stale). Without this a line can end up authenticating
-    # against a different reader's SIM -> USIM AUTHENTICATE 0x9862 "incorrect MAC".
+    # Bind the line to the reader that CURRENTLY holds its SIM, keyed on the STABLE physical USB
+    # port. Two identical readers (no serial) get their pcscd enumeration order — and thus their
+    # indices — flipped at boot/pcscd-restart with the cables untouched; a stored index then points
+    # at the wrong (or empty) reader, and the engine authenticates against no card -> DEFAULT
+    # RES/CK/IK -> carrier rejects EAP-AKA. So:
+    #   1. (Re)learn the SIM's current USB port (by ICCID from the live monitor) and persist it —
+    #      this refreshes the binding if the SIM was physically moved to another socket.
+    #   2. Resolve the live PC/SC index from that port (falls back to ICCID) and persist it too.
+    # The engine also self-resolves the port->index in-container, so its self-heal restarts stay
+    # correct without the control plane.
+    updates: dict = {}
+    live_port = await asyncio.to_thread(_reader_port_for_instance, inst)
+    if live_port and live_port != inst.get("reader_port"):
+        log.info("instance %s: reader port %s -> %s (live ICCID match)",
+                 iid, inst.get("reader_port"), live_port)
+        updates["reader_port"] = live_port
+        inst = {**inst, "reader_port": live_port}
     live_idx = await asyncio.to_thread(_reader_index_for_instance, inst)
     if live_idx is not None and live_idx != inst.get("reader_index"):
-        log.info("instance %s: reader index %s -> %s (live ICCID match)",
+        log.info("instance %s: reader index %s -> %s (port/ICCID resolve)",
                  iid, inst.get("reader_index"), live_idx)
-        inst = cfg.upsert_instance({"id": str(iid), "reader_index": live_idx})
+        updates["reader_index"] = live_idx
+    if updates:
+        inst = cfg.upsert_instance({"id": str(iid), **updates})
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
     cid = await asyncio.to_thread(engine.start, inst, settings, dev_mounts=dev)

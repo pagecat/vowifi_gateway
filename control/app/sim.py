@@ -19,6 +19,8 @@ from smartcard.CardConnection import CardConnection
 from smartcard.Exceptions import NoCardException, CardConnectionException
 from smartcard.scard import SCardBeginTransaction, SCardEndTransaction, SCARD_LEAVE_CARD
 
+from . import usbreader
+
 log = logging.getLogger("vowifi.sim")
 
 MIN_TRIES = 2  # never verify/spend when <= this many attempts remain (avoid PUK lock)
@@ -38,6 +40,9 @@ class CardInfo:
     pin_tries: Optional[int] = None
     smsc: Optional[str] = None
     error: Optional[str] = None
+    # Stable physical USB port path of this reader (e.g. "3-2"). Used to bind a line to a
+    # physical reader socket instead of the unstable pcscd enumeration index.
+    reader_port: Optional[str] = None
 
     def dict(self):
         return asdict(self)
@@ -222,6 +227,11 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
                         error="reader index out of range")
     r = rlist[reader_index]
     info = CardInfo(reader=str(r), reader_index=reader_index, present=False)
+    # Resolve the stable USB port path for this reader (best-effort; None if unavailable).
+    try:
+        info.reader_port = usbreader.port_for_index(reader_index)
+    except Exception:  # noqa
+        pass
     try:
         conn = r.createConnection()
         conn.connect()

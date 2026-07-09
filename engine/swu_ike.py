@@ -6,6 +6,7 @@ import time
 import select
 import sys
 import os
+import errno
 import fcntl
 import subprocess
 import multiprocessing
@@ -38,7 +39,7 @@ from card.USIM import *
 
 requests.packages.urllib3.disable_warnings()
 
-# --- APDU-level tracing (diagnostic, SWU_APDU_DEBUG, default ON) ------------------------------
+# --- APDU-level tracing (diagnostic, SWU_APDU_DEBUG, default OFF) ------------------------------
 # Wrap pyscard's CardConnection.transmit so every APDU issued in THIS process is logged with the
 # reader, the command hex, the response SW + length, and the elapsed time. The mitshell card.USIM
 # path (return_res_ck_ik -> USIM().authenticate()) and swu_ike's own PIN path both go through
@@ -97,6 +98,34 @@ SWU_IFACE = os.environ.get("SWU_IFACE", "ipsec0")          # tun device name (pj
 SWU_NOTIFY = os.environ.get("SWU_NOTIFY", "/usr/local/bin/notify.py")
 SWU_ASSIGN_IPV6_GLOBAL = os.environ.get("SWU_ASSIGN_IPV6_GLOBAL", "1") not in ("0", "", "no")
 SWU_WRITE_RESOLV = os.environ.get("SWU_WRITE_RESOLV", "0") not in ("0", "", "no")
+
+# --- Data-plane MTU / fragmentation handling -------------------------------------------------
+# The userspace ESP dataplane reads inner IP packets off the tun (ipsec0), wraps each in
+# ESP(+UDP for NAT-T)+outer-IPv4, and sends it out toward the ePDG. Design goals:
+#   * The tun (ipsec0) MTU is FIXED and stable so the IMS/pjsip layer is unaware of any path
+#     constraint (SWU_TUN_MTU, default 1400 -> a 1400 inner + ~81 ESP overhead = ~1481 outer,
+#     which still fits the common 1500/1480 uplinks with no fragmentation at all).
+#   * Fragmentation is done ENTIRELY by the tunnel client, transparently: when the real outer
+#     path MTU cannot carry inner+overhead, swu splits the inner packet (RFC 791 for IPv4, an
+#     RFC 8200 Fragment header for IPv6) so every ESP datagram on the wire is COMPLETE and never
+#     IP-fragmented (survives carriers/paths that drop IP fragments).
+#   * The real outer MTU is SENSED beyond the container's own NIC: `ip route get <epdg>` exposes
+#     the route-cached PMTU, so a WireGuard/1280 (or any constrained) hop on the HOST outside the
+#     container — common when bypassing carrier IP restrictions — is picked up via PMTU discovery.
+# Env knobs:
+#   SWU_TUN_MTU     fixed ipsec0 MTU (default 1400)
+#   SWU_OUTER_MTU   override the sensed outer path MTU (0 = autodetect via route + egress NIC)
+#   SWU_MTU_MARGIN  extra bytes shaved off the fragmentation threshold (default 0)
+#   SWU_INNER_FRAG  1 = swu fragments oversized inner packets (default 1)
+#   SWU_ICMP_PTB    1 = also signal the local source with an ICMP PTB (default 0 — keep the IMS
+#                       layer unaware; inner fragmentation already makes everything fit)
+SWU_TUN_MTU_ENV   = int(os.environ.get("SWU_TUN_MTU", "1400") or 1400)
+SWU_OUTER_MTU_ENV = int(os.environ.get("SWU_OUTER_MTU", "0") or 0)
+SWU_MTU_MARGIN    = int(os.environ.get("SWU_MTU_MARGIN", "0") or 0)
+SWU_INNER_FRAG    = os.environ.get("SWU_INNER_FRAG", "1") not in ("0", "", "no")
+SWU_ICMP_PTB      = os.environ.get("SWU_ICMP_PTB", "0") not in ("0", "", "no")
+SWU_MTU_REFRESH   = float(os.environ.get("SWU_MTU_REFRESH", "5") or 5)  # secs between re-sensing
+IPV6_MIN_MTU      = 1280       # RFC 8200: an IPv6 link/interface must carry at least 1280 bytes
 
 
 def swu_log(msg):
@@ -1077,6 +1106,7 @@ class swu():
             
         self.socket.bind(client_address)                
         self.socket.settimeout(self.timeout)
+        self._enable_outer_pmtud(self.socket)
 
 
     def create_socket_nat(self,client_address):
@@ -1088,10 +1118,28 @@ class swu():
             
         self.socket_nat.bind(client_address)                
         self.socket_nat.settimeout(self.timeout)
+        self._enable_outer_pmtud(self.socket_nat)
 
     def create_socket_esp(self,client_address):
         self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_RAW, ESP_PROTOCOL)
         self.socket_esp.bind(client_address)    
+        self._enable_outer_pmtud(self.socket_esp)
+
+    def _enable_outer_pmtud(self, sock):
+        """Set IP_PMTUDISC_DO on an outer (ePDG-facing) socket: the kernel sets DF, discovers the
+        path MTU (from ICMP frag-needed, incl. a WireGuard/constrained hop on the HOST outside the
+        container) and caches it on the route, and NEVER IP-fragments our datagram. We never want
+        the kernel to IP-fragment the ESP-in-UDP: many carrier/ePDG paths drop IP fragments (EE
+        does). Instead swu splits the INNER packet so every ESP datagram is complete and fits the
+        sensed PMTU. The default IP_PMTUDISC_WANT would instead silently EMSGSIZE-drop oversized
+        sends; PMTUDISC_DO is the same DF behaviour but keeps the route PMTU query (`ip route get`)
+        populated for _sense_outer_mtu(). Best-effort: never abort socket setup on an odd kernel."""
+        try:
+            ip_mtu_discover = getattr(socket, "IP_MTU_DISCOVER", 10)
+            ip_pmtudisc_do = getattr(socket, "IP_PMTUDISC_DO", 2)
+            sock.setsockopt(socket.IPPROTO_IP, ip_mtu_discover, ip_pmtudisc_do)
+        except Exception as e:
+            swu_log("could not set IP_PMTUDISC_DO on outer socket: %r" % e)
         
     def set_server(self,address):
         self.server_address = (address,self.port)
@@ -2252,6 +2300,271 @@ class swu():
             pass
         return ns
 
+    # --- Data-plane MTU sizing + outbound fragmentation --------------------------------------
+    def _iface_mtu(self, iface):
+        """Current MTU of a link, read straight from sysfs (no iproute parsing). 0 on any error."""
+        try:
+            with open("/sys/class/net/%s/mtu" % iface) as f:
+                return int(f.read().strip())
+        except Exception:
+            return 0
+
+    def _esp_overhead(self):
+        """Bytes added to an inner IP packet to turn it into the OUTER IPv4 datagram that leaves
+        eth0: outer IPv4 header + (UDP for NAT-T) + ESP header + IV + worst-case pad/trailer +
+        ICV/tag. Derived from the negotiated CHILD-SA cipher/integrity (known before the dataplane
+        workers fork) so the tun MTU is sized to guarantee ANY inner packet <= (outer_mtu -
+        overhead) encapsulates into a single outer datagram <= outer_mtu. The outer family is
+        always IPv4 here (all ePDG sockets are AF_INET)."""
+        outer_ip = 20
+        udp = 8 if self.userplane_mode == NAT_TRAVERSAL else 0
+        esp_hdr = 8                                            # SPI(4) + sequence(4)
+        encr = self.negotiated_encryption_algorithm_child
+        integ = self.negotiated_integrity_algorithm_child
+        if encr in (ENCR_AES_GCM_8, ENCR_AES_GCM_12, ENCR_AES_GCM_16):
+            iv = 8
+            block = 4                                         # GCM path pads (len+2) to a /4
+            icv = {ENCR_AES_GCM_8: 8, ENCR_AES_GCM_12: 12, ENCR_AES_GCM_16: 16}[encr]
+        elif encr == ENCR_NULL:
+            iv = 0
+            block = 1
+            icv = self.integ_key_truncated_len_bytes.get(integ, 0)
+        else:                                                 # AES-CBC (and any other CBC cipher)
+            iv = 16
+            block = 16
+            icv = self.integ_key_truncated_len_bytes.get(integ, 0)
+        # ESP encrypts (payload + padlen + nexthdr) padded up to the cipher block: worst case the
+        # padding is block-1 bytes on top of the mandatory 2-byte trailer.
+        trailer = 2 + (block - 1 if block > 1 else 0)
+        return outer_ip + udp + esp_hdr + iv + trailer + icv
+
+    def _sense_outer_mtu(self):
+        """Sense the REAL outer path MTU toward the ePDG, seeing PAST the container's own NIC.
+        `ip route get <epdg>` reports the egress device AND, once PMTU discovery has learned it,
+        the route-cached path MTU — so a WireGuard/constrained hop running on the HOST outside the
+        container (common when bypassing carrier IP filtering) is picked up as it is discovered.
+        Returns the min of {SWU_OUTER_MTU override, route-cached PMTU, egress-NIC MTU}, or 1500
+        when nothing can be determined. Best-effort and cheap enough to re-run periodically."""
+        if SWU_OUTER_MTU_ENV:
+            return SWU_OUTER_MTU_ENV
+        candidates = []
+        try:
+            out = subprocess.check_output("ip route get %s" % self.epdg_address,
+                                          shell=True, stderr=subprocess.DEVNULL).decode()
+            toks = out.split()
+            dev = None
+            for i, t in enumerate(toks):
+                if t == "dev" and i + 1 < len(toks):
+                    dev = toks[i + 1]
+                elif t == "mtu" and i + 1 < len(toks):
+                    try:
+                        candidates.append(int(toks[i + 1]))     # route-cached PMTU (from PMTUD)
+                    except ValueError:
+                        pass
+            if dev:
+                dm = self._iface_mtu(dev)                       # egress NIC's own MTU
+                if dm:
+                    candidates.append(dm)
+        except Exception:
+            pass
+        return min(candidates) if candidates else 1500
+
+    def _inner_mtu_from(self, outer_mtu):
+        """Largest inner IP packet whose ESP encapsulation fits one outer datagram of outer_mtu."""
+        m = outer_mtu - self._esp_overhead() - SWU_MTU_MARGIN
+        return m if m >= 68 else 68
+
+    def _compute_and_apply_tun_mtu(self):
+        """Fix the ipsec0 (inner) MTU so the IMS/pjsip layer sees a stable value and is unaware of
+        any path constraint, and record self.inner_mtu — the fragmentation THRESHOLD derived from
+        the sensed outer path MTU (NOT the device MTU). The encapsulation worker refreshes the
+        threshold periodically (PMTUD may lower it after traffic starts).
+
+        - ipsec0 MTU = SWU_TUN_MTU (default 1400): 1400 + ESP overhead (~81) = ~1481, still inside
+          the common 1500/1480 uplinks, so a normal deployment fragments NOTHING while giving the
+          IMS layer a fixed MTU.
+        - inner_mtu (fragmentation threshold) = sensed_outer_mtu - ESP overhead. Only inner packets
+          larger than this are split by swu (transparently) so every ESP datagram is complete.
+        Best-effort; on error ipsec0 keeps its default and inner_mtu is left unset (no fragmenting)."""
+        try:
+            outer_mtu = self._sense_outer_mtu()
+            overhead = self._esp_overhead()
+            inner_mtu = self._inner_mtu_from(outer_mtu)
+            tun_mtu = SWU_TUN_MTU_ENV or 1400
+            self.outer_mtu = outer_mtu
+            self.inner_mtu = inner_mtu
+            self.tun_mtu = tun_mtu
+            # read buffer must never truncate a full inner packet (up to the fixed tun MTU)
+            self._tun_read_size = max(2048, tun_mtu + 128)
+
+            self.exec_in_netns("ip link set dev %s mtu %d" % (self.tun_device, tun_mtu))
+            swu_log("dataplane MTU: ipsec0(fixed)=%d esp_overhead=%d sensed_outer(%s)=%d "
+                    "frag_threshold(inner_mtu)=%d inner_frag=%s"
+                    % (tun_mtu, overhead, self._lan_egress_iface(), outer_mtu, inner_mtu, SWU_INNER_FRAG))
+            if inner_mtu < tun_mtu:
+                swu_log("note: outer path (%d) < ipsec0(%d)+overhead; inner packets above %d bytes "
+                        "are split by the tunnel client (transparent to IMS) so each ESP datagram "
+                        "is a complete, unfragmented outer packet%s"
+                        % (outer_mtu, tun_mtu, inner_mtu,
+                           "" if SWU_INNER_FRAG else " — DISABLED (SWU_INNER_FRAG=0)"))
+        except Exception as e:
+            swu_log("tun MTU setup failed (keeping default): %r" % e)
+            self.inner_mtu = getattr(self, "inner_mtu", 0)
+            self._tun_read_size = getattr(self, "_tun_read_size", 2048)
+
+    @staticmethod
+    def _ones_complement_checksum(data):
+        """16-bit one's-complement sum (IPv4 header checksum / ICMP checksum core)."""
+        if len(data) % 2:
+            data += b'\x00'
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) | data[i + 1]
+        total = (total & 0xffff) + (total >> 16)
+        total = (total & 0xffff) + (total >> 16)
+        return (~total) & 0xffff
+
+    def _fragment_ipv4_inner(self, packet, mtu):
+        """RFC 791 fragmentation of an inner IPv4 datagram so each piece, once ESP-encapsulated,
+        fits one outer datagram. Returns a list of IPv4 fragments, or None when the packet cannot
+        be fragmented (DF set, or header/length inconsistent) so the caller can fall back to outer
+        fragmentation / an ICMP signal. Each fragment carries a recomputed header checksum and a
+        payload that is a multiple of 8 bytes (except possibly the last)."""
+        try:
+            if len(packet) < 20:
+                return None
+            ihl = (packet[0] & 0x0F) * 4
+            if ihl < 20 or ihl > len(packet):
+                return None
+            total_len = struct.unpack("!H", packet[2:4])[0]
+            if total_len < ihl or total_len > len(packet):
+                total_len = len(packet)                       # tolerate a short/again-read frame
+            flags_frag = struct.unpack("!H", packet[6:8])[0]
+            df = flags_frag & 0x4000
+            mf = flags_frag & 0x2000
+            base_off = (flags_frag & 0x1FFF) * 8              # honour a pre-existing offset
+            if df:
+                return None
+            header = bytearray(packet[:ihl])
+            payload = packet[ihl:total_len]
+            max_payload = (mtu - ihl) & ~7                    # 8-byte aligned per RFC 791
+            if max_payload <= 0 or len(payload) <= max_payload:
+                return None
+            frags = []
+            off = 0
+            n = len(payload)
+            while off < n:
+                chunk = payload[off:off + max_payload]
+                is_last = (off + len(chunk) >= n)
+                frag_off_units = (base_off + off) // 8
+                new_flags = (0x2000 if (mf or not is_last) else 0) | (frag_off_units & 0x1FFF)
+                h = bytearray(header)
+                h[2:4] = struct.pack("!H", ihl + len(chunk))
+                h[6:8] = struct.pack("!H", new_flags)
+                h[10:12] = b'\x00\x00'
+                h[10:12] = struct.pack("!H", self._ones_complement_checksum(bytes(h)))
+                frags.append(bytes(h) + chunk)
+                off += len(chunk)
+            return frags
+        except Exception as e:
+            swu_log("inner IPv4 fragmentation error: %r" % e)
+            return None
+
+    def _fragment_ipv6_inner(self, packet, mtu):
+        """RFC 8200 §4.5 fragmentation of an inner IPv6 datagram: insert a Fragment extension
+        header and split the payload so each fragment, once ESP-encapsulated, fits one outer
+        datagram <= the outer link MTU. This is essential where the carrier DROPS outer IPv4
+        fragments (e.g. EE): each swu-produced fragment is a COMPLETE, unfragmented outer datagram,
+        so nothing depends on IP-layer reassembly of the outer packet. Both the inner source
+        (Asterisk) and this tunnel ingress are on the same host, so preserving the inner src/dst
+        makes reassembly at the P-CSCF host indistinguishable from ordinary source fragmentation.
+
+        Only the common VoWiFi shape is fragmented: a base 40-byte header immediately followed by
+        the upper-layer (TCP/UDP/ICMPv6). Packets that already carry extension headers — including
+        an existing Fragment header — return None so the caller falls back to outer fragmentation
+        (rare for IMS signalling; RTP is always small)."""
+        try:
+            if len(packet) < 40:
+                return None
+            nexthdr = packet[6]
+            if nexthdr in (0, 43, 44, 60):        # hop-by-hop / routing / fragment / dest-opts
+                return None
+            payload = packet[40:]
+            max_chunk = (mtu - 40 - 8) & ~7        # 40 base + 8 fragment header, 8-byte aligned
+            if max_chunk <= 0 or len(payload) <= max_chunk:
+                return None
+            frag_id = self._next_v6_frag_id()
+            base = bytearray(packet[:40])
+            base[6] = 44                            # base next-header -> Fragment (44)
+            frags = []
+            off = 0
+            n = len(payload)
+            while off < n:
+                chunk = payload[off:off + max_chunk]
+                m = 0 if (off + len(chunk) >= n) else 1
+                # fragment header: next-hdr(1) reserved(1) offset<<3|res|M (2) identification(4)
+                fh = bytes([nexthdr, 0]) + struct.pack("!H", (off & 0xFFF8) | m) + struct.pack("!I", frag_id)
+                h = bytearray(base)
+                struct.pack_into("!H", h, 4, 8 + len(chunk))   # IPv6 payload length
+                frags.append(bytes(h) + fh + chunk)
+                off += len(chunk)
+            return frags
+        except Exception as e:
+            swu_log("inner IPv6 fragmentation error: %r" % e)
+            return None
+
+    def _next_v6_frag_id(self):
+        self._v6_frag_id = (getattr(self, "_v6_frag_id", 0) + 1) & 0xFFFFFFFF
+        return self._v6_frag_id
+
+    def _icmp_too_big(self, packet, mtu):
+        """Build an ICMP 'packet too big' / 'fragmentation needed' addressed back to the inner
+        packet's source, so the LOCAL stack (Asterisk/kernel) learns the tunnel path MTU and
+        self-sizes (TCP MSS shrinks; IPv6 sources emit sub-1280 fragments). Written into the tun,
+        it looks exactly like an on-path router's PMTUD signal. Returns the ICMP datagram bytes or
+        None. Never raises."""
+        try:
+            ver = packet[0] >> 4
+            quote = packet[:min(len(packet), 1232)]           # keep the whole ICMP under 1280
+            if ver == 6:
+                src = packet[8:24]                            # inner IPv6 src/dst
+                dst = packet[24:40]
+                # ICMPv6 type 2 (Packet Too Big), code 0, MTU in the 4-byte body, then the quote.
+                body = struct.pack("!I", mtu) + quote
+                icmp = bytearray(b'\x02\x00\x00\x00' + body)
+                pseudo = dst + src + struct.pack("!I", len(icmp)) + b'\x00\x00\x00\x3a'
+                csum = self._ones_complement_checksum(pseudo + bytes(icmp))
+                icmp[2:4] = struct.pack("!H", csum)
+                ip = bytearray(40)
+                ip[0] = 0x60
+                struct.pack_into("!H", ip, 4, len(icmp))       # payload length
+                ip[6] = 0x3a                                    # next header = ICMPv6
+                ip[7] = 64                                      # hop limit
+                ip[8:24] = dst                                  # from the "router" (the dst) ...
+                ip[24:40] = src                                 # ... back to the source
+                return bytes(ip) + bytes(icmp)
+            elif ver == 4:
+                ihl = (packet[0] & 0x0F) * 4
+                src = packet[12:16]
+                dst = packet[16:20]
+                q = packet[:min(len(packet), ihl + 8)]         # RFC 792: IP header + 8 bytes
+                # type 3 (dest unreachable) code 4 (frag needed, DF set); next-hop MTU in low 16b.
+                icmp = bytearray(b'\x03\x04\x00\x00' + struct.pack("!HH", 0, mtu) + q)
+                icmp[2:4] = struct.pack("!H", self._ones_complement_checksum(bytes(icmp)))
+                total = 20 + len(icmp)
+                ip = bytearray(20)
+                ip[0] = 0x45
+                struct.pack_into("!H", ip, 2, total)
+                ip[8] = 64                                      # TTL
+                ip[9] = 1                                       # protocol = ICMP
+                ip[12:16] = dst
+                ip[16:20] = src
+                ip[10:12] = struct.pack("!H", self._ones_complement_checksum(bytes(ip)))
+                return bytes(ip) + bytes(icmp)
+        except Exception as e:
+            swu_log("ICMP PTB build error: %r" % e)
+        return None
+
     def set_routes(self):
 
         self.tunnel = self.open_tun(1)
@@ -2343,6 +2656,11 @@ class swu():
                     subprocess.call("echo 'nameserver " + i +"' >> /etc/resolv.conf", shell=True)  
                 for i in self.dnsv6_address_list:
                     subprocess.call("echo 'nameserver " + i +"' >> /etc/resolv.conf", shell=True)            
+
+        # VoWiFi engine addition: size ipsec0 to the outer path now that the inner address family
+        # (v4/v6) and the CHILD-SA cipher are both known, so the encapsulation worker (forked next
+        # in state_connected, inheriting self.inner_mtu) never overflows the outer link MTU.
+        self._compute_and_apply_tun_mtu()
 
     def add_dir(self):
         if not os.path.isdir('/etc/netns'):
@@ -2521,6 +2839,142 @@ class swu():
         
         return None
 
+    def _prepare_egress(self, packet):
+        """Decide how an inner packet read off the tun leaves the tunnel. Returns the list of inner
+        IP packets to ESP-encapsulate: normally [packet]; several pieces when an oversized inner
+        packet is fragmented so each encapsulates into one COMPLETE outer datagram <= the sensed
+        path MTU. Inner IPv4 uses RFC 791 fragmentation (DF clear); inner IPv6 uses an RFC 8200
+        Fragment header. Fragmenting at the INNER layer (never letting the kernel IP-fragment the
+        outer carrier — the outer sockets set DF via PMTUDISC_DO) is what makes a constrained path
+        work on carriers that DROP IP fragments (e.g. EE): every packet on the wire is a self-
+        contained outer datagram. The rare packet that cannot be inner-fragmented (DF-set IPv4, or
+        an IPv6 packet already carrying extension headers) is passed whole; with DF set it is then
+        dropped-and-PMTU-signalled by the path rather than silently corrupted. SWU_ICMP_PTB (off by
+        default, to keep the IMS layer unaware) additionally injects an ICMP PTB toward the local
+        source (IPv6 only when the reportable MTU is >= 1280 — RFC 8201)."""
+        inner_mtu = getattr(self, "inner_mtu", 0)
+        if not inner_mtu or len(packet) <= inner_mtu or len(packet) < 20:
+            return [packet]
+        ver = packet[0] >> 4
+        if SWU_INNER_FRAG and ver == 4:
+            frags = self._fragment_ipv4_inner(packet, inner_mtu)
+            if frags:
+                return frags
+        if SWU_INNER_FRAG and ver == 6:
+            frags = self._fragment_ipv6_inner(packet, inner_mtu)
+            if frags:
+                return frags
+        if SWU_ICMP_PTB and (ver == 4 or (ver == 6 and inner_mtu >= IPV6_MIN_MTU)):
+            icmp = self._icmp_too_big(packet, inner_mtu)
+            if icmp:
+                try:
+                    os.write(self.tunnel, icmp)
+                except Exception:
+                    pass
+        return [packet]
+
+    def _outer_path_mtu(self):
+        """The kernel's currently-known path MTU toward the ePDG on the NAT-T (UDP) socket, via
+        IP_MTU. After an EMSGSIZE (or once PMTUD has run) this reflects the exact largest outer
+        datagram the path accepts. Returns None if unavailable (e.g. raw ESP socket / no route)."""
+        try:
+            ip_mtu = getattr(socket, "IP_MTU", 14)
+            m = self.socket_nat.getsockopt(socket.IPPROTO_IP, ip_mtu)
+            return m if m and m > 0 else None
+        except Exception:
+            return None
+
+    def _lower_inner_mtu(self, hint_outer_mtu=None):
+        """Lower the inner fragmentation threshold in response to a path that rejected an outer
+        datagram as too large. Uses the kernel's exact IP_MTU (or a caller-supplied hint) when it
+        yields a strictly smaller threshold; otherwise steps down from the current value so we
+        ALWAYS make progress (IP_MTU can still read the 1500 NIC MTU right after the drop). Bounded
+        below by 68 (min IPv4 datagram). Returns the new inner_mtu."""
+        overhead = self._esp_overhead()
+        outer = hint_outer_mtu or self._outer_path_mtu()
+        cur = getattr(self, "inner_mtu", 0) or (SWU_TUN_MTU_ENV or 1400)
+        new_inner = None
+        if outer:
+            candidate = outer - overhead - SWU_MTU_MARGIN
+            if candidate < cur:
+                new_inner = candidate
+        if new_inner is None:
+            # No usable exact figure: back off ~10% (min 32 bytes) so repeated hits converge fast.
+            new_inner = cur - max(32, cur // 10)
+        if new_inner < 68:
+            new_inner = 68
+        if new_inner < cur:
+            swu_log("outer datagram rejected (EMSGSIZE); lowering fragmentation threshold "
+                    "%d -> %d (outer_mtu=%s overhead=%d)"
+                    % (cur, new_inner, outer if outer else "?", overhead))
+            self.inner_mtu = new_inner
+            self.outer_mtu = outer or getattr(self, "outer_mtu", 0)
+            # Remember this as a ceiling so the periodic re-sense can't raise the threshold back
+            # above a level the path has actually rejected.
+            prev = getattr(self, "_emsgsize_floor", None)
+            self._emsgsize_floor = new_inner if prev is None else min(prev, new_inner)
+        return self.inner_mtu
+
+    def _sendto_outer(self, encrypted_packet):
+        """Send one already-encapsulated ESP datagram on the correct outer socket. Returns True on
+        success. Raises OSError(EMSGSIZE) up to the caller for MTU recovery; swallows every OTHER
+        transient socket error (a single dropped ESP datagram must NEVER kill the dataplane worker,
+        which previously died on an uncaught EMSGSIZE -> the whole tunnel went dead)."""
+        if self.userplane_mode == ESP_PROTOCOL:
+            self.socket_esp.sendto(encrypted_packet, self.server_address_esp)
+        else:
+            self.socket_nat.sendto(encrypted_packet, self.server_address_nat)
+        return True
+
+    def _send_inner_esp(self, inner_packet, encr_alg, encr_key, integ_alg, integ_key, spi_resp, sqn):
+        """Encapsulate one inner IP packet and send it, recovering from a too-large outer datagram
+        (EMSGSIZE) instead of crashing. On EMSGSIZE we learn the real path MTU (IP_MTU), lower the
+        fragmentation threshold, re-fragment THIS inner packet and resend each piece. Bounded retry
+        so a pathological path can't loop forever. Returns the updated ESP sequence number."""
+        encrypted_packet = self.encapsulate_esp_packet(
+            inner_packet, encr_alg, encr_key, integ_alg, integ_key, spi_resp, sqn)
+        if encrypted_packet is None:
+            return sqn
+        try:
+            self._sendto_outer(encrypted_packet)
+            return sqn + 1
+        except OSError as e:
+            if e.errno != errno.EMSGSIZE:
+                # Any other send error: drop this datagram, keep the worker alive.
+                swu_log("outer ESP send error (dropping datagram): %r" % e)
+                return sqn + 1
+        # EMSGSIZE: the outer datagram exceeded the path MTU. Learn it, lower the threshold and
+        # re-fragment this inner packet so each ESP datagram now fits. Retry a few times in case
+        # the path MTU drops in more than one step.
+        for _ in range(4):
+            self._lower_inner_mtu()
+            pieces = self._prepare_egress(inner_packet)
+            # _prepare_egress returns [inner_packet] unchanged when it can't fragment (e.g. DF-set
+            # IPv4 or an already-extension-headed IPv6). Nothing more we can do — drop it.
+            if len(pieces) == 1 and pieces[0] is inner_packet and len(inner_packet) > self.inner_mtu:
+                swu_log("inner packet %dB cannot be fragmented below path MTU; dropping"
+                        % len(inner_packet))
+                return sqn + 1
+            ok = True
+            for piece in pieces:
+                ep = self.encapsulate_esp_packet(
+                    piece, encr_alg, encr_key, integ_alg, integ_key, spi_resp, sqn)
+                if ep is None:
+                    continue
+                try:
+                    self._sendto_outer(ep)
+                    sqn += 1
+                except OSError as e2:
+                    if e2.errno == errno.EMSGSIZE:
+                        ok = False
+                        break                     # still too big -> lower again and re-fragment
+                    swu_log("outer ESP send error on fragment (dropping): %r" % e2)
+                    sqn += 1
+            if ok:
+                return sqn
+        swu_log("giving up sending inner packet after repeated EMSGSIZE (path MTU too small)")
+        return sqn
+
     def encapsulate_ipsec(self,args):
 
         pipe_ike = args[0]
@@ -2539,9 +2993,36 @@ class swu():
         keepalive_interval = float(os.environ.get("SWU_NATT_KEEPALIVE", "20") or 20)
         last_keepalive = time.time()
 
+        # Periodically re-sense the outer path MTU: PMTU discovery only learns a constrained hop
+        # (e.g. a WireGuard/1280 on the host) AFTER traffic starts, so the fragmentation threshold
+        # self.inner_mtu must be refreshed once the route cache updates. Cheap `ip route get`.
+        last_mtu_check = 0.0
+
         while True:
             timeout = keepalive_interval if keepalive_interval > 0 else None
+            if SWU_MTU_REFRESH > 0:
+                timeout = SWU_MTU_REFRESH if timeout is None else min(timeout, SWU_MTU_REFRESH)
             read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [], timeout)
+            if SWU_MTU_REFRESH > 0 and (time.time() - last_mtu_check) >= SWU_MTU_REFRESH:
+                try:
+                    # Re-sense from the route cache, but also fold in the kernel's exact path MTU
+                    # (IP_MTU) which reflects any PMTUD-learned / EMSGSIZE drop, and never raise the
+                    # threshold above a level a real EMSGSIZE already proved too big (self._emsgsize_
+                    # floor) — otherwise we'd oscillate right back into the too-large send.
+                    sensed_outer = self._sense_outer_mtu()
+                    kern = self._outer_path_mtu()
+                    outer = min([m for m in (sensed_outer, kern) if m]) if (sensed_outer or kern) else sensed_outer
+                    new_inner = self._inner_mtu_from(outer)
+                    floor = getattr(self, "_emsgsize_floor", None)
+                    if floor is not None:
+                        new_inner = min(new_inner, floor)
+                    if new_inner != getattr(self, "inner_mtu", 0):
+                        swu_log("outer path MTU refresh -> fragmentation threshold now %d "
+                                "(was %d)" % (new_inner, getattr(self, "inner_mtu", 0)))
+                        self.inner_mtu = new_inner
+                except Exception:
+                    pass
+                last_mtu_check = time.time()
             if keepalive_interval > 0 and self.userplane_mode == NAT_TRAVERSAL and \
                     (time.time() - last_keepalive) >= keepalive_interval:
                 try:
@@ -2551,17 +3032,16 @@ class swu():
                 last_keepalive = time.time()
             for sock in read_sockets:
                 if sock == self.tunnel:
-                    tap_packet = os.read(self.tunnel, 1514)
+                    tap_packet = os.read(self.tunnel, getattr(self, "_tun_read_size", 1514))
 
                     if encr_alg is not None:
 
-                        encrypted_packet = self.encapsulate_esp_packet(tap_packet,encr_alg,encr_key,integ_alg,integ_key,spi_resp,sqn)
-                        if encrypted_packet is not None:
-                            sqn += 1
-                            if self.userplane_mode == ESP_PROTOCOL:
-                                self.socket_esp.sendto(encrypted_packet, self.server_address_esp)
-                            else:
-                                self.socket_nat.sendto(encrypted_packet, self.server_address_nat)
+                        # Transparent inner fragmentation: split an oversized inner packet so each
+                        # ESP datagram is a complete outer packet <= the sensed path MTU. Normally
+                        # (path can carry ipsec0-MTU + overhead) _prepare_egress returns [packet].
+                        for inner_packet in self._prepare_egress(tap_packet):
+                            sqn = self._send_inner_esp(inner_packet, encr_alg, encr_key,
+                                                       integ_alg, integ_key, spi_resp, sqn)
 
                 elif sock == pipe_ike:
                     pipe_packet = pipe_ike.recv()                     
@@ -2594,7 +3074,7 @@ class swu():
             read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [])
             for sock in read_sockets:
                 if sock == self.socket_nat:
-                    packet, address = self.socket_nat.recvfrom(2000)
+                    packet, address = self.socket_nat.recvfrom(4096)
                     
                     if encr_alg is not None:
                         if packet[0:4] == b'\x00\x00\x00\x00': #is ike message
@@ -2611,7 +3091,7 @@ class swu():
                                     self._note_esp_activity(pipe_ike)
 
                 elif sock == self.socket_esp:
-                    packet, address = self.socket_esp.recvfrom(2000)
+                    packet, address = self.socket_esp.recvfrom(4096)
                     if encr_alg is not None:
                         if packet[20:24] == spi_init:
 
@@ -5298,6 +5778,107 @@ def _read_res_ck_ik_pin(reader_index, rand, autn, pin):
             pass
 
 
+# --- Reader binding by physical USB port (VoWiFi engine addition) ----------------------------
+# The engine is launched with a fixed reader index (-m N). But the rig may hold two IDENTICAL
+# readers (no USB serial), so pcscd/libccid tell them apart only by enumeration order — which
+# races at boot / pcscd restart and can FLIP the two readers' indices with the cables untouched.
+# The container self-heals swu_ike in-process on every reauth (and docker may auto-restart it),
+# always reusing the baked -m index; once the index flips, the engine reads the WRONG (or an
+# empty) reader -> card access fails -> return_res_ck_ik falls through to "Using DEFAULT RES, CK
+# and IK" -> the ePDG rejects EAP-AKA, forever. To fix this at the source we bind to the reader's
+# STABLE physical USB port path (e.g. "3-2") and resolve the live index from it at startup.
+#
+# index -> (bus,devnum): SCARD_ATTR_CHANNEL_ID (USB) is little-endian u32 0x00200000|(bus<<8)|dev.
+# (bus,devnum) -> port path: walk /sys/bus/usb/devices/*/{busnum,devnum} (host sysfs is visible
+# read-only inside the container). Best-effort: any failure returns the fallback index unchanged.
+try:
+    from smartcard.scard import (
+        SCardEstablishContext as _SCEstablish, SCardConnect as _SCConnect,
+        SCardGetAttrib as _SCGetAttrib, SCardDisconnect as _SCDisconnect,
+        SCARD_SCOPE_USER as _SC_SCOPE_USER, SCARD_SHARE_DIRECT as _SC_SHARE_DIRECT,
+        SCARD_LEAVE_CARD as _SC_LEAVE, SCARD_PROTOCOL_T0 as _SC_T0,
+        SCARD_PROTOCOL_T1 as _SC_T1, SCARD_ATTR_CHANNEL_ID as _SC_CHANNEL_ID,
+        SCARD_S_SUCCESS as _SC_OK,
+    )
+    _SC_PORT_OK = True
+except Exception:                        # pragma: no cover
+    _SC_PORT_OK = False
+
+
+def _reader_bus_dev(reader_name):
+    """(bus, devnum) via SCARD_ATTR_CHANNEL_ID (SHARE_DIRECT, no card / no APDU), or None."""
+    if not _SC_PORT_OK:
+        return None
+    hcard = None
+    try:
+        hr, hctx = _SCEstablish(_SC_SCOPE_USER)
+        if hr != _SC_OK:
+            return None
+        hr, hcard, _p = _SCConnect(hctx, reader_name, _SC_SHARE_DIRECT, _SC_T0 | _SC_T1)
+        if hr != _SC_OK:
+            return None
+        hr, val = _SCGetAttrib(hcard, _SC_CHANNEL_ID)
+        if hr != _SC_OK or not val or len(val) < 4:
+            return None
+        v = val[0] | (val[1] << 8) | (val[2] << 16) | (val[3] << 24)
+        if (v >> 16) != 0x0020:          # not a USB channel id
+            return None
+        return (v >> 8) & 0xff, v & 0xff
+    except Exception:
+        return None
+    finally:
+        if hcard is not None:
+            try:
+                _SCDisconnect(hcard, _SC_LEAVE)
+            except Exception:
+                pass
+
+
+def _usb_port_path(bus, devnum):
+    import glob as _glob
+    try:
+        entries = _glob.glob("/sys/bus/usb/devices/*/")
+    except Exception:
+        return None
+    for d in entries:
+        try:
+            with open(d + "busnum") as f:
+                b = int(f.read())
+            with open(d + "devnum") as f:
+                n = int(f.read())
+        except Exception:
+            continue
+        if b == bus and n == devnum:
+            return os.path.basename(d.rstrip("/"))
+    return None
+
+
+def resolve_reader_index_by_port(port, fallback_index):
+    """Return the live PC/SC reader index whose physical USB port == `port`, or `fallback_index`
+    if it can't be resolved (no port configured, port absent, or PC/SC/sysfs unavailable)."""
+    if not port:
+        return fallback_index
+    try:
+        rlist = readers()
+    except Exception as e:  # noqa
+        swu_log("reader bind: PC/SC unavailable (%r); using index %s" % (e, fallback_index))
+        return fallback_index
+    for i, r in enumerate(rlist):
+        bd = _reader_bus_dev(str(r))
+        if not bd:
+            continue
+        if _usb_port_path(bd[0], bd[1]) == port:
+            if str(i) != str(fallback_index):
+                swu_log("reader bind: USB port %s is at index %d (was -m %s) -> using %d"
+                        % (port, i, fallback_index, i))
+            else:
+                swu_log("reader bind: USB port %s confirmed at index %d" % (port, i))
+            return i
+    swu_log("reader bind: USB port %s not found on any reader; using fallback index %s"
+            % (port, fallback_index))
+    return fallback_index
+
+
 #https functions
 def https_imsi(server):
     r = requests.get('https://' + server + '/?type=imsi', verify=False)
@@ -5491,7 +6072,20 @@ def main():
         print('Unable to resolve ' + options.destination_addr + '. Exiting.')
         exit(1)
 
-    a = swu(options.source_addr,destination_addr,options.apn,options.modem,options.gateway_ip_address,options.mcc,options.mnc,options.imsi,options.ki,options.op,options.opc,options.netns, options.sqn)
+    # Bind the smartcard reader to its STABLE physical USB port (USIM_READER_PORT), resolving the
+    # live PC/SC index from it. This keeps the engine addressing the reader that physically holds
+    # its SIM even when pcscd re-enumerated two identical readers in a different order (see
+    # resolve_reader_index_by_port). Only applies when -m is an integer reader index (not a serial
+    # port / https server); no-op when USIM_READER_PORT is unset -> falls back to the -m index.
+    modem = options.modem
+    try:
+        _mi = int(str(modem))
+    except (TypeError, ValueError):
+        _mi = None
+    if _mi is not None:
+        modem = str(resolve_reader_index_by_port(os.environ.get("USIM_READER_PORT", "").strip(), _mi))
+
+    a = swu(options.source_addr,destination_addr,options.apn,modem,options.gateway_ip_address,options.mcc,options.mnc,options.imsi,options.ki,options.op,options.opc,options.netns, options.sqn)
 
     if options.imsi == DEFAULT_IMSI: a.get_identity()
     a.set_sa_list(sa_list)

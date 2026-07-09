@@ -175,11 +175,95 @@ def read_iccid(conn):
     return swap_nibbles(hx).rstrip("f")
 
 
+# --- Reader binding by physical USB port ----------------------------------------------------
+# Resolve a reader by its STABLE physical USB port path (e.g. "3-2") instead of the pcscd
+# enumeration index, which can flip between two identical (serial-less) readers on re-enumeration.
+# Mirrors control/app/usbreader.py and swu_ike.resolve_reader_index_by_port so pin_keeper, swu_ike
+# and the manager all agree on which physical reader a line is bound to. Best-effort: returns None
+# when the port can't be resolved so callers fall back to the ICCID/index strategy.
+try:
+    from smartcard.scard import (
+        SCardEstablishContext as _SCEstablish, SCardConnect as _SCConnect,
+        SCardGetAttrib as _SCGetAttrib, SCardDisconnect as _SCDisconnect,
+        SCARD_SCOPE_USER as _SC_SCOPE_USER, SCARD_SHARE_DIRECT as _SC_SHARE_DIRECT,
+        SCARD_LEAVE_CARD as _SC_LEAVE, SCARD_PROTOCOL_T0 as _SC_T0,
+        SCARD_PROTOCOL_T1 as _SC_T1, SCARD_ATTR_CHANNEL_ID as _SC_CHANNEL_ID,
+        SCARD_S_SUCCESS as _SC_OK,
+    )
+    _SC_PORT_OK = True
+except Exception:                        # pragma: no cover
+    _SC_PORT_OK = False
+
+
+def _reader_bus_dev(reader_name):
+    if not _SC_PORT_OK:
+        return None
+    hcard = None
+    try:
+        hr, hctx = _SCEstablish(_SC_SCOPE_USER)
+        if hr != _SC_OK:
+            return None
+        hr, hcard, _p = _SCConnect(hctx, reader_name, _SC_SHARE_DIRECT, _SC_T0 | _SC_T1)
+        if hr != _SC_OK:
+            return None
+        hr, val = _SCGetAttrib(hcard, _SC_CHANNEL_ID)
+        if hr != _SC_OK or not val or len(val) < 4:
+            return None
+        v = val[0] | (val[1] << 8) | (val[2] << 16) | (val[3] << 24)
+        if (v >> 16) != 0x0020:
+            return None
+        return (v >> 8) & 0xff, v & 0xff
+    except Exception:
+        return None
+    finally:
+        if hcard is not None:
+            try:
+                _SCDisconnect(hcard, _SC_LEAVE)
+            except Exception:
+                pass
+
+
+def _usb_port_path(bus, devnum):
+    import glob as _glob
+    try:
+        entries = _glob.glob("/sys/bus/usb/devices/*/")
+    except Exception:
+        return None
+    for d in entries:
+        try:
+            with open(d + "busnum") as f:
+                b = int(f.read())
+            with open(d + "devnum") as f:
+                n = int(f.read())
+        except Exception:
+            continue
+        if b == bus and n == devnum:
+            return os.path.basename(d.rstrip("/"))
+    return None
+
+
+def index_for_port(port):
+    """Live reader index whose physical USB port == `port`, or None."""
+    if not port:
+        return None
+    try:
+        rlist = readers()
+    except Exception:
+        return None
+    for i, r in enumerate(rlist):
+        bd = _reader_bus_dev(str(r))
+        if bd and _usb_port_path(bd[0], bd[1]) == port:
+            return i
+    return None
+
+
 def find_reader(reader_spec):
     """Return (reader, open_connection) for the target SIM.
 
     Matching strategy that works with multiple readers (some empty) WITHOUT needing the
     PIN first:
+      - USIM_READER_PORT set -> resolve the reader at that STABLE physical USB port first
+                        (survives pcscd flipping two identical readers' indices).
       - imsi:<IMSI>  -> single reader: use it. Multiple readers: read ICCID (no PIN needed)
                         on each present card; if the target's ICCID was learned (see
                         USIM_ICCID env) match on it, otherwise fall back to trying IMSI
@@ -199,6 +283,17 @@ def find_reader(reader_spec):
             return c
         except Exception:
             return None
+
+    # 0) Highest priority: the stable USB-port binding. If it resolves to a present, openable
+    # reader, use it — this is the physical reader the line is bound to regardless of index order.
+    port = os.environ.get("USIM_READER_PORT", "").strip()
+    if port:
+        pidx = index_for_port(port)
+        if pidx is not None and pidx < len(rlist):
+            conn = _open(rlist[pidx])
+            if conn is not None:
+                log(f"bound to USB port {port} (reader index {pidx})")
+                return rlist[pidx], conn
 
     target_iccid = os.environ.get("USIM_ICCID", "").strip()
 

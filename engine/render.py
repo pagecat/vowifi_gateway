@@ -238,6 +238,11 @@ def main():
         # swu_ike.py. Reader is addressed by index for swu_ike's smartcard path; source is the
         # container IP; ePDG FQDN is resolved by swu_ike.
         f.write(f"USIM_READER_INDEX={cfg.get('reader_index', 0)}\n")
+        # Stable physical USB port path of the reader (e.g. "3-2"). swu_ike/pin_keeper resolve it
+        # back to a live PC/SC index in-container, so the SIM is always addressed by the reader
+        # that PHYSICALLY holds it — surviving pcscd re-enumerating two identical readers into a
+        # different order. Empty -> fall back to USIM_READER_INDEX.
+        f.write(f"USIM_READER_PORT={cfg.get('reader_port','')}\n")
         f.write(f"USIM_IMSI={ctx['imsi']}\n")
         # IMEI / IMEISV for the ePDG DEVICE_IDENTITY response. imeisv falls back to a value
         # derived from the IMEI if the instance didn't carry one (hand-authored config).
