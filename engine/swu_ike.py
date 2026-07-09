@@ -4110,9 +4110,14 @@ class swu():
                                             eap_payload_response = bytes([2]) + bytes([self.eap_identifier]) + fromHex('0018170400000404') + fromHex(auts)
                                             self.eap_payload_response = eap_payload_response
                                             return REPEAT_STATE,'SYNC FAILURE'
-                                            
-                                        else:    
-                                            
+
+                                        elif res is None or ck is None or ik is None:
+                                            # Hard SIM AUTHENTICATE failure (0x9862 etc.): don't
+                                            # fromHex(None) and crash — reject cleanly.
+                                            return self._sim_auth_failed()
+
+                                        else:
+
                                             print('RES',res)
                                             print('CK',ck)
                                             print('IK',ik)
@@ -4298,7 +4303,12 @@ class swu():
                                     print('RES',res)
                                     print('CK',ck)
                                     print('IK',ik)
-                                    
+
+                                    if res is None or ck is None or ik is None:
+                                        # SIM AUTHENTICATE failed (or returned AUTS) on the reauth
+                                        # challenge: reject cleanly instead of fromHex(None) crash.
+                                        return self._sim_auth_failed()
+
                                     self.RES, CK, IK = fromHex(res), fromHex(ck), fromHex(ik)
                                     self.KENCR, self.KAUT, self.MSK, self.EMSK, self.MK = self.eap_keys_calculation(CK,IK)
                                     print('KENCR',toHex(self.KENCR))
@@ -5106,6 +5116,20 @@ class swu():
         except Exception:
             pass
         exit(1)
+
+    def _sim_auth_failed(self):
+        """Handle a SIM AUTHENTICATE that returned no RES/CK/IK — e.g. the wrong SIM is in the
+        bound reader (0x9862 'incorrect MAC'), a blocked/mismatched card, or an unhandled sync
+        failure. The upstream code blindly did fromHex(None) here and crashed the ENTIRE tunnel
+        process with a TypeError (ugly traceback + supervised restart storm). Instead classify it
+        as an EAP-AKA authentication failure and reject cleanly so the supervisor + manager health
+        back off. The 'authentication failed' phrase is what control/app/status.classify_ike matches
+        to surface a 'SIM authentication (EAP-AKA)' reason instead of a raw traceback."""
+        swu_log("SIM AUTHENTICATE returned no RES/CK/IK — EAP-AKA authentication failed "
+                "(wrong SIM in the bound reader, or a card auth error); rejecting attach")
+        self.reject_reason_code = "AUTHENTICATION_FAILED"
+        self.reject_reason_policy = "backoff"
+        return OTHER_ERROR, 'SIM AUTHENTICATE FAILED'
 
     def _reject_guard(self):
         """G2: after a failed attach attempt, decide whether to keep looping. If the last reject

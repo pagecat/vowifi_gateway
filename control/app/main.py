@@ -37,6 +37,7 @@ class Hub:
     """Holds AMI clients per instance and broadcasts events to WebSocket clients."""
     def __init__(self):
         self.ami: dict[str, AmiClient] = {}
+        self._ami_locks: dict[str, asyncio.Lock] = {}  # per-instance ami_for serialisation
         self.clients: set[WebSocket] = set()
         self.cards: dict[str, dict] = {}     # reader NAME -> detected card/reader info
         self.scanned = False                 # card_monitor completed its first scan
@@ -61,6 +62,18 @@ class Hub:
         self.health[str(iid)] = {"fail_start": None, "retry_count": 0, "frozen_code": None,
                                  "frozen_reason": None, "last_state": None}
 
+    async def drop_ami(self, iid: str):
+        """Tear down and forget the AMI client for an instance. MUST be called whenever the
+        engine container is stopped or recreated (stop/start/reprovision): the client's
+        panoramisk Manager auto-reconnects forever, so a client left pointing at a removed or
+        recreated container keeps dialing it — and if the new container has a different AMI
+        secret (or the docker IP was reused by another line) it floods that Asterisk with
+        'failed to authenticate' every few seconds. close() sets the client's closed flag which
+        neutralises the pending reconnect."""
+        c = self.ami.pop(str(iid), None)
+        if c:
+            await c.close()
+
 
     async def broadcast(self, msg: dict):
         dead = []
@@ -74,24 +87,32 @@ class Hub:
 
     async def ami_for(self, iid: str) -> AmiClient | None:
         iid = str(iid)
-        inst = cfg.get_instance(iid)
-        if not inst or not engine.is_running(iid):
-            return None
-        client = self.ami.get(iid)
-        ip = engine.container_ip(iid)
-        if not ip:
-            return None
-        if client and client.connected and client.host == ip:
+        # Serialise per-instance so concurrent callers (the 4s status_poller + API handlers) can't
+        # each build a client and orphan the other's: an orphaned AmiClient is never close()d, so
+        # its panoramisk Manager reconnects forever (flooding the engine's Asterisk with AMI auth
+        # failures once a container reuses its docker IP).
+        lock = self._ami_locks.setdefault(iid, asyncio.Lock())
+        async with lock:
+            inst = cfg.get_instance(iid)
+            running = bool(inst) and engine.is_running(iid)
+            ip = engine.container_ip(iid) if running else None
+            client = self.ami.get(iid)
+            # Reuse only a healthy client still pointed at the current container.
+            if client and running and ip and client.connected and client.host == ip:
+                return client
+            # Any other cached client is stale/unusable — drop it (close stops its reconnect loop)
+            # so it can't linger and reconnect. This is the leak the old early-returns caused: they
+            # returned None when the container was gone/IP-less WITHOUT closing the cached client.
+            if client:
+                await self.drop_ami(iid)
+            if not running or not ip:
+                return None
+            client = AmiClient(iid, ip, 5038, inst.get("ami_user", "vowifi"),
+                               inst["ami_secret"], realm=cfg.ims_realm(inst["mcc"], inst["mnc"]),
+                               msisdn=inst.get("msisdn", ""), smsc=inst.get("smsc", ""))
+            await client.connect()
+            self.ami[iid] = client
             return client
-        # (re)connect
-        if client:
-            await client.close()
-        client = AmiClient(iid, ip, 5038, inst.get("ami_user", "vowifi"),
-                           inst["ami_secret"], realm=cfg.ims_realm(inst["mcc"], inst["mnc"]),
-                           msisdn=inst.get("msisdn", ""), smsc=inst.get("smsc", ""))
-        await client.connect()
-        self.ami[iid] = client
-        return client
 
 
 hub = Hub()
@@ -746,10 +767,8 @@ async def api_instance_upsert(body: dict):
 
 @app.delete("/api/instances/{iid}")
 async def api_instance_delete(iid: str):
-    engine.stop(iid)
-    c = hub.ami.pop(str(iid), None)
-    if c:
-        await c.close()
+    await asyncio.to_thread(engine.stop, iid)
+    await hub.drop_ami(iid)
     cfg.delete_instance(iid)
     _refresh_card_matches()
     await hub.broadcast({"type": "cards", "cards": hub.cards_list()})
@@ -811,6 +830,7 @@ async def api_instance_start(iid: str, body: dict | None = None):
         inst = cfg.upsert_instance({"id": str(iid), **updates})
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
+    await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
     cid = await asyncio.to_thread(engine.start, inst, settings, dev_mounts=dev)
     asyncio.create_task(push_status(str(iid)))
     return {"ok": True, "container": cid}
@@ -834,6 +854,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
     dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
+    await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
     cid = await asyncio.to_thread(engine.start, inst, cfg.get_settings(), dev_mounts=dev)
     asyncio.create_task(push_status(str(iid)))
     return {"ok": True, "container": cid}
@@ -857,8 +878,11 @@ async def api_clear_pin(iid: str):
 
 
 @app.post("/api/instances/{iid}/stop")
-def api_instance_stop(iid: str):
-    engine.stop(iid)
+async def api_instance_stop(iid: str):
+    await asyncio.to_thread(engine.stop, iid)
+    # Tear down the AMI client too — otherwise its Manager keeps auto-reconnecting to the
+    # now-removed container (and floods a container that later reuses the docker IP).
+    await hub.drop_ami(iid)
     return {"ok": True}
 
 

@@ -33,12 +33,28 @@ class AmiClient:
         self.smsc = smsc
         self._mgr: Manager | None = None
         self._connected = False
+        self._closed = False
         self._event_cb = None
 
     async def connect(self):
         self._mgr = Manager(host=self.host, port=self.port,
                             username=self.username, secret=self.secret,
                             ping_delay=15, reconnect_timeout=5)
+        # panoramisk auto-reconnects on connection loss/refusal by scheduling
+        # loop.call_later(reconnect_timeout, self.connect); its close() only cancels the
+        # pinger, NOT that pending timer — so a Manager whose target container was stopped
+        # or recreated with a NEW AMI secret keeps reconnecting forever and floods the new
+        # Asterisk with "failed to authenticate as 'vowifi'" every few seconds. Wrap connect()
+        # so that once we close() this client, any queued/scheduled reconnect becomes a no-op.
+        self._closed = False
+        _orig_connect = self._mgr.connect
+
+        def _guarded_connect(*a, **k):
+            if self._closed:
+                return None            # client closed -> stop the reconnect loop dead
+            return _orig_connect(*a, **k)
+
+        self._mgr.connect = _guarded_connect
         try:
             # Bound the login handshake: a half-open TCP (e.g. the container was just
             # recreated on the same IP) must not block the caller indefinitely.
@@ -66,6 +82,11 @@ class AmiClient:
             raise
 
     async def close(self):
+        # Mark closed FIRST so any reconnect that panoramisk already scheduled
+        # (loop.call_later -> self.connect) turns into a no-op via the guard installed in
+        # connect(). Otherwise the Manager keeps dialing the (now stopped / re-secreted)
+        # engine forever, flooding its Asterisk with AMI auth failures.
+        self._closed = True
         if self._mgr:
             try:
                 self._mgr.close()
@@ -75,7 +96,7 @@ class AmiClient:
 
     @property
     def connected(self):
-        return self._connected and self._mgr is not None
+        return self._connected and self._mgr is not None and not self._closed
 
     async def registration_state(self) -> str:
         """Return 'Registered' | 'Rejected' | 'Unregistered' | 'unknown'."""
