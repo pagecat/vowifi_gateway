@@ -8,8 +8,40 @@ async function j(method, path, body) {
   const text = await r.text()
   let data
   try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text } }
-  if (!r.ok) throw Object.assign(new Error(data.detail || data.error || r.statusText), { status: r.status, data })
+  // detail may be a structured dict (e.g. {code, message}); prefer its message so
+  // alerts show readable text instead of "[object Object]".
+  const detailMsg = data.detail && typeof data.detail === 'object' ? data.detail.message : data.detail
+  if (!r.ok) throw Object.assign(new Error(detailMsg || data.error || r.statusText), { status: r.status, data })
   return data
+}
+
+/** Build query string. Prefer reader NAME (stable); index is optional fallback. */
+function readerQuery(readerOrIndex, maybeName) {
+  const q = new URLSearchParams()
+  if (typeof readerOrIndex === 'string' && readerOrIndex) {
+    q.set('reader', readerOrIndex)
+  } else if (typeof readerOrIndex === 'number') {
+    q.set('reader_index', String(readerOrIndex))
+    if (maybeName) q.set('reader', maybeName)
+  } else if (maybeName) {
+    q.set('reader', maybeName)
+  } else {
+    q.set('reader_index', '0')
+  }
+  return q
+}
+
+function readerBody(readerOrIndex, extra = {}) {
+  if (typeof readerOrIndex === 'string' && readerOrIndex) {
+    return { reader: readerOrIndex, ...extra }
+  }
+  if (typeof readerOrIndex === 'number') {
+    return { reader_index: readerOrIndex, ...extra }
+  }
+  if (readerOrIndex && typeof readerOrIndex === 'object') {
+    return { ...readerOrIndex, ...extra }
+  }
+  return { reader_index: 0, ...extra }
 }
 
 export const api = {
@@ -52,6 +84,77 @@ export const api = {
   hangup: (id) => j('POST', `/api/instances/${id}/hangup`),
   softphone: (id) => j('GET', `/api/instances/${id}/softphone`),
   sipinfo: (id) => j('GET', `/api/instances/${id}/sipinfo`),
+
+  // eSIM / LPA (lpac) — first arg is usually the PC/SC reader NAME (string).
+  // Optional se_id / aid target a specific Secure Element on dual-SE cards.
+  esimStatus: () => j('GET', '/api/esim/status'),
+  esimChip: (readerOrIndex, maybeName) => j('GET', `/api/esim/chip?${readerQuery(readerOrIndex, maybeName)}`),
+  esimProfiles: (readerOrIndex, maybeName) => j('GET', `/api/esim/profiles?${readerQuery(readerOrIndex, maybeName)}`),
+  esimEnable: (iccid, readerOrBody) => j(
+    'POST',
+    `/api/esim/profiles/${encodeURIComponent(iccid)}/enable`,
+    readerBody(readerOrBody),
+  ),
+  esimDisable: (iccid, readerOrBody) => j(
+    'POST',
+    `/api/esim/profiles/${encodeURIComponent(iccid)}/disable`,
+    readerBody(readerOrBody),
+  ),
+  esimDelete: (iccid, readerOrBody) => {
+    if (readerOrBody && typeof readerOrBody === 'object') {
+      const q = readerQuery(readerOrBody.reader ?? readerOrBody.reader_index)
+      if (readerOrBody.se_id || readerOrBody.seId) q.set('se_id', readerOrBody.se_id || readerOrBody.seId)
+      if (readerOrBody.aid) q.set('aid', readerOrBody.aid)
+      return j('DELETE', `/api/esim/profiles/${encodeURIComponent(iccid)}?${q}`)
+    }
+    return j(
+      'DELETE',
+      `/api/esim/profiles/${encodeURIComponent(iccid)}?${readerQuery(readerOrBody)}`,
+    )
+  },
+  esimNickname: (iccid, nickname, readerOrBody) => j(
+    'POST',
+    `/api/esim/profiles/${encodeURIComponent(iccid)}/nickname`,
+    readerBody(readerOrBody, { nickname }),
+  ),
+  esimDownload: (body) => j('POST', '/api/esim/download', body),
+  esimDownloadCancel: (readerOrBody) => j('POST', '/api/esim/download/cancel', readerBody(readerOrBody)),
+  esimDiscovery: (body) => j('POST', '/api/esim/discovery', body || {}),
+  esimNotifications: (readerOrIndex, maybeName) => j(
+    'GET',
+    `/api/esim/notifications?${readerQuery(readerOrIndex, maybeName)}`,
+  ),
+  // Aliases used by Esim.jsx
+  esimProcessNotifications: (readerOrIndex, seq) => j(
+    'POST',
+    '/api/esim/notifications/process',
+    readerBody(readerOrIndex, seq == null ? {} : { seq }),
+  ),
+  esimNotificationsProcess: (body) => j('POST', '/api/esim/notifications/process', body || {}),
+  esimRemoveNotification: (seq, readerOrBody) => {
+    if (readerOrBody && typeof readerOrBody === 'object') {
+      const q = readerQuery(readerOrBody.reader ?? readerOrBody.reader_index)
+      if (readerOrBody.se_id || readerOrBody.seId) q.set('se_id', readerOrBody.se_id || readerOrBody.seId)
+      if (readerOrBody.aid) q.set('aid', readerOrBody.aid)
+      return j('DELETE', `/api/esim/notifications/${seq}?${q}`)
+    }
+    return j(
+      'DELETE',
+      `/api/esim/notifications/${seq}?${readerQuery(readerOrBody)}`,
+    )
+  },
+  esimNotificationRemove: (seq, readerOrBody) => {
+    if (readerOrBody && typeof readerOrBody === 'object') {
+      const q = readerQuery(readerOrBody.reader ?? readerOrBody.reader_index)
+      if (readerOrBody.se_id || readerOrBody.seId) q.set('se_id', readerOrBody.se_id || readerOrBody.seId)
+      if (readerOrBody.aid) q.set('aid', readerOrBody.aid)
+      return j('DELETE', `/api/esim/notifications/${seq}?${q}`)
+    }
+    return j(
+      'DELETE',
+      `/api/esim/notifications/${seq}?${readerQuery(readerOrBody)}`,
+    )
+  },
 }
 
 export function connectWs(onMsg) {

@@ -21,6 +21,7 @@
 # Usage:
 #   sudo ./install.sh install [--mode local|docker]   # full install (default mode: local)
 #   sudo ./install.sh reload  [--mode local|docker] [--no-cache] [--engines]
+#   sudo ./install.sh build-lpac [--lpac-src PATH] [--dest DIR]   # local eSIM LPA (lpac)
 #   sudo ./install.sh enable-autostart | disable-autostart
 #   sudo ./install.sh uninstall [--purge]             # --purge also deletes ./data (+ venv)
 #   ./install.sh status | logs
@@ -35,6 +36,8 @@
 #   VOWIFI_ADVERTISE_ADDR  host LAN IP for SIP/WebRTC media           (default: auto-detect)
 #   VOWIFI_BIND            control bind addr                          (default 0.0.0.0)
 #   PCSC_VERSION           pinned pcsc-lite version                   (default 2.3.3)
+#   LPAC_SRC               optional path to lpac source (for build-lpac)
+#   CMAKE_FETCH_VER        Kitware cmake version if system is too old (default 3.31.12)
 set -eu
 
 # ------------------------------------------------------------------ paths & config
@@ -679,6 +682,176 @@ cmd_patchall() {
   ensure_ccid_host all 01_hsic_slot_status.patch 02_hsic_malformed_atr.patch
 }
 
+cmd_build_lpac() {
+  # Compile lpac (PC/SC + curl, STANDALONE) into $VOWIFI_DATA_DIR/lpac for the eSIM UI.
+  # Local-mode only — docker control plane is out of scope for this integration.
+  #
+  # lpac STANDALONE uses cmake_policy(CMP0177) which needs CMake >= 3.31.
+  # Ubuntu 22.04 / Armbian ship 3.22 — we fetch a Kitware binary toolchain into
+  # $VOWIFI_DATA_DIR/tools/cmake when needed.
+  need_root
+  LPAC_SRC="${LPAC_SRC:-}"
+  DEST=""
+  CMAKE_MIN=3.31
+  CMAKE_FETCH_VER="${CMAKE_FETCH_VER:-3.31.12}"
+  # shellcheck disable=SC2086
+  set -- $ARGS
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lpac-src)
+        [ $# -ge 2 ] || die "--lpac-src requires a path"
+        LPAC_SRC="$2"; shift 2 ;;
+      --dest)
+        [ $# -ge 2 ] || die "--dest requires a path"
+        DEST="$2"; shift 2 ;;
+      *) die "unknown build-lpac arg: $1 (supported: --lpac-src PATH, --dest DIR)" ;;
+    esac
+  done
+  DEST="${DEST:-$VOWIFI_DATA_DIR/lpac}"
+
+  if [ -z "$LPAC_SRC" ]; then
+    if [ -d "$REPO_DIR/../lpac" ]; then
+      LPAC_SRC=$(CDPATH= cd -- "$REPO_DIR/../lpac" && pwd -P)
+    elif [ -d "$REPO_DIR/lpac" ]; then
+      LPAC_SRC=$(CDPATH= cd -- "$REPO_DIR/lpac" && pwd -P)
+    else
+      err "lpac source not found (looked for ../lpac and ./lpac)."
+      err "Clone it next to this repo, then re-run:"
+      printf '\n  git clone https://github.com/estkme-group/lpac.git ../lpac\n' >&2
+      printf '  sudo %s build-lpac\n\n' "$0" >&2
+      err "Or point at an existing tree: sudo $0 build-lpac --lpac-src /path/to/lpac"
+      exit 1
+    fi
+  fi
+  [ -f "$LPAC_SRC/CMakeLists.txt" ] || die "not an lpac source tree: $LPAC_SRC"
+
+  cmake_version_ok() {
+    ver=$("$1" --version 2>/dev/null | head -1 | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+    [ -n "$ver" ] || return 1
+    major=${ver%%.*}
+    minor=${ver#*.}; minor=${minor%%.*}
+    need_major=${CMAKE_MIN%%.*}
+    need_minor=${CMAKE_MIN#*.}; need_minor=${need_minor%%.*}
+    if [ "$major" -gt "$need_major" ] 2>/dev/null; then return 0; fi
+    if [ "$major" -eq "$need_major" ] && [ "$minor" -ge "$need_minor" ] 2>/dev/null; then return 0; fi
+    return 1
+  }
+
+  ensure_cmake() {
+    if have cmake && cmake_version_ok "$(command -v cmake)"; then
+      CMAKE_BIN=$(command -v cmake)
+      info "using system cmake $($CMAKE_BIN --version | head -1)"
+      return 0
+    fi
+    TOOLS="$VOWIFI_DATA_DIR/tools"
+    CMAKE_HOME="$TOOLS/cmake-$CMAKE_FETCH_VER"
+    CMAKE_BIN="$CMAKE_HOME/bin/cmake"
+    if [ -x "$CMAKE_BIN" ] && cmake_version_ok "$CMAKE_BIN"; then
+      info "using cached Kitware cmake at $CMAKE_BIN"
+      export PATH="$CMAKE_HOME/bin:$PATH"
+      return 0
+    fi
+    arch=$(uname -m)
+    case "$arch" in
+      x86_64|amd64)  cmake_arch=x86_64 ;;
+      aarch64|arm64) cmake_arch=aarch64 ;;
+      *) die "no Kitware cmake binary for arch=$arch; install cmake >= $CMAKE_MIN manually" ;;
+    esac
+    url="https://github.com/Kitware/CMake/releases/download/v${CMAKE_FETCH_VER}/cmake-${CMAKE_FETCH_VER}-linux-${cmake_arch}.tar.gz"
+    info "system cmake too old (need >= $CMAKE_MIN); fetching Kitware $CMAKE_FETCH_VER ($cmake_arch)"
+    mkdir -p "$TOOLS"
+    tmp=$(mktemp -d)
+    if have curl; then
+      curl -fsSL "$url" -o "$tmp/cmake.tgz"
+    elif have wget; then
+      wget -qO "$tmp/cmake.tgz" "$url"
+    else
+      pkg_install curl ca-certificates
+      curl -fsSL "$url" -o "$tmp/cmake.tgz"
+    fi
+    tar -xzf "$tmp/cmake.tgz" -C "$tmp"
+    rm -rf "$CMAKE_HOME"
+    mv "$tmp/cmake-${CMAKE_FETCH_VER}-linux-${cmake_arch}" "$CMAKE_HOME"
+    rm -rf "$tmp"
+    export PATH="$CMAKE_HOME/bin:$PATH"
+    CMAKE_BIN="$CMAKE_HOME/bin/cmake"
+    info "installed $("$CMAKE_BIN" --version | head -1) -> $CMAKE_HOME"
+  }
+
+  info "building lpac into $DEST (src: $LPAC_SRC)"
+  info "ensuring build dependencies"
+  if have apt-get; then
+    pkg_install build-essential pkg-config libpcsclite-dev libcurl4-openssl-dev git ca-certificates curl
+  elif have dnf || have yum; then
+    pkg_install gcc make pkgconfig pcsc-lite-devel libcurl-devel git curl
+  elif have zypper; then
+    pkg_install gcc make pkg-config pcsc-lite-devel libcurl-devel git curl
+  elif have pacman; then
+    pkg_install gcc make pkgconf pcsclite curl git
+  else
+    have gcc || die "missing gcc"
+    have pkg-config || die "missing pkg-config"
+  fi
+
+  ensure_cmake
+
+  BUILD_DIR="$LPAC_SRC/build-vowifi"
+  STAGE_DIR=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap 'rm -rf "$STAGE_DIR"' EXIT
+
+  info "configuring lpac (STANDALONE, PCSC+curl) in $BUILD_DIR"
+  rm -rf "$BUILD_DIR"
+  "$CMAKE_BIN" -S "$LPAC_SRC" -B "$BUILD_DIR" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DSTANDALONE_MODE=ON \
+    -DLPAC_WITH_APDU_PCSC=ON \
+    -DLPAC_WITH_HTTP_CURL=ON \
+    -DLPAC_WITH_APDU_AT=OFF \
+    -DLPAC_WITH_APDU_QMI=OFF \
+    -DLPAC_WITH_APDU_QMI_QRTR=OFF \
+    -DLPAC_WITH_APDU_UQMI=OFF \
+    -DLPAC_WITH_APDU_MBIM=OFF \
+    -DLPAC_WITH_APDU_GBINDER=OFF
+
+  info "building"
+  "$CMAKE_BIN" --build "$BUILD_DIR" --parallel "$(nproc 2>/dev/null || echo 2)"
+
+  info "installing to staging"
+  DESTDIR="$STAGE_DIR" "$CMAKE_BIN" --install "$BUILD_DIR"
+
+  SRC_BIN="$STAGE_DIR/executables"
+  if [ ! -x "$SRC_BIN/lpac" ]; then
+    if [ -x "$STAGE_DIR/usr/executables/lpac" ]; then
+      SRC_BIN="$STAGE_DIR/usr/executables"
+    else
+      find "$STAGE_DIR" -type f -name lpac 2>/dev/null || true
+      die "lpac binary not found after install under $STAGE_DIR"
+    fi
+  fi
+
+  info "deploying to $DEST"
+  mkdir -p "$(dirname -- "$DEST")"
+  rm -rf "$DEST.tmp"
+  mkdir -p "$DEST.tmp"
+  cp -a "$SRC_BIN/lpac" "$DEST.tmp/lpac"
+  [ -d "$SRC_BIN/lib" ] && cp -a "$SRC_BIN/lib" "$DEST.tmp/lib"
+  [ -d "$SRC_BIN/driver" ] && cp -a "$SRC_BIN/driver" "$DEST.tmp/driver"
+  chmod +x "$DEST.tmp/lpac"
+  rm -rf "$DEST"
+  mv "$DEST.tmp" "$DEST"
+
+  info "self-check: lpac driver apdu list"
+  if ! "$DEST/lpac" driver apdu list >/dev/null; then
+    warn "lpac driver apdu list failed (pcscd may be down); binary is installed at $DEST/lpac"
+  else
+    "$DEST/lpac" version || true
+    info "OK: $DEST/lpac"
+  fi
+  trap - EXIT
+  rm -rf "$STAGE_DIR"
+}
+
 cmd_logs() {
   resolve_mode
   # `|| true` so that Ctrl-C'ing out of a follow (non-zero exit) doesn't abort the caller —
@@ -759,6 +932,7 @@ ${B}VoWiFi→SIP gateway installer${N}
   $0 uninstall [--purge]  remove vowifi containers/images/service (--purge also deletes data+venv)
   $0 status               show mode + component status
   $0 logs                 follow control-plane logs
+  $0 build-lpac [--lpac-src PATH] [--dest DIR]   compile lpac into data/lpac (local eSIM LPA)
   $0 patch                build + install the CCID driver with the base HSIC fix (01) — opt-in,
                           for the HSIC 1d99:0016 reader (safe for every card, incl. physical eSIM)
   $0 patch2               add only the ATR-compatibility fix (02) for non-compliant (U)SIM ATRs
@@ -810,6 +984,7 @@ case "$CMD" in
   uninstall)          cmd_uninstall ;;
   status)             cmd_status ;;
   logs)               cmd_logs ;;
+  build-lpac)         cmd_build_lpac ;;
   patch)              cmd_patch ;;
   patch2)             cmd_patch2 ;;
   patchall)           cmd_patchall ;;
