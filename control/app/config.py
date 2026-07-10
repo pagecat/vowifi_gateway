@@ -51,9 +51,21 @@ DEFAULTS = {
             "chat_id": "",
             "events": {"incoming_sms": True, "incoming_call": True},
         },
+        # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
+        # $VOWIFI_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
+        "esim": {
+            "lpac_bin": "",
+            "download_timeout": 300,
+            "auto_process_notifications": True,
+        },
     },
     "instances": {},
 }
+
+
+def default_lpac_bin() -> str:
+    """Default path for the locally-built STANDALONE lpac binary."""
+    return os.path.join(DATA_DIR, "lpac", "lpac")
 
 # Port block allocation per instance index (avoids collisions across SIMs)
 PORT_BASE = {"sip_udp": 5060, "sip_tls": 5061, "webrtc": 8089, "ami": 5038,
@@ -130,8 +142,18 @@ def load() -> dict:
             merged["events"] = {**DEFAULTS["settings"][key]["events"],
                                 **(saved.get("events", {}) or {})}
             out["settings"][key] = merged
+        esim_saved = data.get("settings", {}).get("esim", {}) or {}
+        out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
         out["instances"] = data.get("instances", {})
         return out
+
+
+def esim_settings() -> dict:
+    """Resolved eSIM/lpac settings (fills empty lpac_bin with the default path)."""
+    s = dict(get_settings().get("esim") or {})
+    if not (s.get("lpac_bin") or "").strip():
+        s["lpac_bin"] = default_lpac_bin()
+    return s
 
 
 def save(data: dict):
@@ -295,7 +317,11 @@ def upsert_instance(inst: dict) -> dict:
     # one (checks other instances AND live host listeners, stepping forward on collision).
     if "ports" not in inst:
         inst["ports"] = existing.get("ports") or alloc_ports_auto(data, exclude_iid=iid)
-    if "ami_secret" not in inst:
+    # Treat an empty/missing ami_secret the same: a WebUI save that carries a blank
+    # secret must never overwrite the real one (control would then log in to the
+    # engine's Asterisk with the wrong credential forever).
+    if not inst.get("ami_secret"):
+        inst.pop("ami_secret", None)
         inst["ami_secret"] = existing.get("ami_secret") or secrets.token_urlsafe(16)
     # The SIM PIN is a locally-saved credential tied to this IMSI/ICCID; it is used on
     # every engine start. A config edit that doesn't carry a (new, non-empty) PIN must NOT

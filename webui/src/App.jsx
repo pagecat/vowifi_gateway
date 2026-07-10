@@ -6,6 +6,7 @@ import Messages from './views/Messages.jsx'
 import SimConfig from './views/SimConfig.jsx'
 import Settings from './views/Settings.jsx'
 import Logs from './views/Logs.jsx'
+import Esim from './views/Esim.jsx'
 
 // [key, label, icon, alwaysAvailable] — views not marked alwaysAvailable are disabled
 // while no PC/SC reader is connected (they all operate on a physical SIM line).
@@ -14,6 +15,7 @@ const NAV = [
   ['softphone', 'Softphone', '☎', false],
   ['messages', 'Messages', '✉', false],
   ['sims', 'SIM Config', '▣', false],
+  ['esim', 'eSIM', '◎', false],
   ['settings', 'Settings', '⚙', true],
   ['logs', 'Logs', '≣', true],
 ]
@@ -98,7 +100,7 @@ export default function App() {
 
   const sel = instances.find((i) => i.id === selected)
 
-  const View = { dashboard: Dashboard, softphone: Softphone, messages: Messages, sims: SimConfig, settings: Settings, logs: Logs }[view]
+  const View = { dashboard: Dashboard, softphone: Softphone, messages: Messages, sims: SimConfig, esim: Esim, settings: Settings, logs: Logs }[view]
 
   return (
     <div style={{ display: 'flex', height: '100%' }}>

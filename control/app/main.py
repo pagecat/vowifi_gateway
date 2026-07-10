@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
-from . import store, engine, status as status_mod, sim, card, notify_push, usbreader
+from . import store, engine, status as status_mod, sim, card, notify_push, lpa, estkme, usbreader
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -45,12 +45,23 @@ class Hub:
         self._msisdn_tries: dict[str, int] = {}
         self.health: dict[str, dict] = {}    # per-instance retry/health tracking
         self._pushed_calls: set[int] = set() # call-record ids already push-notified (dedupe)
+        # Per-reader serialization for PC/SC APDU access (sim.read_card / PIN / lpac).
+        # lpac opens SCARD_SHARE_EXCLUSIVE; concurrent connect/APDU on the same reader
+        # fails with sharing violations or corrupts eUICC sessions.
+        self.reader_locks: dict[str, asyncio.Lock] = {}
+        self.lpa_busy: dict[str, bool] = {}  # readers currently owned by an LPA op
+        self.lpa_downloads: dict[str, dict] = {}  # reader_name -> active download handle
 
     def cards_list(self) -> list[dict]:
         """Reader/card entries sorted by current PC/SC index (the UI display order)."""
         return sorted(self.cards.values(),
                       key=lambda c: (c.get("index") is None, c.get("index") or 0,
                                      c.get("name") or ""))
+
+    def reader_lock(self, name: str) -> asyncio.Lock:
+        if name not in self.reader_locks:
+            self.reader_locks[name] = asyncio.Lock()
+        return self.reader_locks[name]
 
     def health_for(self, iid: str) -> dict:
         return self.health.setdefault(str(iid), {
@@ -73,7 +84,6 @@ class Hub:
         c = self.ami.pop(str(iid), None)
         if c:
             await c.close()
-
 
     async def broadcast(self, msg: dict):
         dead = []
@@ -161,17 +171,38 @@ async def _on_card_insert(name, idx):
     # while the engine kept running) — probing it could clash with the engine's card
     # access. Always map the reader to the running instance whose pin_keeper reports
     # using THIS reader name first, and only probe when no running engine claims it.
+    # Also skip probing while an LPA (lpac) operation holds the reader exclusively —
+    # profile enable/disable triggers eUICC REFRESH that looks like remove+insert.
     inst = await asyncio.to_thread(_find_running_by_reader, name)
     if inst is not None:
         info.update(iccid=inst.get("iccid"), imsi=inst.get("imsi"), matched=inst["id"],
                     smsc=inst.get("smsc"))
+    elif hub.lpa_busy.get(name):
+        prev = hub.cards.get(name) or {}
+        info.update(iccid=prev.get("iccid"), imsi=prev.get("imsi"),
+                    matched=prev.get("matched"), smsc=prev.get("smsc"),
+                    mcc=prev.get("mcc"), mnc=prev.get("mnc"),
+                    pin_enabled=prev.get("pin_enabled"), pin_tries=prev.get("pin_tries"))
+        log.info("card insert during LPA busy — skipping probe reader=%s", name)
     else:
+        lock = hub.reader_lock(name)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=0.05)
+        except asyncio.TimeoutError:
+            prev = hub.cards.get(name) or {}
+            info.update(iccid=prev.get("iccid"), imsi=prev.get("imsi"),
+                        matched=prev.get("matched"), smsc=prev.get("smsc"))
+            hub.cards[name] = info
+            log.debug("card probe skipped — reader lock busy: %s", name)
+            return
         try:
             c = await asyncio.to_thread(sim.read_card, idx)
             info.update(iccid=c.iccid, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
                         imsi=c.imsi, mcc=c.mcc, mnc=c.mnc, smsc=c.smsc)
         except Exception as e:  # noqa
             log.debug("card probe failed: %r", e)
+        finally:
+            lock.release()
         inst = _match_instance_by_iccid(info["iccid"])
         if inst:
             info["matched"] = inst["id"]
@@ -214,9 +245,7 @@ async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
     if target and await asyncio.to_thread(engine.is_running, str(target["id"])):
         # Stop the SIP server + docker container on card/reader removal.
         await asyncio.to_thread(engine.stop, str(target["id"]))
-        c = hub.ami.pop(str(target["id"]), None)
-        if c:
-            await c.close()
+        await hub.drop_ami(str(target["id"]))
         await hub.broadcast({"type": "engine", "instance": target["id"],
                              "event": "reader_lost" if reader_unplugged else "card_removed",
                              "args": [name]})
@@ -263,6 +292,18 @@ async def card_monitor():
 
             for name, st in current.items():
                 entry = hub.cards.get(name)
+                # LPA holds the reader exclusively and enable/disable triggers REFRESH
+                # (looks like remove+insert). Keep last-known state; skip insert/remove.
+                if hub.lpa_busy.get(name):
+                    if entry is None:
+                        hub.cards[name] = {**st, "iccid": None, "matched": None,
+                                           "imsi": None, "pin_enabled": None,
+                                           "pin_tries": None}
+                        changed = True
+                    elif entry.get("index") != st["index"]:
+                        entry["index"] = st["index"]
+                        changed = True
+                    continue
                 if entry is None:
                     # reader newly plugged in (or first scan after manager start)
                     if not first:
@@ -288,6 +329,12 @@ async def card_monitor():
                         pass
                     changed = True
                 if bool(entry.get("present")) != st["present"]:
+                    # eUICC REFRESH during LPA looks like remove+insert — keep last-known
+                    # state and do not stop engines / probe until the LPA op finishes.
+                    if hub.lpa_busy.get(name):
+                        entry["present"] = st["present"]
+                        changed = True
+                        continue
                     if st["present"]:
                         await _on_card_insert(name, st["index"])
                     else:
@@ -408,9 +455,7 @@ def apply_health(iid, inst, st):
             engine.stop(iid)
         except Exception:
             pass
-        c = hub.ami.pop(str(iid), None)
-        if c:
-            asyncio.create_task(c.close())
+        asyncio.create_task(hub.drop_ami(str(iid)))
         return _frozen(h, st, rmax)
     st["retry"] = {"count": count, "max": rmax}
     return st
@@ -441,8 +486,13 @@ def api_readers():
 
 
 @app.get("/api/sim/detect")
-def api_sim_detect(reader_index: int = 0):
-    return sim.read_card(reader_index).dict()
+async def api_sim_detect(reader_index: int = 0):
+    rlist = await asyncio.to_thread(sim.list_readers)
+    if reader_index < 0 or reader_index >= len(rlist):
+        raise HTTPException(400, "reader index out of range")
+    name = rlist[reader_index]
+    async with hub.reader_lock(name):
+        return await asyncio.to_thread(lambda: sim.read_card(reader_index).dict())
 
 
 def _resolve_reader_index(body: dict) -> int:
@@ -463,38 +513,50 @@ def _resolve_reader_index(body: dict) -> int:
 @app.post("/api/sim/verify-pin")
 async def api_verify_pin(body: dict):
     idx = await asyncio.to_thread(_resolve_reader_index, body)
-    res = await asyncio.to_thread(sim.verify_pin, body["pin"], idx)
-    if res.get("ok"):
-        # PIN now satisfied — re-read the (previously locked) IMSI + SMSC and refresh the
-        # detected-card entry so the dashboard can move from "locked" to "ready to provision".
-        try:
-            c = await asyncio.to_thread(sim.read_card, idx, body["pin"])
-            # Key strictly by the reader NAME the read actually used — an index-keyed
-            # lookup could merge this card's identity into a stale entry of a reader
-            # that was just unplugged.
-            card_entry = hub.cards.get(c.reader) or {"index": idx, "name": c.reader,
-                                                     "present": True}
-            card_entry.update(present=True, iccid=c.iccid, imsi=c.imsi, mcc=c.mcc,
-                              mnc=c.mnc, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
-                              smsc=c.smsc)
-            inst = _match_instance_by_iccid(c.iccid)
-            card_entry["matched"] = inst["id"] if inst else None
-            hub.cards[c.reader] = card_entry
-            res["card"] = card_entry
-            await hub.broadcast({"type": "cards", "cards": hub.cards_list()})
-        except Exception as e:  # noqa
-            log.debug("post-verify re-read failed: %r", e)
+    rlist = await asyncio.to_thread(sim.list_readers)
+    name = rlist[idx] if 0 <= idx < len(rlist) else ""
+    async with hub.reader_lock(name or f"idx:{idx}"):
+        res = await asyncio.to_thread(sim.verify_pin, body["pin"], idx)
+        if res.get("ok"):
+            # PIN now satisfied — re-read the (previously locked) IMSI + SMSC and refresh the
+            # detected-card entry so the dashboard can move from "locked" to "ready to provision".
+            try:
+                c = await asyncio.to_thread(sim.read_card, idx, body["pin"])
+                # Key strictly by the reader NAME the read actually used — an index-keyed
+                # lookup could merge this card's identity into a stale entry of a reader
+                # that was just unplugged.
+                card_entry = hub.cards.get(c.reader) or {"index": idx, "name": c.reader,
+                                                         "present": True}
+                card_entry.update(present=True, iccid=c.iccid, imsi=c.imsi, mcc=c.mcc,
+                                  mnc=c.mnc, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
+                                  smsc=c.smsc)
+                inst = _match_instance_by_iccid(c.iccid)
+                card_entry["matched"] = inst["id"] if inst else None
+                hub.cards[c.reader] = card_entry
+                res["card"] = card_entry
+                await hub.broadcast({"type": "cards", "cards": hub.cards_list()})
+            except Exception as e:  # noqa
+                log.debug("post-verify re-read failed: %r", e)
     return res
 
 
 @app.post("/api/sim/change-pin")
 async def api_change_pin(body: dict):
-    return sim.change_pin(body["old"], body["new"], body.get("reader_index", 0))
+    idx = await asyncio.to_thread(_resolve_reader_index, body)
+    rlist = await asyncio.to_thread(sim.list_readers)
+    name = rlist[idx] if 0 <= idx < len(rlist) else f"idx:{idx}"
+    async with hub.reader_lock(name):
+        return await asyncio.to_thread(sim.change_pin, body["old"], body["new"], idx)
 
 
 @app.post("/api/sim/pin-enabled")
 async def api_pin_enabled(body: dict):
-    return sim.set_pin_enabled(body["pin"], bool(body["enabled"]), body.get("reader_index", 0))
+    idx = await asyncio.to_thread(_resolve_reader_index, body)
+    rlist = await asyncio.to_thread(sim.list_readers)
+    name = rlist[idx] if 0 <= idx < len(rlist) else f"idx:{idx}"
+    async with hub.reader_lock(name):
+        return await asyncio.to_thread(
+            sim.set_pin_enabled, body["pin"], bool(body["enabled"]), idx)
 
 
 def _refresh_card_matches():
@@ -505,6 +567,100 @@ def _refresh_card_matches():
         if c.get("present") and c.get("iccid"):
             inst = _match_instance_by_iccid(c.get("iccid"))
             c["matched"] = inst["id"] if inst else None
+
+
+
+def _esim_resolve_reader(reader_index: int | None = None, reader: str | None = None) -> tuple[str, int]:
+    """Resolve (reader_name, index) for eSIM APIs. Prefer NAME when provided."""
+    rlist = sim.list_readers()
+    if not rlist:
+        raise HTTPException(409, "no PC/SC readers connected")
+    if reader:
+        if reader not in rlist:
+            raise HTTPException(409, f"reader '{reader}' is no longer connected")
+        return reader, rlist.index(reader)
+    idx = 0 if reader_index is None else int(reader_index)
+    if idx < 0 or idx >= len(rlist):
+        raise HTTPException(400, "reader index out of range")
+    return rlist[idx], idx
+
+
+def _esim_imei_for_reader(name: str, override: str | None = None) -> str:
+    if override and str(override).strip():
+        return str(override).strip()
+    entry = hub.cards.get(name) or {}
+    matched = entry.get("matched")
+    if matched:
+        inst = cfg.get_instance(matched)
+        if inst and inst.get("imei"):
+            return str(inst["imei"])
+    return ""
+
+
+def _esim_resolve_se(
+    name: str,
+    idx: int,
+    se_id: str | None = None,
+    aid: str | None = None,
+    *,
+    require: bool = False,
+) -> dict:
+    """Resolve which ISD-R / SE to target. Dual-SE cards need se_id or aid when require=True."""
+    ses = estkme.discover_ses(name, idx)
+    try:
+        if require and len(ses) > 1 and not (se_id or aid):
+            raise KeyError("eUICC SE is required for dual-SE cards")
+        return estkme.resolve_se(ses, se_id=se_id, aid=aid)
+    except KeyError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+def _esim_guard_engine(name: str):
+    """Refuse LPA while a VoWiFi engine holds the card (lpac needs exclusive PC/SC)."""
+    inst = _find_running_by_reader(name)
+    if inst is not None:
+        raise HTTPException(
+            409,
+            f"Line {inst.get('id')} is running on this reader — stop it before eSIM operations",
+        )
+
+
+async def _esim_refresh_card(name: str, idx: int):
+    """Re-probe USIM identity after profile enable/disable/download and broadcast."""
+    info = hub.cards.get(name) or {"index": idx, "name": name, "present": True}
+    try:
+        c = await asyncio.to_thread(sim.read_card, idx)
+        info.update(
+            present=True, index=idx, name=name,
+            iccid=c.iccid, imsi=c.imsi, mcc=c.mcc, mnc=c.mnc,
+            pin_enabled=c.pin_enabled, pin_tries=c.pin_tries, smsc=c.smsc,
+        )
+        inst = _match_instance_by_iccid(c.iccid)
+        info["matched"] = inst["id"] if inst else None
+    except Exception as e:  # noqa
+        log.debug("post-LPA card refresh failed: %r", e)
+        info.update(index=idx, name=name, present=True)
+    hub.cards[name] = info
+    await hub.broadcast({"type": "cards", "cards": hub.cards_list()})
+    return info
+
+
+async def _esim_run(name: str, idx: int, coro, *, refresh: bool = False):
+    """Serialize an LPA call: engine gate + per-reader lock + lpa_busy + optional refresh."""
+    await asyncio.to_thread(_esim_guard_engine, name)
+    async with hub.reader_lock(name):
+        hub.lpa_busy[name] = True
+        try:
+            result = await coro
+            if refresh:
+                await _esim_refresh_card(name, idx)
+            return result
+        except lpa.LpaError as e:
+            raise HTTPException(400, e.user_message()) from e
+        except FileNotFoundError as e:
+            raise HTTPException(503, str(e)) from e
+        finally:
+            hub.lpa_busy.pop(name, None)
 
 
 @app.get("/api/cards")
@@ -580,7 +736,81 @@ def _reader_port_for_instance(inst: dict) -> str | None:
     return None
 
 
-def _preflight_pin(inst: dict) -> dict:
+def _card_identity_mismatch(inst: dict) -> dict | None:
+    """Detect that the reader this line uses now holds a DIFFERENT SIM identity — the
+    signature of an eSIM profile switch (enable/disable/download changes the eUICC's
+    active profile, so the same physical reader re-enumerates with a new ICCID/IMSI).
+
+    Starting the line anyway is what used to break things: the engine grabs whatever
+    card is in the reader, runs EAP-AKA with the OLD line's IMSI against the NEW
+    profile's keys, the carrier rejects it (tunnel_sim_auth), and the bounded retry
+    loop stops the container. Refuse the start up-front with a structured error
+    instead. Only a positive, known conflict blocks — absent readers/unknown ICCIDs
+    keep the existing fail-open behavior (engine start surfaces NO_CARD as before)."""
+    want = (inst.get("iccid") or "").strip()
+    if not want:
+        return None
+    if _reader_index_for_instance(inst) is not None:
+        return None      # this line's SIM/profile is present somewhere — all good
+    # Prefer the stable USB port binding when present; fall back to stored index.
+    port = (inst.get("reader_port") or "").strip()
+    idx = inst.get("reader_index")
+    for c in hub.cards.values():
+        if not c.get("present"):
+            continue
+        if port and c.get("reader_port") == port:
+            pass
+        elif not port and c.get("index") == idx:
+            pass
+        else:
+            continue
+        got = (c.get("iccid") or "").strip()
+        if got and got != want:
+            return {"reader": c.get("name") or (f"USB {port}" if port else f"reader {idx}"),
+                    "iccid": got}
+    return None
+
+
+def _raise_card_mismatch(inst: dict, mism: dict):
+    raise HTTPException(409, {
+        "code": "card_mismatch",
+        "reader": mism["reader"],
+        "card_iccid": mism["iccid"],
+        "line_iccid": inst.get("iccid") or "",
+        "message": (f"The card in {mism['reader']} now has a different identity "
+                    f"(ICCID {mism['iccid']}; this line expects {inst.get('iccid')}). "
+                    "This usually means the eSIM profile was switched. Provision the "
+                    "active profile as its own line, or switch the eSIM back to this "
+                    "profile, then start again."),
+    })
+
+
+def _preflight_pin_locked(inst: dict, idx: int) -> dict:
+    """PIN preflight body — caller must already hold the reader asyncio.Lock.
+    Sync so it can run under asyncio.to_thread (PC/SC is blocking)."""
+    try:
+        probe = sim.read_card(idx)          # no VERIFY: learns pin_enabled + presence
+    except Exception as e:  # noqa
+        log.debug("preflight probe failed: %r", e)
+        return {"ok": True, "need_pin": bool(inst.get("pin"))}
+    if not probe.present:
+        return {"ok": False, "code": "no_card"}
+    if probe.pin_enabled is False:
+        return {"ok": True, "need_pin": False}
+    saved = inst.get("pin")
+    if not saved:
+        return {"ok": False, "code": "pin_required", "tries": probe.pin_tries}
+    try:
+        chk = sim.read_card(idx, saved)
+    except Exception as e:  # noqa
+        log.debug("preflight verify failed: %r", e)
+        return {"ok": True, "need_pin": True}     # couldn't verify now; let the engine try
+    if chk.error and "PIN" in (chk.error or "").upper():
+        return {"ok": False, "code": "pin_invalid", "clear": True, "tries": chk.pin_tries}
+    return {"ok": True, "need_pin": True}
+
+
+async def _preflight_pin(inst: dict) -> dict:
     """Actively check the SIM's PIN state BEFORE starting the engine (so we never spin up
     the SWu tunnel/IMS against a locked card). Reads the physical card:
       - card absent                         -> {ok:False, code:'no_card'}
@@ -596,29 +826,21 @@ def _preflight_pin(inst: dict) -> dict:
         # Card not seen by the monitor — could be held by a running engine, or truly gone.
         # Don't block here; engine start + status FSM will surface NO_CARD if it's absent.
         return {"ok": True, "need_pin": bool(inst.get("pin"))}
-    try:
-        probe = sim.read_card(idx)          # no VERIFY: learns pin_enabled + presence
-    except Exception as e:  # noqa
-        log.debug("preflight probe failed: %r", e)
+    # Skip while LPA owns the reader (exclusive PC/SC) — let the engine try later.
+    rlist = await asyncio.to_thread(sim.list_readers)
+    rname = rlist[idx] if 0 <= idx < len(rlist) else None
+    if rname and hub.lpa_busy.get(rname):
         return {"ok": True, "need_pin": bool(inst.get("pin"))}
-    if not probe.present:
-        return {"ok": False, "code": "no_card"}
-    if probe.pin_enabled is False:
-        return {"ok": True, "need_pin": False}
-    # PIN is (or may be) required.
-    saved = inst.get("pin")
-    if not saved:
-        return {"ok": False, "code": "pin_required",
-                "tries": probe.pin_tries}
-    # Verify the saved PIN actually works (single connection: read_card VERIFYs then reads).
+    lock = hub.reader_lock(rname or f"idx:{idx}")
+    # asyncio.Lock has no blocking=False; try a short acquire, fail-open if busy.
     try:
-        chk = sim.read_card(idx, saved)
-    except Exception as e:  # noqa
-        log.debug("preflight verify failed: %r", e)
-        return {"ok": True, "need_pin": True}     # couldn't verify now; let the engine try
-    if chk.error and "PIN" in (chk.error or "").upper():
-        return {"ok": False, "code": "pin_invalid", "clear": True, "tries": chk.pin_tries}
-    return {"ok": True, "need_pin": True}
+        await asyncio.wait_for(lock.acquire(), timeout=0.05)
+    except asyncio.TimeoutError:
+        return {"ok": True, "need_pin": bool(inst.get("pin"))}
+    try:
+        return await asyncio.to_thread(_preflight_pin_locked, inst, idx)
+    finally:
+        lock.release()
 
 
 @app.post("/api/provision")
@@ -629,7 +851,10 @@ async def api_provision(body: dict):
     (int, when manual), apn (default 'ims'), idr_mode ('apn'|'fqdn', default 'apn')."""
     idx = await asyncio.to_thread(_resolve_reader_index, body)
     pin = body.get("pin", "")
-    c = await asyncio.to_thread(sim.read_card, idx, pin or None)
+    rlist = await asyncio.to_thread(sim.list_readers)
+    rname = rlist[idx] if 0 <= idx < len(rlist) else body.get("reader") or f"idx:{idx}"
+    async with hub.reader_lock(rname):
+        c = await asyncio.to_thread(sim.read_card, idx, pin or None)
     if c.error and "PIN" in (c.error or "").upper():
         raise HTTPException(400, f"PIN error: {c.error} ({c.pin_tries} tries left)")
     if not c.imsi:
@@ -691,6 +916,9 @@ async def api_provision(body: dict):
     inst = cfg.upsert_instance(inst)
     hub._msisdn_tries.pop(str(inst["id"]), None)
     hub.reset_health(inst["id"])
+    # engine.start force-removes any existing container; retire AMI first so a cached
+    # client can't keep Login'ing the old (or IP-reused) engine with a stale secret.
+    await hub.drop_ami(str(inst["id"]))
     await asyncio.to_thread(engine.start, inst, cfg.get_settings(),
                             dev_mounts=os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1")
     _refresh_card_matches()
@@ -751,9 +979,7 @@ async def api_instance_upsert(body: dict):
         try:
             hub._msisdn_tries.pop(iid, None)
             hub.reset_health(iid)
-            c = hub.ami.pop(iid, None)
-            if c:
-                await c.close()
+            await hub.drop_ami(iid)
             await asyncio.to_thread(engine.start, inst, cfg.get_settings(),
                                     dev_mounts=os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1")
             applied = True
@@ -785,6 +1011,13 @@ async def api_instance_start(iid: str, body: dict | None = None):
     if not inst:
         raise HTTPException(404, "no such instance")
 
+    # eSIM-profile-switch guard: never start a line whose reader now holds a different
+    # identity — EAP-AKA with mismatched IMSI/keys is guaranteed to be rejected by the
+    # carrier (and can burn PIN tries on the wrong profile).
+    mism = _card_identity_mismatch(inst)
+    if mism:
+        _raise_card_mismatch(inst, mism)
+
     # If the caller re-supplied a PIN (unlock flow), verify + persist it before preflight.
     supplied = (body or {}).get("pin")
     if supplied:
@@ -796,7 +1029,7 @@ async def api_instance_start(iid: str, body: dict | None = None):
                                          + (f" ({chk.pin_tries} tries left)" if chk.pin_tries is not None else ""))
         inst = cfg.upsert_instance({"id": str(iid), "pin": supplied})
 
-    pf = await asyncio.to_thread(_preflight_pin, inst)
+    pf = await _preflight_pin(inst)
     if not pf["ok"]:
         if pf.get("clear"):
             cfg.clear_pin(str(iid))     # stale saved PIN — force re-entry next time
@@ -846,15 +1079,18 @@ async def api_reprovision(iid: str, body: dict | None = None):
         raise HTTPException(404, "no such instance")
     if body:
         inst = cfg.upsert_instance({"id": str(iid), **body})
-    pf = await asyncio.to_thread(_preflight_pin, inst)
+    mism = _card_identity_mismatch(inst)
+    if mism:
+        _raise_card_mismatch(inst, mism)
+    pf = await _preflight_pin(inst)
     if not pf["ok"]:
         if pf.get("clear"):
             cfg.clear_pin(str(iid))
         raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
-    dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
+    dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
     cid = await asyncio.to_thread(engine.start, inst, cfg.get_settings(), dev_mounts=dev)
     asyncio.create_task(push_status(str(iid)))
     return {"ok": True, "container": cid}
@@ -870,9 +1106,7 @@ async def api_clear_pin(iid: str):
     had = cfg.clear_pin(str(iid))
     if await asyncio.to_thread(engine.is_running, str(iid)):
         await asyncio.to_thread(engine.stop, str(iid))
-        c = hub.ami.pop(str(iid), None)
-        if c:
-            await c.close()
+        await hub.drop_ami(str(iid))
         asyncio.create_task(push_status(str(iid)))
     return {"ok": True, "had_pin": had}
 
@@ -1247,6 +1481,281 @@ def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):
         return
     asyncio.create_task(
         asyncio.to_thread(notify_push.dispatch, settings, event, inst, source, text))
+
+
+
+
+# ----------------------------- eSIM / LPA (lpac) -----------------------------
+@app.get("/api/esim/status")
+async def api_esim_status():
+    """Whether lpac is installed and basic settings."""
+    settings = cfg.get_settings().get("esim") or {}
+    bin_path = lpa.lpac_bin()
+    return {
+        "available": lpa.lpac_available(),
+        "lpac_bin": bin_path,
+        "download_timeout": int(settings.get("download_timeout") or 300),
+        "auto_process_notifications": bool(settings.get("auto_process_notifications", True)),
+        "busy_readers": list(hub.lpa_busy.keys()),
+    }
+
+
+@app.get("/api/esim/chip")
+async def api_esim_chip(reader_index: int = 0, reader: str | None = None):
+    """Load chip info for every SE on the card (dual SE → two entries)."""
+    name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
+    running = await asyncio.to_thread(_find_running_by_reader, name)
+    payload = await _esim_run(name, idx, lpa.load_all_ses(name, idx))
+    ses = payload.get("ses") or []
+    # Backward-compatible single-chip view = first SE that loaded successfully.
+    primary = next((s for s in ses if s.get("chip")), ses[0] if ses else None)
+    return {
+        "ok": True,
+        "reader": name,
+        "reader_index": idx,
+        "dual": bool(payload.get("dual")),
+        "ses": ses,
+        "chip": (primary or {}).get("chip"),
+        "imei": _esim_imei_for_reader(name),
+        "line_running": bool(running),
+        "matched_instance": running["id"] if running else (hub.cards.get(name) or {}).get("matched"),
+    }
+
+
+@app.get("/api/esim/profiles")
+async def api_esim_profiles(reader_index: int = 0, reader: str | None = None):
+    """List profiles grouped per SE (same load as chip — prefer /api/esim/chip for full view)."""
+    name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
+    running = await asyncio.to_thread(_find_running_by_reader, name)
+    payload = await _esim_run(name, idx, lpa.load_all_ses(name, idx))
+    ses = payload.get("ses") or []
+    flat = []
+    for se in ses:
+        flat.extend(se.get("profiles") or [])
+    return {
+        "ok": True,
+        "reader": name,
+        "reader_index": idx,
+        "dual": bool(payload.get("dual")),
+        "ses": ses,
+        "profiles": flat,
+        "imei": _esim_imei_for_reader(name),
+        "line_running": bool(running),
+        "matched_instance": running["id"] if running else (hub.cards.get(name) or {}).get("matched"),
+        "lpa_busy": bool(hub.lpa_busy.get(name)),
+    }
+
+
+@app.post("/api/esim/profiles/{iccid}/enable")
+async def api_esim_enable(iccid: str, body: dict | None = None):
+    body = body or {}
+    name, idx = await asyncio.to_thread(
+        _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
+    se = await asyncio.to_thread(
+        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+        require=True)
+    await _esim_run(
+        name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")), refresh=True)
+    return {"ok": True, "iccid": iccid, "se_id": se["id"], "card": hub.cards.get(name)}
+
+
+@app.post("/api/esim/profiles/{iccid}/disable")
+async def api_esim_disable(iccid: str, body: dict | None = None):
+    body = body or {}
+    name, idx = await asyncio.to_thread(
+        _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
+    se = await asyncio.to_thread(
+        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+        require=True)
+    await _esim_run(
+        name, idx, lpa.profile_disable(name, iccid, aid=se.get("aid")), refresh=True)
+    return {"ok": True, "iccid": iccid, "se_id": se["id"], "card": hub.cards.get(name)}
+
+
+@app.delete("/api/esim/profiles/{iccid}")
+async def api_esim_delete(
+    iccid: str, reader_index: int = 0, reader: str | None = None,
+    se_id: str | None = None, aid: str | None = None,
+):
+    name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
+    se = await asyncio.to_thread(_esim_resolve_se, name, idx, se_id, aid, require=True)
+    await _esim_run(
+        name, idx, lpa.profile_delete(name, iccid, aid=se.get("aid")), refresh=True)
+    return {"ok": True, "iccid": iccid, "se_id": se["id"]}
+
+
+@app.post("/api/esim/profiles/{iccid}/nickname")
+async def api_esim_nickname(iccid: str, body: dict):
+    name, idx = await asyncio.to_thread(
+        _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
+    se = await asyncio.to_thread(
+        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+        require=True)
+    nick = body.get("nickname", "")
+    await _esim_run(
+        name, idx, lpa.profile_nickname(name, iccid, nick, aid=se.get("aid")))
+    return {"ok": True, "iccid": iccid, "nickname": nick, "se_id": se["id"]}
+
+
+@app.post("/api/esim/download")
+async def api_esim_download(body: dict):
+    """Start a profile download as a background task; progress via WS type=esim_download."""
+    name, idx = await asyncio.to_thread(
+        _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
+    se = await asyncio.to_thread(
+        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+        require=True)
+    if hub.lpa_busy.get(name):
+        raise HTTPException(409, "an eSIM operation is already running on this reader")
+    await asyncio.to_thread(_esim_guard_engine, name)
+    imei = _esim_imei_for_reader(name, body.get("imei"))
+    # Claim busy before returning so a second concurrent POST cannot start another job.
+    hub.lpa_busy[name] = True
+    se_id = se["id"]
+    aid = se.get("aid")
+
+    async def _job():
+        try:
+            async with hub.reader_lock(name):
+                try:
+                    await hub.broadcast({
+                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "se_id": se_id, "event": "started", "step": "started", "imei": imei,
+                    })
+
+                    async def on_progress(event):
+                        # lpa.run_lpac passes {"step", "data", "code"}
+                        step = (event or {}).get("step") or ""
+                        data = (event or {}).get("data")
+                        msg = {
+                            "type": "esim_download", "reader": name, "reader_index": idx,
+                            "se_id": se_id, "event": "progress", "step": step,
+                        }
+                        if isinstance(data, dict):
+                            msg["metadata"] = data
+                            msg["data"] = data
+                        elif data is not None:
+                            msg["data"] = data
+                        if step == "es8p_metadata_parse" and isinstance(data, dict):
+                            msg["event"] = "preview"
+                        await hub.broadcast(msg)
+
+                    result = await lpa.download(
+                        name,
+                        activation_code=body.get("activation_code"),
+                        smdp=body.get("smdp"),
+                        matching_id=body.get("matching_id"),
+                        confirmation_code=body.get("confirmation_code"),
+                        imei=imei or None,
+                        aid=aid,
+                        on_progress=on_progress,
+                    )
+                    await _esim_refresh_card(name, idx)
+                    await hub.broadcast({
+                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "se_id": se_id, "event": "completed", "step": "completed",
+                        "result": result, "card": hub.cards.get(name),
+                    })
+                except lpa.LpaError as e:
+                    # lpac puts the failing function name in message (e.g. es9p_authenticate_client).
+                    err = {
+                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "se_id": se_id, "event": "error",
+                        "step": (e.message or "").strip() or None,
+                        "error": e.user_message(),
+                    }
+                    await hub.broadcast(err)
+                except Exception as e:  # noqa
+                    log.exception("esim download failed")
+                    await hub.broadcast({
+                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "se_id": se_id, "event": "error", "error": str(e),
+                    })
+        finally:
+            hub.lpa_busy.pop(name, None)
+
+    asyncio.create_task(_job())
+    return {
+        "ok": True, "started": True, "reader": name, "reader_index": idx,
+        "se_id": se_id, "imei": imei,
+    }
+
+
+@app.post("/api/esim/download/cancel")
+async def api_esim_download_cancel(body: dict | None = None):
+    body = body or {}
+    name, _idx = await asyncio.to_thread(
+        _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
+    cancelled = lpa.cancel_download(name)
+    if cancelled:
+        await hub.broadcast({
+            "type": "esim_download", "reader": name,
+            "event": "cancelling", "step": "cancelling",
+        })
+    return {"ok": True, "cancelled": cancelled}
+
+
+@app.post("/api/esim/discovery")
+async def api_esim_discovery(body: dict | None = None):
+    body = body or {}
+    name, idx = await asyncio.to_thread(
+        _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
+    se = await asyncio.to_thread(
+        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+        require=True)
+    imei = _esim_imei_for_reader(name, body.get("imei"))
+    entries = await _esim_run(
+        name, idx,
+        lpa.discovery(name, imei=imei or None, smds=body.get("smds"), aid=se.get("aid")))
+    return {
+        "ok": True, "reader": name, "se_id": se["id"],
+        "entries": entries or [], "imei": imei,
+    }
+
+
+@app.get("/api/esim/notifications")
+async def api_esim_notifications(reader_index: int = 0, reader: str | None = None):
+    name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
+    payload = await _esim_run(name, idx, lpa.load_all_ses(name, idx))
+    ses = payload.get("ses") or []
+    flat = []
+    for se in ses:
+        flat.extend(se.get("notifications") or [])
+    return {
+        "ok": True, "reader": name, "dual": bool(payload.get("dual")),
+        "ses": ses, "notifications": flat,
+    }
+
+
+@app.post("/api/esim/notifications/process")
+async def api_esim_notifications_process(body: dict | None = None):
+    body = body or {}
+    name, idx = await asyncio.to_thread(
+        _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
+    se = await asyncio.to_thread(
+        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+        require=True)
+    seq = body.get("seq")
+    remove = bool(body.get("remove", True))
+    if seq is None:
+        coro = lpa.notification_process(
+            name, all_notifications=True, autoremove=remove, aid=se.get("aid"))
+    else:
+        coro = lpa.notification_process(
+            name, int(seq), autoremove=remove, aid=se.get("aid"))
+    await _esim_run(name, idx, coro)
+    return {"ok": True, "se_id": se["id"]}
+
+
+@app.delete("/api/esim/notifications/{seq}")
+async def api_esim_notification_remove(
+    seq: int, reader_index: int = 0, reader: str | None = None,
+    se_id: str | None = None, aid: str | None = None,
+):
+    name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
+    se = await asyncio.to_thread(_esim_resolve_se, name, idx, se_id, aid, require=True)
+    await _esim_run(name, idx, lpa.notification_remove(name, seq, aid=se.get("aid")))
+    return {"ok": True, "seq": seq, "se_id": se["id"]}
 
 
 # ----------------------------- WebSocket -----------------------------

@@ -8,25 +8,28 @@ A **containerized VoWiFi→SIP gateway** that turns a physical VoWiFi-capable SI
 - Presents the registered line as a **WebRTC endpoint** (browser softphone in the control-plane WebUI) and a **SIP/RTP server** (for MicroSIP, Zoiper, Asterisk trunks, etc.) with two-way voice
 - Routes outbound calls (`INVITE` to the SIP server → IMS `INVITE` over the tunnel) and inbound calls (IMS `INVITE` → rings your SIP clients)
 - Sends/receives SMS via SIP MESSAGE (to/from the engine's SIP transport)
+- Manages **eSIM / eUICC** profiles locally via [lpac](https://github.com/estkme-group/lpac) (download, enable/disable/delete, notifications), including **ESTKme dual-SE** cards (SE1/SE2)
 
 **What you need:**
 - A Linux host (amd64/arm64, Raspberry Pi works) with `/dev/net/tun` + kernel ESP/XFRM
 - **Docker** + a **PC/SC smart-card reader** (USB CCID)
 - A **VoWiFi-capable SIM** from a carrier that allows ePDG (tested: Telus Canada 302-220; T-Mobile US + many EU carriers should work)
+- *(Optional, for the eSIM tab)* an **eUICC** in the reader, plus a one-time local lpac build (`git clone` [estkme-group/lpac](https://github.com/estkme-group/lpac) next to this repo, then `sudo ./install.sh build-lpac`)
 
 ---
 
 ## Screenshots
 
-The control-plane WebUI — dashboard, browser softphone, and SMS messaging (light theme; a dark theme is also built in):
+The control-plane WebUI — dashboard, browser softphone, SMS messaging, and eSIM management (light theme; a dark theme is also built in):
 
-| Dashboard | Softphone | Messages |
-|:---:|:---:|:---:|
-| [![Dashboard — per-SIM line status, IMS registration, and controls](screenshots/dashboard.jpg)](screenshots/dashboard.jpg) | [![Softphone — in-browser WebRTC dialer](screenshots/softphone.jpg)](screenshots/softphone.jpg) | [![Messages — SIP MESSAGE ↔ carrier SMS inbox/outbox](screenshots/message.jpg)](screenshots/message.jpg) |
+| Dashboard | Softphone | Messages | eSIM |
+|:---:|:---:|:---:|:---:|
+| [![Dashboard — per-SIM line status, IMS registration, and controls](screenshots/dashboard.jpg)](screenshots/dashboard.jpg) | [![Softphone — in-browser WebRTC dialer](screenshots/softphone.jpg)](screenshots/softphone.jpg) | [![Messages — SIP MESSAGE ↔ carrier SMS inbox/outbox](screenshots/message.jpg)](screenshots/message.jpg) | [![eSIM — chip info, dual-SE profiles, download and notifications](screenshots/esim.jpg)](screenshots/esim.jpg) |
 
 - **Dashboard** — live per-SIM status (SIM → ePDG DNS → tunnel → IMS reg → working), carrier/number/IMSI/ICCID/SMSC/P-CSCF, PIN state, and per-line controls (stop, re-register, re-provision, SIP info, configure).
 - **Softphone** — browser-based WebRTC dialer for placing and receiving calls on the registered line, no external client needed.
 - **Messages** — per-line SMS inbox/outbox, bridging SIP MESSAGE ↔ carrier SMS.
+- **eSIM** — local LPA (lpac) for eUICC chips: EID / free space, profile list (enable / disable / delete / nickname), activation-code download with progress, and pending notifications. Dual-SE cards (e.g. ESTKme Max / Plus+) show EID1/EID2 and require an explicit SE pick before download. Loading eSIM info needs exclusive PC/SC access — stop the VoWiFi line on that reader first.
 
 ---
 
@@ -123,6 +126,14 @@ sudo ./install.sh reload --no-cache
 # changing engine code/patches)
 sudo ./install.sh reload --engines
 
+# Build/install a local lpac binary for the eSIM tab (PC/SC + curl, STANDALONE).
+# Output: $VOWIFI_DATA_DIR/lpac/lpac (or <repo>/data/lpac/lpac). Needed once before
+# using WebUI → eSIM; safe to re-run after lpac upgrades.
+# Requires the lpac source next to this repo (or pass --lpac-src /path/to/lpac):
+git clone https://github.com/estkme-group/lpac.git ../lpac
+sudo ./install.sh build-lpac
+# Or: sudo ./install.sh build-lpac --lpac-src /path/to/lpac
+
 # Switch modes (tears down the old plane, brings up the new one, keeps data + engine image)
 sudo ./install.sh install --mode docker
 sudo ./install.sh install --mode local
@@ -183,8 +194,9 @@ Example: the **first** SIM is on 5060/5061/8089, the **second** on 5160/5161/818
 Open `https://<host-ip>:<VOWIFI_PORT>` (default 8443). Tabs (see [Screenshots](#screenshots) above):
 - **/** (Dashboard) — reader/card status, provision a SIM, engine state per instance
 - **/softphone** — browser-based WebRTC dialer (click-to-call from the dashboard, or dial manually; supports inbound calls, DTMF, call recording)
-- **/settings** — global config (TLS domain for Let's Encrypt, Asterisk debug toggles, ring timeout, etc.)
 - **/messages** — SMS inbox/outbox (SIP MESSAGE ↔ carrier SMS, per instance)
+- **/esim** — eUICC profile management via local lpac (chip info, download, enable/disable/delete, notifications; dual-SE aware). Requires cloning [lpac](https://github.com/estkme-group/lpac) next to this repo and running `./install.sh build-lpac` once.
+- **/settings** — global config (TLS domain for Let's Encrypt, Asterisk debug toggles, ring timeout, etc.)
 - **/logs** — call/SMS logs with filtering
 
 ---
@@ -321,6 +333,7 @@ Released under the [MIT License](LICENSE). The build pulls in third-party compon
 - [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2) (pure-Python SWu ePDG IKEv2/IPsec client)
 - [mitshell/CryptoMobile](https://github.com/mitshell/CryptoMobile) + [mitshell/card](https://github.com/mitshell/card) (Milenage / USIM helpers)
 - [pyscard](https://pyscard.sourceforge.io/) (PC/SC, LGPL)
+- [estkme-group/lpac](https://github.com/estkme-group/lpac) (local LPA for the eSIM tab)
 
 ---
 
@@ -331,6 +344,8 @@ Released under the [MIT License](LICENSE). The build pulls in third-party compon
 | 302-220 | Telus (CA) | ✓ works | ePDG auto-derived from IMSI, full two-way voice + SMS; IPv6 IMS PDN |
 | 234 (EE) | CTExcel (UK, on EE) | ✓ works | China Telecom MVNO on EE's UK network; IPv6 IMS PDN |
 | 234-15 | Vodafone (UK) | ✓ works | IPv4 IMS PDN (needs the IPv4/dual CFG family — auto-detected) |
+| 262-02 | Vodafone (DE) | ✓ works | |
+| 208-15 | Free (FR) | ✓ works | |
 | 310-260 | T-Mobile (US) | untested | should work; ePDG auto-derived from IMSI |
 
 Any VoWiFi-capable SIM should work without configuration: the ePDG/realm are derived from the IMSI,
