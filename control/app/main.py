@@ -1178,25 +1178,107 @@ async def api_messages_delete(iid: str, body: dict):
 
 
 SMS_RESP_RE = re.compile(r"Received SIP response")
+# The patched (sysmocom) Asterisk logs the raw 3GPP RP PDU of every SMS it parses via
+# res_pjsip_messaging.c parse_rpdata. For an MO SMS the SMSC returns an async RP-ACK / RP-ERROR
+# "submit report" (an incoming application/vnd.3gpp.sms MESSAGE whose Call-ID is
+# <our-outbound-Call-ID>:sm-submit-report) — THIS, not the SIP 202 Accepted, is the authoritative
+# delivery verdict. Byte 0 low 3 bits = RP-MTI: 3 = RP-ACK (delivered), 5 = RP-ERROR (failed,
+# followed by an RP-Cause). 1 = RP-DATA (a real inbound SMS) which we ignore here.
+RPDATA_RE = re.compile(r"parse_rpdata:\s*SMS RP-DATA\s*'([0-9a-fA-F]+)'")
+_RP_ACK_MTI = 3
+_RP_ERROR_MTI = 5
+# RP-Cause value (3GPP TS 24.011 §8.2.5.4, values per TS 24.008) -> human reason.
+RP_CAUSE = {
+    1: "unassigned/unallocated number", 8: "operator determined barring", 10: "call barred",
+    11: "reserved", 21: "short message transfer rejected", 22: "memory capacity exceeded",
+    27: "destination out of order", 28: "unidentified subscriber", 29: "facility rejected",
+    30: "unknown subscriber", 38: "network out of order", 41: "temporary failure",
+    42: "congestion", 47: "resources unavailable", 50: "requested facility not subscribed",
+    69: "requested facility not implemented", 81: "invalid short message reference value",
+    95: "invalid message", 96: "invalid mandatory information", 97: "message type non-existent",
+    98: "message not compatible with SM protocol state", 99: "information element non-existent",
+    111: "protocol error", 127: "interworking, unspecified",
+}
 
 
-def detect_sms_result(iid: str) -> dict:
-    """Determine the real MO SMS outcome from the SIP response the network returned.
-    AMI 'Success' only means Asterisk accepted the send; the carrier's 2xx/4xx comes
-    asynchronously. Returns {ok: True|False|None, code, reason}."""
-    raw = engine.logs(iid, 300)
+def _decode_rp_report(pdu_hex: str) -> dict | None:
+    """Decode an RP submit-report PDU (hex). Returns {ok, cause, reason} for an RP-ACK/RP-ERROR,
+    or None when the PDU is not a submit report (e.g. RP-DATA, a real inbound SMS)."""
+    try:
+        b = bytes.fromhex(pdu_hex)
+    except ValueError:
+        return None
+    if not b:
+        return None
+    mti = b[0] & 0x07
+    if mti == _RP_ACK_MTI:
+        return {"ok": True}
+    if mti == _RP_ERROR_MTI:
+        # octet0 MTI, octet1 msg-ref, octet2 RP-Cause IE length, octet3 cause value (bit8=ext).
+        cause = (b[3] & 0x7f) if len(b) >= 4 else None
+        reason = RP_CAUSE.get(cause, f"cause {cause}" if cause is not None else "delivery failed")
+        return {"ok": False, "cause": cause, "reason": reason}
+    return None
+
+
+def detect_sms_result(iid: str, since=None) -> dict:
+    """Determine the real MO SMS outcome. Two authoritative signals, checked in order:
+      1. The SMSC's RP-ACK/RP-ERROR submit report (parse_rpdata) — the true delivery verdict.
+      2. A SIP 4xx/5xx to our MESSAGE (IMS rejected it before the SMSC).
+    A SIP 202/2xx is NOT success — the carrier accepts almost everything and reports the real
+    result via the async RP submit report. Returns {ok: True|False|None, code?, reason?}."""
+    raw = engine.logs(iid, 4000, since=since)
     raw = re.sub(r"\x1b\[[0-9;]*m", "", raw)
-    blocks = SMS_RESP_RE.split(raw)
+    # 1. RP submit report (authoritative). Take the LAST ACK/ERROR seen in the window (our send's).
+    for h in reversed(RPDATA_RE.findall(raw)):
+        d = _decode_rp_report(h)
+        if d is not None:
+            if d["ok"]:
+                return {"ok": True}
+            return {"ok": False, "reason": d.get("reason", "delivery failed"),
+                    "cause": d.get("cause")}
+    # 2. Fall back to a negative SIP response to our MESSAGE.
     result = {"ok": None}
-    for b in blocks[1:]:
+    for b in SMS_RESP_RE.split(raw)[1:]:
         m = re.search(r"SIP/2\.0 (\d{3})([^\n]*)", b)
         if not m:
             continue
         if re.search(r"CSeq:\s*\d+\s+MESSAGE", b):   # a response to our MESSAGE
             code = int(m.group(1))
-            result = {"ok": 200 <= code < 300, "code": code,
-                      "reason": m.group(2).strip()}
+            result = {"ok": 200 <= code < 300, "code": code, "reason": m.group(2).strip()}
     return result
+
+
+async def _watch_sms_delivery(iid: str, mid: int, since: int, timeout: float = 40.0):
+    """Asynchronously resolve an MO SMS's REAL delivery outcome after the IMS accepted it.
+    The message is already stored as 'sent'; here we poll for the SMSC's RP submit report (or a
+    SIP 4xx) and update the record to 'delivered' or 'failed' (+ reason), broadcasting each change
+    so the open Messages view refreshes. On timeout the message stays 'sent' (accepted, delivery
+    unconfirmed — e.g. Asterisk SMS debug off, or the network sent no report)."""
+    iid = str(iid)
+    loops = max(1, int(timeout // 2))
+    for _ in range(loops):
+        await asyncio.sleep(2)
+        if not await asyncio.to_thread(engine.is_running, iid):
+            return
+        d = await asyncio.to_thread(detect_sms_result, iid, since)
+        if d.get("ok") is True:
+            store.set_message_status(mid, "delivered", None)
+            await hub.broadcast({"type": "sms", "instance": iid,
+                                 "message": {"id": mid, "status": "delivered",
+                                             "direction": "out", "error": None}})
+            return
+        if d.get("ok") is False:
+            reason = d.get("reason") or "unknown"
+            code = d.get("code")
+            err = (f"Carrier rejected the SMS: {reason}"
+                   + (f" (SIP {code})" if code else "")).strip()
+            store.set_message_status(mid, "failed", err)
+            await hub.broadcast({"type": "sms", "instance": iid,
+                                 "message": {"id": mid, "status": "failed",
+                                             "direction": "out", "error": err}})
+            return
+    # no verdict within the window — leave as 'sent' (accepted, unconfirmed).
 
 
 @app.post("/api/instances/{iid}/sms/send")
@@ -1206,28 +1288,27 @@ async def api_sms_send(iid: str, body: dict):
     ami = await hub.ami_for(iid)
     if not ami:
         raise HTTPException(409, "Line is not running / control channel unavailable.")
+    since = int(time.time())
     rec = store.add_message(iid, "out", to, text, status="pending")
     res = await ami.send_sms(to, text)
 
     if not res.get("ok"):
-        # Asterisk itself refused to dispatch (endpoint down, bad address, etc.)
-        ok, err = False, (res.get("detail") or res.get("error") or "Send rejected by the line.")
-    else:
-        # Wait briefly for the carrier's SIP response and read the real outcome.
-        await asyncio.sleep(3)
-        d = await asyncio.to_thread(detect_sms_result, iid)
-        if d.get("ok") is False:
-            ok = False
-            err = f"Carrier rejected the SMS (SIP {d.get('code')} {d.get('reason','')}).".strip()
-        else:
-            ok, err = True, None   # 2xx, or accepted with no negative response seen
+        # Asterisk itself refused to dispatch (endpoint down, bad address, etc.) — final failure.
+        err = res.get("detail") or res.get("error") or "Send rejected by the line."
+        store.set_message_status(rec["id"], "failed", err)
+        rec["status"], rec["error"] = "failed", err
+        await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
+        return {"ok": False, "message": rec, "error": err}
 
-    status = "ok" if ok else "failed"
-    store.set_message_status(rec["id"], status, err)
-    rec["status"] = status
-    rec["error"] = err
+    # IMS accepted the MESSAGE (SIP 202). That is NOT delivery confirmation — mark the message
+    # 'sent' now and resolve the REAL outcome asynchronously from the SMSC's RP submit report,
+    # flipping it to 'delivered' or 'failed' (+ reason) when it arrives. This keeps the send
+    # snappy and stops the old false "success" on carrier/SMSC rejections.
+    store.set_message_status(rec["id"], "sent", None)
+    rec["status"], rec["error"] = "sent", None
     await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-    return {"ok": ok, "message": rec, "error": err}
+    asyncio.create_task(_watch_sms_delivery(iid, rec["id"], since))
+    return {"ok": True, "message": rec, "error": None, "pending_delivery": True}
 
 
 # ----------------------------- Calls -----------------------------

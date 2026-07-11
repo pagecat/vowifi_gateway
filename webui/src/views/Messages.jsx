@@ -162,6 +162,17 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {msgs.map((m) => {
             const failed = m.status === 'failed'
+            // Outbound delivery lifecycle: pending -> sent (IMS accepted) -> delivered | failed.
+            // 'delivered' is confirmed by the network's SMS submit report; 'sent' means accepted
+            // but delivery not yet confirmed.
+            const delivered = m.status === 'delivered'
+            const sent = m.status === 'sent'
+            const statusText = failed ? ' · Failed to deliver'
+              : m.status === 'pending' ? ' · sending…'
+              : sent ? ' · Sent'
+              : delivered ? ' · Delivered ✓'
+              : ''
+            const statusColor = failed ? '#ef4444' : delivered ? '#22c55e' : 'var(--text-mute)'
             const checked = selIds.has(m.id)
             return (
               <div key={m.id} onClick={() => selMode && toggleSel(m.id)}
@@ -180,10 +191,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
                       padding: '8px 12px', borderRadius: 12, fontSize: 14,
                     }}>{m.body}</div>
                   </div>
-                  <div style={{ fontSize: 10, color: failed ? '#ef4444' : 'var(--text-mute)',
+                  <div style={{ fontSize: 10, color: statusColor,
                     textAlign: m.direction === 'out' ? 'right' : 'left', marginTop: 2 }}>
                     {new Date(m.ts * 1000).toLocaleString()}
-                    {failed ? ' · Failed to deliver' : m.status === 'pending' ? ' · sending…' : ''}
+                    {statusText}
                   </div>
                   {failed && m.error && (
                     <div style={{ fontSize: 10.5, color: '#ef4444', marginTop: 1,

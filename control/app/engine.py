@@ -189,10 +189,15 @@ def exec_cli(iid: str, command: str) -> str:
         return f"error: {e}"
 
 
-def logs(iid: str, tail: int = 200) -> str:
+def logs(iid: str, tail: int = 200, since=None) -> str:
     try:
         c = _client().containers.get(container_name(iid))
-        return c.logs(tail=tail).decode(errors="replace")
+        kwargs = {"tail": tail}
+        if since is not None:
+            # docker SDK accepts an int (unix ts) or datetime; used by the SMS delivery
+            # watcher to read only the lines emitted after a send.
+            kwargs["since"] = since
+        return c.logs(**kwargs).decode(errors="replace")
     except Exception as e:  # noqa
         return f"error: {e}"
 
