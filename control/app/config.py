@@ -59,6 +59,16 @@ DEFAULTS = {
             "bot_token": "",
             "chat_id": "",
             "events": {"incoming_sms": True, "incoming_call": True},
+            # Inbound commands (the bot listening, not just notifying). Layered on purpose:
+            # reading/sending SMS, restarting a line, and rewriting an eUICC are three very
+            # different amounts of trust, so each is opt-in separately and all default off.
+            # allowed_chats empty = only chat_id may command the bot.
+            "commands": {
+                "enabled": False,
+                "allowed_chats": [],
+                "allow_management": False,
+                "allow_esim": False,
+            },
         },
         # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
         # $VOWIFI_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
@@ -213,9 +223,25 @@ def _ensure():
             yaml.safe_dump(DEFAULTS, f)
 
 
+_cached: dict | None = None
+_cached_key: tuple | None = None
+
+
 def load() -> dict:
+    """Read + merge the config. Cached on the file's mtime/size because get_instance,
+    list_instances and get_settings all funnel through here and are called dozens of times
+    per request cycle — re-reading and re-parsing the YAML each time is disk work done under
+    a lock the event loop also waits on. Callers mutate what they get, so hand out a copy."""
+    global _cached, _cached_key
     with _lock:
         _ensure()
+        try:
+            st = os.stat(CONFIG_PATH)
+            cache_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            cache_key = None
+        if cache_key is not None and cache_key == _cached_key and _cached is not None:
+            return deepcopy(_cached)
         with open(CONFIG_PATH) as f:
             data = yaml.safe_load(f) or {}
         # merge defaults (shallow for settings)
@@ -234,11 +260,15 @@ def load() -> dict:
             merged = {**DEFAULTS["settings"][key], **saved}
             merged["events"] = {**DEFAULTS["settings"][key]["events"],
                                 **(saved.get("events", {}) or {})}
+            if "commands" in DEFAULTS["settings"][key]:
+                merged["commands"] = {**DEFAULTS["settings"][key]["commands"],
+                                      **(saved.get("commands", {}) or {})}
             out["settings"][key] = merged
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
         out["instances"] = data.get("instances", {})
-        return out
+        _cached, _cached_key = out, cache_key
+        return deepcopy(out)
 
 
 def esim_settings() -> dict:
@@ -250,12 +280,15 @@ def esim_settings() -> dict:
 
 
 def save(data: dict):
+    global _cached, _cached_key
     with _lock:
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w") as f:
             yaml.safe_dump(data, f, sort_keys=False)
         os.replace(tmp, CONFIG_PATH)
+        # Don't rely on the new mtime differing from the cached one; drop it outright.
+        _cached, _cached_key = None, None
 
 
 def get_settings() -> dict:
@@ -274,6 +307,13 @@ def public_settings() -> dict:
     settings["advertise_address_effective"] = advertise_address(settings)
     settings["advertise_address_managed_by_env"] = advertise_address_managed_by_env()
     settings["advertise_address_detected"] = _host_lan_ipv4() or ""
+    # The bot token is a bearer credential for an account that can now be commanded, and this
+    # payload goes to every browser that opens Settings. Report only whether one is set; an
+    # empty token in a patch is understood as "leave it alone" (see update_settings).
+    tg = dict(settings.get("telegram") or {})
+    tg["bot_token_set"] = bool((tg.get("bot_token") or "").strip())
+    tg["bot_token"] = ""
+    settings["telegram"] = tg
     return settings
 
 
@@ -287,6 +327,15 @@ def update_settings(patch: dict) -> dict:
         patch["advertise_address"] = normalize_advertise_address(
             patch.get("advertise_address")
         )
+    # public_settings blanks the bot token, so the WebUI never has the real one to send back.
+    # An empty token therefore means "unchanged" — the same rule the SIM PIN and the SIP
+    # account passwords already follow — otherwise every Settings save would erase it.
+    if isinstance(patch.get("telegram"), dict):
+        tg_patch = dict(patch["telegram"])
+        tg_patch.pop("bot_token_set", None)
+        if not str(tg_patch.get("bot_token") or "").strip():
+            tg_patch["bot_token"] = (data["settings"].get("telegram") or {}).get("bot_token", "")
+        patch["telegram"] = tg_patch
     try:
         previous = normalize_advertise_address(
             data["settings"].get("advertise_address", "")
@@ -515,6 +564,14 @@ def upsert_instance(inst: dict) -> dict:
     # instances with a computed `status` and `has_pin`); never persist them to config.
     inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
     existing = data["instances"].get(iid, {})
+    # An ICCID names exactly one line: it is how a physical card is matched to its config, and
+    # every lookup takes the FIRST match. Two lines sharing one would silently capture each
+    # other's card, port relearning and identity verdict, so refuse it at the door.
+    new_iccid = str(inst.get("iccid") or "").strip()
+    if new_iccid:
+        for other_id, other in data["instances"].items():
+            if str(other_id) != iid and str(other.get("iccid") or "").strip() == new_iccid:
+                raise ValueError(f"ICCID {new_iccid} already belongs to line {other_id}")
     if "index" not in existing:
         inst["index"] = next_index(data)
     else:

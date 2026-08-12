@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import store, engine, status as status_mod, sim, card, notify_push, lpa, estkme, usbreader
+from . import telegram_bot
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -32,12 +33,18 @@ log = logging.getLogger("vowifi.main")
 WEBUI_DIR = os.environ.get("VOWIFI_WEBUI", os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "webui", "dist"))
 
+# How long a line whose AMI refused a connect is skipped before trying again. Long enough that
+# a down engine costs one attempt rather than one per caller, short enough that a line coming
+# back up shows as registered within a couple of poll cycles.
+AMI_RETRY_COOLDOWN = 15.0
+
 
 class Hub:
     """Holds AMI clients per instance and broadcasts events to WebSocket clients."""
     def __init__(self):
         self.ami: dict[str, AmiClient] = {}
         self._ami_locks: dict[str, asyncio.Lock] = {}  # per-instance ami_for serialisation
+        self._ami_retry_at: dict[str, float] = {}      # instance -> monotonic cooldown expiry
         self.clients: set[WebSocket] = set()
         self.cards: dict[str, dict] = {}     # reader NAME -> detected card/reader info
         self.scanned = False                 # card_monitor completed its first scan
@@ -51,6 +58,15 @@ class Hub:
         self.reader_locks: dict[str, asyncio.Lock] = {}
         self.lpa_busy: dict[str, bool] = {}  # readers currently owned by an LPA op
         self.lpa_downloads: dict[str, dict] = {}  # reader_name -> active download handle
+        # In-process subscribers to the same event stream the WebSocket carries. Lets a module
+        # inside the manager (the Telegram bot) follow SMS delivery, status and engine events
+        # without opening a WebSocket back to its own process.
+        self.listeners: set = set()
+
+    def subscribe(self, fn):
+        """Register an async callback for every broadcast. Returns an unsubscribe function."""
+        self.listeners.add(fn)
+        return lambda: self.listeners.discard(fn)
 
     def cards_list(self) -> list[dict]:
         """Reader/card entries sorted by current PC/SC index (the UI display order)."""
@@ -84,6 +100,9 @@ class Hub:
         'failed to authenticate' every few seconds. close() sets the client's closed flag which
         neutralises the pending reconnect."""
         c = self.ami.pop(str(iid), None)
+        # A deliberate stop/start is exactly when the operator expects a fresh attempt, so
+        # don't make them wait out a cooldown left over from the previous container.
+        self._ami_retry_at.pop(str(iid), None)
         if c:
             await c.close()
 
@@ -96,6 +115,13 @@ class Hub:
                 dead.append(ws)
         for ws in dead:
             self.clients.discard(ws)
+        # A misbehaving in-process listener must never break the event path for the WebSocket
+        # clients or for the engine-event handler that called us.
+        for fn in list(self.listeners):
+            try:
+                await fn(msg)
+            except Exception as e:  # noqa
+                log.debug("broadcast listener failed: %r", e)
 
     async def ami_for(self, iid: str) -> AmiClient | None:
         iid = str(iid)
@@ -105,10 +131,26 @@ class Hub:
         # failures once a container reuses its docker IP).
         lock = self._ami_locks.setdefault(iid, asyncio.Lock())
         async with lock:
-            inst = cfg.get_instance(iid)
-            running = bool(inst) and engine.is_running(iid)
-            ip = engine.container_ip(iid) if running else None
             client = self.ami.get(iid)
+            # A line whose Asterisk isn't accepting AMI yet (just started, or stopped) refuses
+            # every connect. Retrying on each caller made a single /api/instances pay the
+            # connect timeout once per line, so a known-bad line is skipped for a while. The
+            # status machine copes with ami_client=None; it just can't report registration.
+            if client is None and time.monotonic() < self._ami_retry_at.get(iid, 0.0):
+                return None
+            inst = cfg.get_instance(iid)
+
+            def _probe():
+                """Both Docker round trips in one hop, off the event loop."""
+                if not (inst and engine.is_running(iid)):
+                    return False, None
+                return True, engine.container_ip(iid)
+
+            try:
+                running, ip = await asyncio.to_thread(_probe)
+            except Exception as e:  # noqa  (daemon unreachable — don't take the API down)
+                log.debug("engine probe failed instance=%s: %r", iid, e)
+                running, ip = False, None
             # Reuse only a healthy client still pointed at the current container.
             if client and running and ip and client.connected and client.host == ip:
                 return client
@@ -123,11 +165,20 @@ class Hub:
                                inst["ami_secret"], realm=cfg.ims_realm(inst["mcc"], inst["mnc"]),
                                msisdn=inst.get("msisdn", ""), smsc=inst.get("smsc", ""))
             await client.connect()
+            if not client.connected:
+                # Caching a client that never logged in would keep panoramisk's reconnect
+                # timer alive AND hide this line from the cooldown check above, so the next
+                # caller would pay the connect timeout all over again.
+                await client.close()
+                self._ami_retry_at[iid] = time.monotonic() + AMI_RETRY_COOLDOWN
+                return None
+            self._ami_retry_at.pop(iid, None)
             self.ami[iid] = client
             return client
 
 
 hub = Hub()
+telegram = telegram_bot.TelegramBot(hub)
 
 
 def _match_instance_by_iccid(iccid):
@@ -159,9 +210,13 @@ def _find_running_by_reader(name: str):
 
 
 async def _on_card_insert(name, idx):
+    # `identified` means the ICCID/IMSI below came from a direct probe of the card that is in
+    # this reader right now. Entries copied from a running engine's config, kept from a previous
+    # scan, or left over after the physical reader behind this name changed are NOT identified —
+    # they may describe a different card, so they must not be used to veto or to adopt identity.
     info = {"index": idx, "name": name, "present": True, "iccid": None,
             "pin_enabled": None, "pin_tries": None, "matched": None, "imsi": None,
-            "mcc": None, "mnc": None, "smsc": None, "reader_port": None}
+            "mcc": None, "mnc": None, "smsc": None, "reader_port": None, "identified": False}
     # Resolve the STABLE physical USB port for this reader index (DIRECT connect, no APDU —
     # safe even if a running engine holds the card). This is the binding a line pins to, so it
     # survives pcscd re-enumerating two identical readers into a different order.
@@ -200,7 +255,8 @@ async def _on_card_insert(name, idx):
         try:
             c = await asyncio.to_thread(sim.read_card, idx)
             info.update(iccid=c.iccid, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
-                        imsi=c.imsi, mcc=c.mcc, mnc=c.mnc, smsc=c.smsc)
+                        imsi=c.imsi, mcc=c.mcc, mnc=c.mnc, smsc=c.smsc,
+                        identified=bool(c.iccid))
         except Exception as e:  # noqa
             log.debug("card probe failed: %r", e)
         finally:
@@ -325,11 +381,19 @@ async def card_monitor():
                     entry["index"] = st["index"]     # indices shift on unplug
                     # The physical reader behind this name/index may have changed — refresh the
                     # stable USB port binding so the display + ICCID->port learning stay correct.
+                    was_port = entry.get("reader_port")
                     try:
                         entry["reader_port"] = await asyncio.to_thread(
                             usbreader.port_for_index, st["index"])
                     except Exception:  # noqa
-                        pass
+                        entry["reader_port"] = None
+                    # A re-enumeration only swaps which physical reader answers to this name, so
+                    # `present` never transitions and the card is never re-probed: the cached
+                    # ICCID would now describe the OTHER reader's card. Drop the identity claim
+                    # until something probes again, or the veto would discard a correct port
+                    # resolution in exactly the two-identical-readers flip it exists to survive.
+                    if entry.get("reader_port") != was_port:
+                        entry["identified"] = False
                     changed = True
                 if bool(entry.get("present")) != st["present"]:
                     # eUICC REFRESH during LPA looks like remove+insert — keep last-known
@@ -455,7 +519,11 @@ def apply_health(iid, inst, st):
             now = time.monotonic()
             last = h.get("last_recover_try")
             due = last is None or (now - last) >= rint
-            if due and status_mod.resolve_epdg(_epdg_fqdn(inst)):
+            if due:
+                # The ePDG DNS probe that gates this used to run here, but apply_health is
+                # synchronous and called from the poller and from /api/instances — a slow
+                # resolver (exactly what an epdg_unresolved freeze implies) stalled the whole
+                # event loop. _auto_recover now makes that check off-thread and bails early.
                 h["last_recover_try"] = now
                 h["recovering"] = True
                 asyncio.create_task(_auto_recover(str(iid)))
@@ -504,7 +572,7 @@ def apply_health(iid, inst, st):
 
 async def _auto_recover(iid: str):
     """Re-provision a line frozen for a recoverable network reason, once ePDG resolves.
-    Mirrors the Start / Re-provision path (PIN preflight, reader rebind, engine.start).
+    Mirrors the Start / Re-provision path (reader rebind, PIN preflight, engine.start).
     Permanent preflight failures upgrade the freeze so we stop hammering; transient
     no_card leaves the network freeze in place for the next interval."""
     h = hub.health_for(iid)
@@ -514,6 +582,13 @@ async def _auto_recover(iid: str):
             return
         if h.get("frozen_code") not in NETWORK_RECOVERABLE:
             return
+        # The gate that used to live in apply_health: only a line whose ePDG resolves again is
+        # worth re-provisioning. Off-thread because getaddrinfo blocks, and this path exists
+        # precisely for lines whose DNS is currently unhappy.
+        if not await asyncio.to_thread(status_mod.resolve_epdg, _epdg_fqdn(inst)):
+            return
+
+        inst = await _rebind_reader(iid, inst, ctx="auto-recover instance")
 
         mism = _card_identity_mismatch(inst)
         if mism:
@@ -540,21 +615,6 @@ async def _auto_recover(iid: str):
             log.warning("auto-recover aborted — %s instance=%s", code, iid)
             return
 
-        updates: dict = {}
-        live_port = await asyncio.to_thread(_reader_port_for_instance, inst)
-        if live_port and live_port != inst.get("reader_port"):
-            log.info("auto-recover instance %s: reader port %s -> %s",
-                     iid, inst.get("reader_port"), live_port)
-            updates["reader_port"] = live_port
-            inst = {**inst, "reader_port": live_port}
-        live_idx = await asyncio.to_thread(_reader_index_for_instance, inst)
-        if live_idx is not None and live_idx != inst.get("reader_index"):
-            log.info("auto-recover instance %s: reader index %s -> %s",
-                     iid, inst.get("reader_index"), live_idx)
-            updates["reader_index"] = live_idx
-        if updates:
-            inst = cfg.upsert_instance({"id": str(iid), **updates})
-
         hub._msisdn_tries.pop(str(iid), None)
         # Keep frozen_code until start succeeds so a failed start leaves the network
         # freeze in place for the next recover interval (and recovering blocks
@@ -576,12 +636,16 @@ async def lifespan(app: FastAPI):
     store.init()
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
+    # Always started: the loop idles cheaply while the feature is off, which is what lets
+    # settings changes take effect without restarting the manager.
+    tgbot = asyncio.create_task(telegram.run())
     yield
     poller.cancel()
     monitor.cancel()
+    tgbot.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
-    await asyncio.gather(poller, monitor, return_exceptions=True)
+    await asyncio.gather(poller, monitor, tgbot, return_exceptions=True)
     for c in hub.ami.values():
         await c.close()
 
@@ -596,7 +660,13 @@ def api_readers():
 
 
 @app.get("/api/sim/detect")
-async def api_sim_detect(reader_index: int = 0):
+async def api_sim_detect(reader_index: int = 0, reader: str | None = None):
+    """Probe one reader. A supplied reader NAME wins over the index: this endpoint is what
+    the WebUI uses to learn a card's identity before binding a line to it, so reading the
+    wrong physical SIM here writes the wrong ICCID/IMSI into the line's config."""
+    if reader:
+        reader_index = await asyncio.to_thread(
+            _resolve_reader_index, {"reader_index": reader_index, "reader": reader})
     rlist = await asyncio.to_thread(sim.list_readers)
     if reader_index < 0 or reader_index >= len(rlist):
         raise HTTPException(400, "reader index out of range")
@@ -744,12 +814,13 @@ async def _esim_refresh_card(name: str, idx: int):
             present=True, index=idx, name=name,
             iccid=c.iccid, imsi=c.imsi, mcc=c.mcc, mnc=c.mnc,
             pin_enabled=c.pin_enabled, pin_tries=c.pin_tries, smsc=c.smsc,
+            identified=bool(c.iccid),
         )
         inst = _match_instance_by_iccid(c.iccid)
         info["matched"] = inst["id"] if inst else None
     except Exception as e:  # noqa
         log.debug("post-LPA card refresh failed: %r", e)
-        info.update(index=idx, name=name, present=True)
+        info.update(index=idx, name=name, present=True, identified=False)
     hub.cards[name] = info
     await hub.broadcast({"type": "cards", "cards": hub.cards_list()})
     return info
@@ -808,16 +879,38 @@ def api_ports_suggest():
         raise HTTPException(409, f"no free port block: {e}")
 
 
+def _iccid_contradicts(idx: int, iccid: str) -> bool:
+    """True only when the live monitor sees a PRESENT, freshly identified card at this reader
+    index whose ICCID is known and different from the line's. Everything unknown — no monitor
+    entry, a card that could not be probed, an entry whose identity predates a reader
+    re-enumeration, a line with no stored ICCID — is not a contradiction: PC/SC offers no
+    "find reader by ICCID", so an absent identity must never cost us the port resolution."""
+    if not iccid:
+        return False
+    for c in hub.cards.values():
+        if not c.get("present") or c.get("index") != idx or not c.get("identified"):
+            continue
+        got = (c.get("iccid") or "").strip()
+        if got and got != iccid:
+            return True
+    return False
+
+
 def _reader_index_for_instance(inst: dict) -> int | None:
-    """Resolve the PC/SC reader index this instance should address, preferring the STABLE
-    physical USB port binding over the (unstable) enumeration index/ICCID.
+    """Resolve the PC/SC reader index this instance should address. The port proposes and the
+    ICCID disposes: the port is only a record of where this SIM was last seen (resolving it
+    costs no APDU, so it is always safe), while the ICCID is what actually identifies the line.
 
     Priority:
-      1. inst.reader_port -> live index via the USB port map. This is authoritative: it sticks
-         to the physical reader socket even when pcscd flips the indices of two identical
-         readers. It does not require the card to be readable/matched by the monitor.
+      1. inst.reader_port -> live index via the USB port map, UNLESS the monitor knows the card
+         now sitting there is a different one. Without that veto a SIM moved between sockets, a
+         foreign card in the old socket, or a switched eSIM profile all keep resolving to the
+         stale reader and the engine authenticates against the wrong card.
       2. ICCID match against the live card monitor (works once the card's identity is known).
+    A veto needs a positive contradiction, so an unreadable or unknown ICCID leaves the port
+    winning — which is what makes two identical readers resolve correctly.
     Returns None if neither resolves (card/reader not present)."""
+    iccid = (inst.get("iccid") or "").strip()
     port = inst.get("reader_port")
     if port:
         try:
@@ -825,11 +918,10 @@ def _reader_index_for_instance(inst: dict) -> int | None:
         except Exception as e:  # noqa
             log.debug("port->index resolve failed for %s: %r", port, e)
             idx = None
-        if idx is not None:
+        if idx is not None and not _iccid_contradicts(idx, iccid):
             return idx
-    iccid = inst.get("iccid")
     for c in hub.cards.values():
-        if c.get("present") and iccid and c.get("iccid") == iccid:
+        if c.get("present") and iccid and (c.get("iccid") or "").strip() == iccid:
             return c.get("index")
     return None
 
@@ -860,8 +952,13 @@ def _card_identity_mismatch(inst: dict) -> dict | None:
     want = (inst.get("iccid") or "").strip()
     if not want:
         return None
-    if _reader_index_for_instance(inst) is not None:
-        return None      # this line's SIM/profile is present somewhere — all good
+    # "Is this line's SIM here?" is an identity question, so it is answered by identity. Asking
+    # the reader resolver instead would answer "does this line's socket exist?" — it hands back
+    # an index without ever looking at the card, so a stranger's SIM in that socket would still
+    # count as the line being present and this whole guard would never fire.
+    for c in hub.cards.values():
+        if c.get("present") and (c.get("iccid") or "").strip() == want:
+            return None      # this line's SIM/profile is present somewhere — all good
     # Prefer the stable USB port binding when present; fall back to stored index.
     port = (inst.get("reader_port") or "").strip()
     idx = inst.get("reader_index")
@@ -905,8 +1002,11 @@ def _preflight_pin_locked(inst: dict, idx: int) -> dict:
         return {"ok": True, "need_pin": bool(inst.get("pin"))}
     if not probe.present:
         return {"ok": False, "code": "no_card"}
+    # `imsi` rides along so a caller can confirm WHICH SIM answered. It reads only after the
+    # PIN is satisfied (EF_IMSI sits under ADF_USIM), which is precisely when a locked card
+    # has no other identity evidence to offer.
     if probe.pin_enabled is False:
-        return {"ok": True, "need_pin": False}
+        return {"ok": True, "need_pin": False, "imsi": probe.imsi}
     saved = inst.get("pin")
     if not saved:
         return {"ok": False, "code": "pin_required", "tries": probe.pin_tries}
@@ -917,7 +1017,7 @@ def _preflight_pin_locked(inst: dict, idx: int) -> dict:
         return {"ok": True, "need_pin": True}     # couldn't verify now; let the engine try
     if chk.error and "PIN" in (chk.error or "").upper():
         return {"ok": False, "code": "pin_invalid", "clear": True, "tries": chk.pin_tries}
-    return {"ok": True, "need_pin": True}
+    return {"ok": True, "need_pin": True, "imsi": chk.imsi}
 
 
 async def _preflight_pin(inst: dict) -> dict:
@@ -953,6 +1053,108 @@ async def _preflight_pin(inst: dict) -> dict:
         lock.release()
 
 
+def _adoptable_iccid(inst: dict, idx: int, observed_imsi: str | None = None) -> str | None:
+    """The ICCID this line may adopt from the card at reader `idx`, or None.
+
+    Lines built through SIM Config's Detect + Save path predate the ICCID being part of that
+    form and carry none, which disables the identity veto and the profile-switch guard for
+    exactly the lines a user hand-built. Adopting one is worth doing, but the socket is NOT
+    evidence of identity: reader_port records where the SIM was last seen, not what is in there
+    now, so a swapped, moved or re-profiled card would be adopted just as readily. A wrong ICCID
+    is also durable and self-justifying — it satisfies the guards that were supposed to catch
+    it, and the correct SIM coming back is then refused as a mismatch.
+
+    So adoption requires the card to positively identify AS this line: the IMSI must match,
+    taken either from the monitor's own probe or from the PIN preflight that just unlocked the
+    card (IMSI lives under ADF_USIM, so a locked card yields one only after VERIFY)."""
+    want_imsi = (inst.get("imsi") or "").strip()
+    if not want_imsi:
+        return None                     # nothing to corroborate against
+    seen = [c for c in hub.cards.values()
+            if c.get("present") and c.get("index") == idx and c.get("identified")]
+    if len(seen) != 1:
+        return None                     # no freshly probed card there, or an ambiguous index
+    entry = seen[0]
+    iccid = (entry.get("iccid") or "").strip()
+    if not iccid:
+        return None
+    if (observed_imsi or entry.get("imsi") or "").strip() != want_imsi:
+        return None
+    owner = _match_instance_by_iccid(iccid)
+    if owner and str(owner.get("id")) != str(inst.get("id")):
+        return None                     # would give two lines one identity
+    return iccid
+
+
+async def _adopt_line_iccid(iid: str, inst: dict, observed_imsi: str | None = None,
+                            ctx: str = "instance") -> dict:
+    """One-time ICCID backfill for a line that has none. Deliberately NOT part of _rebind_reader:
+    the port and index it writes are self-correcting (every consumer re-resolves them live), but
+    an ICCID is the authority everything else consults, so it must not be written as a side
+    effect of a start attempt that validation may still refuse."""
+    if (inst.get("iccid") or "").strip():
+        return inst
+    idx = await asyncio.to_thread(_reader_index_for_instance, inst)
+    if idx is None:
+        return inst
+    learned = await asyncio.to_thread(_adoptable_iccid, inst, idx, observed_imsi)
+    if not learned:
+        return inst
+    try:
+        inst = cfg.upsert_instance({"id": str(iid), "iccid": learned})
+    except ValueError as e:  # another line claimed it between the check and the write
+        log.warning("%s %s: ICCID backfill refused: %s", ctx, iid, e)
+        return inst
+    log.info("%s %s: adopted ICCID %s from reader %s (IMSI-confirmed one-time backfill)",
+             ctx, iid, learned, idx)
+    return inst
+
+
+async def _rebind_reader(iid: str, inst: dict, ctx: str = "instance") -> dict:
+    """Point a line at the reader that CURRENTLY holds its SIM and persist what changed.
+    Two identical readers (no serial) get their pcscd enumeration order — and thus their
+    indices — flipped at boot/pcscd-restart with the cables untouched; a stored index then
+    points at the wrong (or empty) reader, and the engine authenticates against no card ->
+    DEFAULT RES/CK/IK -> carrier rejects EAP-AKA. So:
+      1. (Re)learn the SIM's current USB port (by ICCID from the live monitor) and persist it —
+         this refreshes the locator if the SIM was physically moved to another socket.
+      2. Resolve the live PC/SC index from that port (falls back to ICCID) and persist it too.
+    Everything downstream — the identity guard, the PIN probes, the env the engine is handed —
+    addresses a reader index, so this has to run FIRST or those steps act on the old binding
+    while the engine gets the new one. The engine also self-resolves the port->index
+    in-container, so its self-heal restarts stay correct without the control plane.
+
+    Only the locator is refreshed here. Adopting a missing ICCID is a durable identity claim and
+    lives in _adopt_line_iccid, behind the PIN preflight that can corroborate it."""
+    updates: dict = {}
+    live_port = await asyncio.to_thread(_reader_port_for_instance, inst)
+    if live_port and live_port != inst.get("reader_port"):
+        log.info("%s %s: reader port %s -> %s (live ICCID match)",
+                 ctx, iid, inst.get("reader_port"), live_port)
+        updates["reader_port"] = live_port
+        inst = {**inst, "reader_port": live_port}
+    live_idx = await asyncio.to_thread(_reader_index_for_instance, inst)
+    if live_idx is not None and live_idx != inst.get("reader_index"):
+        log.info("%s %s: reader index %s -> %s (port/ICCID resolve)",
+                 ctx, iid, inst.get("reader_index"), live_idx)
+        updates["reader_index"] = live_idx
+    if updates:
+        inst = cfg.upsert_instance({"id": str(iid), **updates})
+    return inst
+
+
+def _next_instance_id() -> str:
+    """Next free line id. Counting the instances collides after a deletion (lines 1 and 3 left
+    -> 3), and the id is a blind upsert key — the new line would overwrite line 3."""
+    top = 0
+    for i in cfg.list_instances():
+        try:
+            top = max(top, int(str(i.get("id", "")).strip()))
+        except (TypeError, ValueError):
+            continue
+    return str(top + 1)
+
+
 @app.post("/api/provision")
 async def api_provision(body: dict):
     """Provision a detected card: verify PIN, read identity, create the line and start it.
@@ -985,7 +1187,7 @@ async def api_provision(body: dict):
         raise HTTPException(422, "smsc_unreadable: could not read the SMS centre from the SIM — "
                                  "please provide it manually.")
     inst = {
-        "id": str(body.get("id") or (len(cfg.list_instances()) + 1)),
+        "id": str(body.get("id") or _next_instance_id()),
         "name": body.get("name") or f"{c.mcc}-{c.mnc}",
         "imsi": c.imsi, "mcc": c.mcc, "mnc": c.mnc, "iccid": c.iccid,
         "imei": body.get("imei", ""),
@@ -1035,7 +1237,8 @@ async def api_provision(body: dict):
     except ValueError as e:
         message = str(e)
         code = (
-            "duplicate_sip_username"
+            "duplicate_iccid" if "ICCID" in message
+            else "duplicate_sip_username"
             if "more than once" in message or "reserved" in message
             else "invalid_sip_account"
         )
@@ -1120,7 +1323,8 @@ async def api_instance_upsert(body: dict):
     except ValueError as e:
         message = str(e)
         code = (
-            "duplicate_sip_username"
+            "duplicate_iccid" if "ICCID" in message
+            else "duplicate_sip_username"
             if "more than once" in message or "reserved" in message
             else "invalid_sip_account"
         )
@@ -1155,6 +1359,8 @@ async def api_instance_start(iid: str, body: dict | None = None):
     if not inst:
         raise HTTPException(404, "no such instance")
 
+    inst = await _rebind_reader(iid, inst)
+
     # eSIM-profile-switch guard: never start a line whose reader now holds a different
     # identity — EAP-AKA with mismatched IMSI/keys is guaranteed to be rejected by the
     # carrier (and can burn PIN tries on the wrong profile).
@@ -1178,33 +1384,10 @@ async def api_instance_start(iid: str, body: dict | None = None):
         if pf.get("clear"):
             cfg.clear_pin(str(iid))     # stale saved PIN — force re-entry next time
         raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
+    inst = await _adopt_line_iccid(iid, inst, pf.get("imsi"))
 
     settings = cfg.get_settings()
     dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
-    # Bind the line to the reader that CURRENTLY holds its SIM, keyed on the STABLE physical USB
-    # port. Two identical readers (no serial) get their pcscd enumeration order — and thus their
-    # indices — flipped at boot/pcscd-restart with the cables untouched; a stored index then points
-    # at the wrong (or empty) reader, and the engine authenticates against no card -> DEFAULT
-    # RES/CK/IK -> carrier rejects EAP-AKA. So:
-    #   1. (Re)learn the SIM's current USB port (by ICCID from the live monitor) and persist it —
-    #      this refreshes the binding if the SIM was physically moved to another socket.
-    #   2. Resolve the live PC/SC index from that port (falls back to ICCID) and persist it too.
-    # The engine also self-resolves the port->index in-container, so its self-heal restarts stay
-    # correct without the control plane.
-    updates: dict = {}
-    live_port = await asyncio.to_thread(_reader_port_for_instance, inst)
-    if live_port and live_port != inst.get("reader_port"):
-        log.info("instance %s: reader port %s -> %s (live ICCID match)",
-                 iid, inst.get("reader_port"), live_port)
-        updates["reader_port"] = live_port
-        inst = {**inst, "reader_port": live_port}
-    live_idx = await asyncio.to_thread(_reader_index_for_instance, inst)
-    if live_idx is not None and live_idx != inst.get("reader_index"):
-        log.info("instance %s: reader index %s -> %s (port/ICCID resolve)",
-                 iid, inst.get("reader_index"), live_idx)
-        updates["reader_index"] = live_idx
-    if updates:
-        inst = cfg.upsert_instance({"id": str(iid), **updates})
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
@@ -1217,12 +1400,13 @@ async def api_instance_start(iid: str, body: dict | None = None):
 async def api_reprovision(iid: str, body: dict | None = None):
     """Manual re-provision: reset retry state and re-establish the line using the stored
     config (re-reads the SIM, no PIN re-entry). Optional body overrides fields (e.g. sip
-    user_agent) before restart. Runs the same PIN preflight as start."""
+    user_agent) before restart. Runs the same reader rebind + PIN preflight as start."""
     inst = cfg.get_instance(iid)
     if not inst:
         raise HTTPException(404, "no such instance")
     if body:
         inst = cfg.upsert_instance({"id": str(iid), **body})
+    inst = await _rebind_reader(iid, inst)
     mism = _card_identity_mismatch(inst)
     if mism:
         _raise_card_mismatch(inst, mism)
@@ -1231,6 +1415,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
         if pf.get("clear"):
             cfg.clear_pin(str(iid))
         raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
+    inst = await _adopt_line_iccid(iid, inst, pf.get("imsi"), ctx="reprovision")
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
@@ -1261,6 +1446,14 @@ async def api_instance_stop(iid: str):
     # Tear down the AMI client too — otherwise its Manager keeps auto-reconnecting to the
     # now-removed container (and floods a container that later reuses the docker IP).
     await hub.drop_ami(iid)
+    # A deliberate stop must also clear any freeze. apply_health keeps overlaying ERROR while
+    # frozen_code is set, and a network-class freeze additionally schedules _auto_recover — so
+    # without this the poller quietly starts the line the user just stopped.
+    hub.reset_health(iid)
+    # Announce it. Every other state-changing route pushes; stop got away without one because
+    # the WebUI refetches after its own button press, which stops being true the moment
+    # something else (the Telegram bot) issues the stop.
+    asyncio.create_task(push_status(str(iid)))
     return {"ok": True}
 
 
@@ -1704,8 +1897,16 @@ def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):
     tg = settings.get("telegram") or {}
     if not (wh.get("enabled") or tg.get("enabled")):
         return
-    asyncio.create_task(
-        asyncio.to_thread(notify_push.dispatch, settings, event, inst, source, text))
+
+    async def _fire():
+        message_id = await asyncio.to_thread(
+            notify_push.dispatch, settings, event, inst, source, text)
+        # Remember which conversation this notification announced, so a plain reply to it in
+        # the chat is answered as an SMS to that peer instead of needing /use + /sms.
+        if message_id and event == notify_push.EV_INCOMING_SMS:
+            telegram.remember_reply_target(message_id, str(iid), source)
+
+    asyncio.create_task(_fire())
 
 
 

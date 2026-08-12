@@ -46,10 +46,10 @@ function readerBody(readerOrIndex, extra = {}) {
 
 export const api = {
   readers: () => j('GET', '/api/readers'),
-  detect: (i = 0) => j('GET', `/api/sim/detect?reader_index=${i}`),
   // `reader` (PC/SC reader NAME) lets the backend re-resolve the index at request time —
   // indices shift when another reader is unplugged, and a stale index could address the
   // wrong physical SIM.
+  detect: (i = 0, reader) => j('GET', `/api/sim/detect?${readerQuery(i, reader)}`),
   verifyPin: (pin, reader_index = 0, reader) => j('POST', '/api/sim/verify-pin', { pin, reader_index, reader }),
   changePin: (oldp, newp, reader_index = 0) => j('POST', '/api/sim/change-pin', { old: oldp, new: newp, reader_index }),
   setPinEnabled: (pin, enabled, reader_index = 0) => j('POST', '/api/sim/pin-enabled', { pin, enabled, reader_index }),

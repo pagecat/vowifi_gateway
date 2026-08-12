@@ -20,6 +20,13 @@ export default function Settings() {
   const updWhEv = (k, v) => setS((x) => ({ ...x, webhook: { ...wh, events: { ...(wh.events || {}), [k]: v } } }))
   const updTg = (patch) => setS((x) => ({ ...x, telegram: { ...tg, ...patch } }))
   const updTgEv = (k, v) => setS((x) => ({ ...x, telegram: { ...tg, events: { ...(tg.events || {}), [k]: v } } }))
+  const tgc = tg.commands || {}
+  const updTgCmd = (patch) => setS((x) => ({ ...x, telegram: { ...tg, commands: { ...tgc, ...patch } } }))
+  // Chat ids are edited as free text but stored as a list, so an empty box means "no extra
+  // chats" rather than a list holding one empty string.
+  const setAllowedChats = (text) => updTgCmd({
+    allowed_chats: text.split(',').map((c) => c.trim()).filter(Boolean),
+  })
 
   const save = async () => {
     try {
@@ -209,9 +216,12 @@ export default function Settings() {
           onChange={(e) => updTg({ enabled: e.target.checked })} />Enable Telegram push</label>
         <div style={{ marginTop: 12, opacity: tg.enabled ? 1 : .5 }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <div><label>Bot token</label>
-              <input className="mono" value={tg.bot_token || ''} disabled={!tg.enabled}
-                onChange={(e) => updTg({ bot_token: e.target.value })} placeholder="123456:ABC-DEF..." /></div>
+            {/* Write-only: the server sends back a blank token and treats a blank one on save
+                as "unchanged", so the credential never round-trips through the browser. */}
+            <div><label>Bot token{tg.bot_token_set ? ' (saved)' : ''}</label>
+              <input className="mono" type="password" value={tg.bot_token || ''} disabled={!tg.enabled}
+                onChange={(e) => updTg({ bot_token: e.target.value })}
+                placeholder={tg.bot_token_set ? 'leave blank to keep the saved token' : '123456:ABC-DEF...'} /></div>
             <div><label>Chat / Channel ID</label>
               <input className="mono" value={tg.chat_id || ''} disabled={!tg.enabled}
                 onChange={(e) => updTg({ chat_id: e.target.value })} placeholder="-1001234567890 or 12345678" /></div>
@@ -222,6 +232,32 @@ export default function Settings() {
               checked={tg.events?.incoming_call !== false} onChange={(e) => updTgEv('incoming_call', e.target.checked)} />Incoming call</label>
             <label><input type="checkbox" style={{ width: 'auto', marginRight: 7 }} disabled={!tg.enabled}
               checked={tg.events?.incoming_sms !== false} onChange={(e) => updTgEv('incoming_sms', e.target.checked)} />Incoming SMS</label>
+          </div>
+
+          <h4 style={{ marginBottom: 4 }}>Commands (two-way)</h4>
+          <div style={{ fontSize: 12.5, color: 'var(--text-mute)', marginBottom: 8, lineHeight: 1.5 }}>
+            Lets the same bot take orders, not just send notices. Anyone who can post in an
+            allowed chat can act on this gateway, so the riskier groups are separate switches.
+          </div>
+          <label><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} disabled={!tg.enabled}
+            checked={!!tgc.enabled} onChange={(e) => updTgCmd({ enabled: e.target.checked })} />
+            Accept commands (SMS, status)</label>
+          <div style={{ marginTop: 10, opacity: tg.enabled && tgc.enabled ? 1 : .5 }}>
+            <label>Chats allowed to command (comma separated)</label>
+            <input className="mono" disabled={!tg.enabled || !tgc.enabled}
+              value={(tgc.allowed_chats || []).join(', ')}
+              onChange={(e) => setAllowedChats(e.target.value)}
+              placeholder="empty = only the Chat / Channel ID above" />
+            <label style={{ display: 'block', marginTop: 10 }}>
+              <input type="checkbox" style={{ width: 'auto', marginRight: 8 }}
+                disabled={!tg.enabled || !tgc.enabled} checked={!!tgc.allow_management}
+                onChange={(e) => updTgCmd({ allow_management: e.target.checked })} />
+              Also allow line control (start / stop / re-provision / PIN)
+            </label>
+            <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
+              A PIN sent in chat is deleted from the conversation as soon as it is read, but it
+              still travels through Telegram — prefer entering it here in the WebUI.
+            </div>
           </div>
         </div>
       </div>

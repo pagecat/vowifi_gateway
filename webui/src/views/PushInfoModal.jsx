@@ -57,6 +57,20 @@ Hello there`}</pre>
               <li>Add the bot to the channel/group as a member (and admin, for channels) so it can post.</li>
               <li>Send the bot a message first if pushing to a private chat, so it's allowed to reply.</li>
             </ul>
+            <p style={{ fontSize: 13, color: 'var(--text-soft)', fontWeight: 600, margin: '14px 0 4px' }}>Commands (two-way)</p>
+            <p style={{ fontSize: 12.5, color: 'var(--text-dim)', lineHeight: 1.6, marginTop: 0 }}>
+              With <b>Accept commands</b> on, the same bot also takes orders. Send it <code>/help</code>
+              for the current list. Replying to an incoming-SMS notification answers that sender,
+              so the common case needs no command at all.
+            </p>
+            <ul style={{ fontSize: 12.5, color: 'var(--text-dim)', lineHeight: 1.7, paddingLeft: 20 }}>
+              <li><code>/status</code>, <code>/lines</code>, <code>/use &lt;line&gt;</code> — with one SIM you never need <code>/use</code>.</li>
+              <li><code>/sms &lt;number&gt; &lt;text&gt;</code> — the reply updates itself to <i>delivered</i> or the failure reason.</li>
+              <li><code>/msgs</code> lists recent conversations; <code>/msgs &lt;number&gt;</code> opens one.</li>
+              <li>With <b>line control</b> on: <code>/line_start</code>, <code>/line_stop</code>, <code>/line_register</code>, <code>/line_reprovision</code>, <code>/pin</code>. Stopping and re-provisioning ask for confirmation first.</li>
+              <li>Only the chats you list may command the bot; anything else is ignored without a reply.</li>
+              <li>Commands older than a minute are discarded, so a queue built up while the gateway was down is never replayed.</li>
+            </ul>
           </>
         )}
 

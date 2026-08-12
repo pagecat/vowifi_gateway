@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 
 import docker
 
@@ -30,8 +31,27 @@ PCSCD_SOCK = os.environ.get("VOWIFI_PCSCD_DIR", "/run/pcscd")
 HOST_DATA_DIR = os.environ.get("VOWIFI_HOST_DATA", DATA_DIR)
 
 
+_client_lock = threading.Lock()
+_client_cached: "docker.DockerClient | None" = None
+
+
 def _client():
-    return docker.from_env()
+    """One shared client. docker.from_env() re-reads the environment, builds a new HTTP
+    session over the daemon socket and negotiates an API version on EVERY call — the status
+    poller probes each container every few seconds, so paying that repeatedly is a real cost
+    on a small board. The SDK is designed to be built once and reused."""
+    global _client_cached
+    with _client_lock:
+        if _client_cached is None:
+            _client_cached = docker.from_env()
+        return _client_cached
+
+
+def reset_client():
+    """Drop the shared client so the next call rebuilds it (daemon restarted / socket gone)."""
+    global _client_cached
+    with _client_lock:
+        _client_cached = None
 
 
 def container_name(iid: str) -> str:
@@ -140,6 +160,9 @@ def is_running(iid: str) -> bool:
         return c.status == "running"
     except docker.errors.NotFound:
         return False
+    except docker.errors.DockerException:
+        reset_client()      # a wedged socket must not be reused by every later probe
+        raise
 
 
 def container_ip(iid: str) -> str | None:
@@ -149,7 +172,10 @@ def container_ip(iid: str) -> str | None:
         for n in nets.values():
             if n.get("IPAddress"):
                 return n["IPAddress"]
+    except docker.errors.NotFound:
+        return None
     except Exception:
+        reset_client()
         return None
     return None
 
