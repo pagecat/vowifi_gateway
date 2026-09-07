@@ -8,3 +8,6 @@ cryptography>=42.0
 Jinja2>=3.1
 python-multipart>=0.0.9
 requests>=2.31
+# MTProto login for the userbot sidecar, so the WebUI can collect the SMS code
+# without an SSH session. Pure Python; the native call stack stays in the sidecar.
+telethon>=1.36

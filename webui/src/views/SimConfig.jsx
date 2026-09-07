@@ -21,7 +21,9 @@ const PREVIEW_MCC_ISO = {
 }
 
 const emptyInstance = () => ({
-  id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '',
+  // `iccid` is the line's identity; `reader`/`reader_index`/`reader_port` only record where
+  // that card was last seen, so the manager can find it again without an APDU.
+  id: '', name: '', imsi: '', iccid: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '',
   reader_index: 0, reader_port: '', msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn', cp_mode: 'auto',
   use_reauth_id: true,
   sip: {
@@ -66,6 +68,22 @@ function previewPani(sip, mcc) {
     if (n) parts.push(`i-wlan-node-id=${n}`)
   }
   return parts.join(';')
+}
+
+/** Next free line id. `instances.length + 1` collides after a deletion (lines 1 and 3 left ->
+ *  "3"), and POST /api/instances is a blind upsert by id — the new line would overwrite line 3. */
+function nextInstanceId(instances) {
+  const top = (instances || []).reduce((m, i) => Math.max(m, parseInt(i.id, 10) || 0), 0)
+  return String(top + 1)
+}
+
+/** Green (success) vs amber (attention) for the free-form status line. Failures are tested
+ *  first, and success matches whole phrases: a bare 'read' also matches the word "reader", so
+ *  anything mentioning a reader — a card-swap warning, or "reader '…' is no longer connected"
+ *  — used to be painted as if everything were fine. */
+function pinMsgOk(m) {
+  if (m.startsWith('⚠') || m.startsWith('Error') || m.startsWith('Failed')) return false
+  return m.includes('OK') || m.includes('Card read') || m.startsWith('Saved.') || m.includes('deleted')
 }
 
 function sipUsernameConflict(sip) {
@@ -121,21 +139,36 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   // Keep the "PIN saved?" indicator in sync when it changes server-side (delete-PIN,
   // start-with-PIN) without a full line switch — mirror the fresh value onto the form.
   useEffect(() => { if (selected) setForm((f) => ({ ...f, has_pin: selected.has_pin })) }, [selected?.has_pin])
+  // Same for an ICCID the manager learned server-side (an older line without one gets it
+  // backfilled on its next start). Only fills a blank — a just-detected card must win.
+  useEffect(() => {
+    if (selected?.iccid) setForm((f) => (f.iccid ? f : { ...f, iccid: selected.iccid }))
+  }, [selected?.iccid])
 
   const upd = (patch) => setForm((f) => ({ ...f, ...patch }))
   const updSip = (patch) => setForm((f) => ({ ...f, sip: { ...f.sip, ...patch } }))
   // The reader index to act on, clamped to a reader that currently exists (never probe a
   // stale/out-of-range index that would report a phantom empty reader).
   const readerIdx = () => (form.reader_index >= 0 && form.reader_index < readers.length) ? form.reader_index : 0
+  // PC/SC NAME of that reader. Sent alongside the index so the backend addresses the reader the
+  // user is looking at even if the list shifted since it was fetched.
+  const readerName = () => readers[readerIdx()] || ''
   // Stable USB port path of a reader index (from the live card monitor). A line binds to this
   // port, not the enumeration index, so it sticks to the physical reader socket even when pcscd
   // re-enumerates two identical readers in a different order.
   const portForIdx = (i) => (cards.find((c) => c.index === i) || {}).reader_port || ''
+  // Picking a reader re-points the locator at it. A port that contradicts the chosen reader is
+  // worse than none, so an unknown port clears the stored one — but only when the monitor has
+  // actually reported: with no card data at all we don't know anything yet, and discarding a
+  // good binding on transient ignorance would disable the port arm of every identity check.
+  const pickReader = (i) => upd(cards.length
+    ? { reader_index: i, reader_port: portForIdx(i) }
+    : { reader_index: i })
 
   const detect = async () => {
     setPinMsg('Detecting…')
     try {
-      const c = await api.detect(readerIdx())
+      const c = await api.detect(readerIdx(), readerName())
       setCard(c)
       if (!c.present) {
         setPinMsg('No SIM card in this reader.')
@@ -143,21 +176,33 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       }
       const patch = { imsi: c.imsi || form.imsi, mcc: c.mcc || form.mcc, mnc: c.mnc || form.mnc }
       if (c.smsc && smscMode === 'auto') patch.smsc = c.smsc   // SMSC from the SIM (EF_SMSP)
+      // Keep the `imsi:` form — the engine's reader matcher understands no other prefix.
       if (c.imsi) patch.reader = `imsi:${c.imsi}`
-      // Bind the line to the reader's stable physical USB port (from the detected card, else the
-      // live monitor). Persisted so start-time re-resolves the correct index for this socket.
+      // The ICCID is what identifies this line's SIM. Without it the manager can only trust the
+      // socket, which is exactly what goes wrong when cards are swapped between readers.
+      if (c.iccid) patch.iccid = c.iccid
+      // Where that card currently sits (from the detected card, else the live monitor). A hint
+      // for finding it again — start-time re-resolves the live index from this port.
       const port = c.reader_port || portForIdx(readerIdx())
       if (port) patch.reader_port = port
-      if (!form.id) patch.id = String(instances.length + 1)
+      if (!form.id) patch.id = nextInstanceId(instances)
+      const known = (form.iccid || '').trim()
+      const found = (c.iccid || '').trim()
       upd(patch)
-      setPinMsg(c.imsi ? 'Card read.' : `Card present (enter PIN to read IMSI). ICCID ${c.iccid || '?'}, tries ${c.pin_tries ?? '?'}`)
+      if (known && found && known !== found) {
+        setPinMsg(`⚠ Different SIM: this line is ${known}, the card in this slot is ${found}. `
+          + 'Saving now moves the line onto the new card (a swapped SIM or a switched eSIM '
+          + 'profile); put the original card back if that is not what you want.')
+      } else {
+        setPinMsg(c.imsi ? 'Card read.' : `Card present (enter PIN to read IMSI). ICCID ${found || '?'}, tries ${c.pin_tries ?? '?'}`)
+      }
     } catch (e) { setPinMsg('Error: ' + e.message) }
   }
 
   const verifyPin = async () => {
     setPinMsg('Verifying…')
     try {
-      const r = await api.verifyPin(pin, readerIdx())
+      const r = await api.verifyPin(pin, readerIdx(), readerName())
       setPinMsg(r.ok ? 'PIN OK ✓' : `Failed: ${r.error} (${r.tries} tries left)`)
       if (r.ok) {
         const p = { pin }
@@ -173,14 +218,32 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
     try {
       const sipError = sipUsernameConflict(form.sip)
       if (sipError) throw new Error(sipError)
-      const body = { ...form, mnc: String(form.mnc).padStart(3, '0') }
-      // Strip runtime-only fields that ride along on the instance object from /api/instances
-      // (they are computed per-request, not config — never persist them).
-      delete body.status; delete body.has_pin
+      // Send a PATCH of what this form actually owns, not the whole object. /api/instances
+      // merges, and GET /api/instances overlays the LIVE reader index/port onto every line —
+      // so posting the form wholesale writes back a snapshot of wherever the SIM happened to be
+      // when the page was seeded, undoing a binding the manager has since relearned. It also
+      // keeps runtime-only fields (status, has_pin) out of the config by construction.
+      const body = {
+        id: form.id, name: form.name, imsi: form.imsi,
+        mcc: form.mcc, mnc: String(form.mnc).padStart(3, '0'),
+        imei: form.imei, imeisv: form.imeisv, msisdn: form.msisdn, smsc: form.smsc,
+        apn: form.apn, idr_mode: form.idr_mode, cp_mode: form.cp_mode,
+        use_reauth_id: form.use_reauth_id, enabled: form.enabled, sip: form.sip,
+      }
+      // The SIM binding is rewritten only on a deliberate change — a fresh Detect, a different
+      // reader, or a line that doesn't exist yet. Editing an APN must not re-pin the line.
+      // Compared against the loaded line only when it IS this line: after a delete the form is
+      // blank while `selected` has moved on, and a new line must carry its own binding.
+      const saved = selected && String(selected.id) === String(form.id) ? selected : null
+      for (const k of ['iccid', 'reader', 'reader_index', 'reader_port']) {
+        if (!saved || form[k] !== saved[k]) body[k] = form[k]
+      }
+      // A blank ICCID is never a deliberate edit: the field is read-only and only a card read
+      // fills it, so sending one would erase an identity the manager learned on its own.
+      if (!body.iccid) delete body.iccid
       // Never send an empty PIN — the stored PIN (tied to this IMSI) must survive edits to
       // unrelated fields. `pin` state is only set when the user re-enters/verifies a PIN
       // here; only then do we forward it to update the saved credential.
-      delete body.pin
       if (pin) body.pin = pin
       // An empty password field means "keep the saved secret", not "replace it with
       // empty". A deliberate password change is sent normally.
@@ -233,19 +296,19 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
     <div style={{ maxWidth: 1000 }}>
       {instances.length > 1 &&
         <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} label="Configuring line" />}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="sim-config-grid">
       {/* Card / PIN panel */}
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ marginTop: 0 }}>SIM card</h3>
         <Field label="Reader">
-          <select value={form.reader_index} onChange={(e) => upd({ reader_index: +e.target.value, reader_port: portForIdx(+e.target.value) || form.reader_port })}>
+          <select value={form.reader_index} onChange={(e) => pickReader(+e.target.value)}>
             {readers.map((r, i) => <option key={i} value={i}>{i}: {r}{portForIdx(i) ? ` — USB ${portForIdx(i)}` : ''}</option>)}
             {readers.length === 0 && <option>no readers</option>}
           </select>
         </Field>
         {form.reader_port &&
           <div className="mono" style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
-            Bound to USB port {form.reader_port} (stable across reader re-enumeration)
+            SIM last seen at USB port {form.reader_port} — where to look for it, not what identifies it
           </div>}
         <button className="btn btn-ghost" style={{ marginTop: 10 }} onClick={detect}>Detect card</button>
         {card && (
@@ -273,16 +336,22 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               : 'No PIN saved — you\'ll be asked for it when the line is started (if the SIM requires one).'}
           </div>
         )}
-        {pinMsg && <div style={{ fontSize: 13, marginTop: 10, color: pinMsg.includes('OK') || pinMsg.includes('read') || pinMsg.startsWith('Saved.') || pinMsg.includes('deleted') ? '#22c55e' : '#eab308' }}>{pinMsg}</div>}
+        {pinMsg && <div style={{ fontSize: 13, marginTop: 10, color: pinMsgOk(pinMsg) ? '#22c55e' : '#eab308' }}>{pinMsg}</div>}
       </div>
 
       {/* Instance form */}
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ marginTop: 0 }}>Line configuration</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
           <Field label="Instance ID"><input value={form.id} onChange={(e) => upd({ id: e.target.value })} placeholder="1" /></Field>
           <Field label="Name"><input value={form.name} onChange={(e) => upd({ name: e.target.value })} placeholder="Telus" /></Field>
           <Field label="IMSI"><input className="mono" value={form.imsi} onChange={(e) => upd({ imsi: e.target.value })} /></Field>
+          {/* Read-only: the ICCID is this line's identity and is only ever taken from the card
+              itself. Typing one in would claim a SIM the manager has never seen. */}
+          <Field label="ICCID (SIM identity)">
+            <input className="mono" value={form.iccid || ''} readOnly style={{ opacity: .7 }}
+              placeholder="detect the card to read it" />
+          </Field>
           <Field label="MCC"><input value={form.mcc} onChange={(e) => upd({ mcc: e.target.value })} /></Field>
           <Field label="MNC"><input value={form.mnc} onChange={(e) => upd({ mnc: e.target.value })} /></Field>
           <Field label="IMEI"><input className="mono" value={form.imei} onChange={(e) => upd({ imei: e.target.value })} placeholder="35123456-789012-3" /></Field>
@@ -344,7 +413,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         </div>
 
         <h4 style={{ marginBottom: 6 }}>Local SIP access</h4>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
           <Field label="Listen address">
             <select value={form.sip.listen_addr} onChange={(e) => updSip({ listen_addr: e.target.value })}>
               <option value="0.0.0.0">0.0.0.0 (all)</option>

@@ -59,6 +59,16 @@ DEFAULTS = {
             "bot_token": "",
             "chat_id": "",
             "events": {"incoming_sms": True, "incoming_call": True},
+            # Inbound commands (the bot listening, not just notifying). Layered on purpose:
+            # reading/sending SMS, restarting a line, and rewriting an eUICC are three very
+            # different amounts of trust, so each is opt-in separately and all default off.
+            # allowed_chats empty = only chat_id may command the bot.
+            "commands": {
+                "enabled": False,
+                "allowed_chats": [],
+                "allow_management": False,
+                "allow_esim": False,
+            },
         },
         # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
         # $VOWIFI_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
@@ -213,9 +223,25 @@ def _ensure():
             yaml.safe_dump(DEFAULTS, f)
 
 
+_cached: dict | None = None
+_cached_key: tuple | None = None
+
+
 def load() -> dict:
+    """Read + merge the config. Cached on the file's mtime/size because get_instance,
+    list_instances and get_settings all funnel through here and are called dozens of times
+    per request cycle — re-reading and re-parsing the YAML each time is disk work done under
+    a lock the event loop also waits on. Callers mutate what they get, so hand out a copy."""
+    global _cached, _cached_key
     with _lock:
         _ensure()
+        try:
+            st = os.stat(CONFIG_PATH)
+            cache_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            cache_key = None
+        if cache_key is not None and cache_key == _cached_key and _cached is not None:
+            return deepcopy(_cached)
         with open(CONFIG_PATH) as f:
             data = yaml.safe_load(f) or {}
         # merge defaults (shallow for settings)
@@ -234,11 +260,15 @@ def load() -> dict:
             merged = {**DEFAULTS["settings"][key], **saved}
             merged["events"] = {**DEFAULTS["settings"][key]["events"],
                                 **(saved.get("events", {}) or {})}
+            if "commands" in DEFAULTS["settings"][key]:
+                merged["commands"] = {**DEFAULTS["settings"][key]["commands"],
+                                      **(saved.get("commands", {}) or {})}
             out["settings"][key] = merged
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
         out["instances"] = data.get("instances", {})
-        return out
+        _cached, _cached_key = out, cache_key
+        return deepcopy(out)
 
 
 def esim_settings() -> dict:
@@ -250,12 +280,15 @@ def esim_settings() -> dict:
 
 
 def save(data: dict):
+    global _cached, _cached_key
     with _lock:
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w") as f:
             yaml.safe_dump(data, f, sort_keys=False)
         os.replace(tmp, CONFIG_PATH)
+        # Don't rely on the new mtime differing from the cached one; drop it outright.
+        _cached, _cached_key = None, None
 
 
 def get_settings() -> dict:
@@ -274,6 +307,13 @@ def public_settings() -> dict:
     settings["advertise_address_effective"] = advertise_address(settings)
     settings["advertise_address_managed_by_env"] = advertise_address_managed_by_env()
     settings["advertise_address_detected"] = _host_lan_ipv4() or ""
+    # The bot token is a bearer credential for an account that can now be commanded, and this
+    # payload goes to every browser that opens Settings. Report only whether one is set; an
+    # empty token in a patch is understood as "leave it alone" (see update_settings).
+    tg = dict(settings.get("telegram") or {})
+    tg["bot_token_set"] = bool((tg.get("bot_token") or "").strip())
+    tg["bot_token"] = ""
+    settings["telegram"] = tg
     return settings
 
 
@@ -287,6 +327,15 @@ def update_settings(patch: dict) -> dict:
         patch["advertise_address"] = normalize_advertise_address(
             patch.get("advertise_address")
         )
+    # public_settings blanks the bot token, so the WebUI never has the real one to send back.
+    # An empty token therefore means "unchanged" — the same rule the SIM PIN and the SIP
+    # account passwords already follow — otherwise every Settings save would erase it.
+    if isinstance(patch.get("telegram"), dict):
+        tg_patch = dict(patch["telegram"])
+        tg_patch.pop("bot_token_set", None)
+        if not str(tg_patch.get("bot_token") or "").strip():
+            tg_patch["bot_token"] = (data["settings"].get("telegram") or {}).get("bot_token", "")
+        patch["telegram"] = tg_patch
     try:
         previous = normalize_advertise_address(
             data["settings"].get("advertise_address", "")
@@ -445,6 +494,42 @@ _SIP_RESERVED_USERNAMES = frozenset({
 })
 
 
+def validate_sip_username(username: str) -> None:
+    """Reject a name Asterisk reserves for itself. Raises ValueError."""
+    name = str(username or "").strip()
+    if not name:
+        raise ValueError("a SIP username cannot be empty")
+    if name in _SIP_RESERVED_USERNAMES:
+        raise ValueError(
+            f"SIP username '{name}' is reserved (used by the built-in softphone "
+            "or Asterisk internals). Choose a different name."
+        )
+
+
+def _sip_username_line_in(data: dict, username: str, exclude_iid: str | None = None) -> str | None:
+    name = str(username or "").strip()
+    if not name:
+        return None
+    for iid, inst in (data.get("instances") or {}).items():
+        if exclude_iid is not None and str(iid) == str(exclude_iid):
+            continue
+        for account in ((inst.get("sip") or {}).get("external") or []):
+            if isinstance(account, dict) and str(account.get("username") or "").strip() == name:
+                return str(iid)
+    return None
+
+
+def sip_username_line(username: str, exclude_iid: str | None = None) -> str | None:
+    """The line already using this external SIP username, if any.
+
+    Names have to be unique across lines and not merely within one, because the
+    userbot sidecar registers every line's account from a single PJSUA2
+    endpoint: two accounts sharing a `sip:user@host` identity make an inbound
+    call ambiguous, and PJSIP hands it to whichever it matches first.
+    """
+    return _sip_username_line_in(load(), username, exclude_iid)
+
+
 def validate_sip_external_usernames(sip: dict | None) -> None:
     """Reject external SIP names that would collide in the rendered pjsip config."""
     sip = sip or {}
@@ -515,6 +600,14 @@ def upsert_instance(inst: dict) -> dict:
     # instances with a computed `status` and `has_pin`); never persist them to config.
     inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
     existing = data["instances"].get(iid, {})
+    # An ICCID names exactly one line: it is how a physical card is matched to its config, and
+    # every lookup takes the FIRST match. Two lines sharing one would silently capture each
+    # other's card, port relearning and identity verdict, so refuse it at the door.
+    new_iccid = str(inst.get("iccid") or "").strip()
+    if new_iccid:
+        for other_id, other in data["instances"].items():
+            if str(other_id) != iid and str(other.get("iccid") or "").strip() == new_iccid:
+                raise ValueError(f"ICCID {new_iccid} already belongs to line {other_id}")
     if "index" not in existing:
         inst["index"] = next_index(data)
     else:
@@ -564,6 +657,23 @@ def upsert_instance(inst: dict) -> dict:
         prev = (existing.get("sip", {}) or {}).get("webrtc", {}) or {}
         wr["password"] = prev.get("password") or secrets.token_urlsafe(12)
     validate_sip_external_usernames(sip)
+    # Cross-line uniqueness, but only for names this save introduces: a clash
+    # that predates it is not something the user can fix from this form.
+    had = {str(a.get("username") or "").strip()
+           for a in ((existing.get("sip") or {}).get("external") or [])
+           if isinstance(a, dict)}
+    for account in (sip.get("external") or []):
+        if not isinstance(account, dict):
+            continue
+        name = str(account.get("username") or "").strip()
+        if not name or name in had:
+            continue
+        clash = _sip_username_line_in(data, name, exclude_iid=iid)
+        if clash:
+            raise ValueError(
+                f"SIP username '{name}' already belongs to line {clash}. Names must be "
+                "unique across lines, or the userbot cannot register them all at once."
+            )
     data["instances"][iid] = merged
     save(data)
     return merged
@@ -893,8 +1003,15 @@ def write_instance_json(inst: dict, settings: dict) -> str:
     d = os.path.join(DATA_DIR, "instances", str(inst["id"]))
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, "instance.json")
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(render_instance_json(inst, settings), f, indent=2)
-    os.replace(tmp, path)
+    payload = json.dumps(render_instance_json(inst, settings), indent=2)
+    # The engine bind-mounts this file (or its parent dir). os.replace() swaps
+    # the inode; a running container keeps the old one and Asterisk never sees
+    # new SIP accounts. Truncate-and-write the existing inode instead.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     return path

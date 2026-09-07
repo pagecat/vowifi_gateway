@@ -453,6 +453,8 @@ Environment=VOWIFI_ADVERTISE_ADDR=$LAN_IP
 Environment=VOWIFI_ENGINE_IMAGE=$ENGINE_IMAGE
 Environment=VOWIFI_MANAGER_URL=https://host.docker.internal:$VOWIFI_PORT
 Environment=VOWIFI_PCSCD_DIR=/run/pcscd
+Environment=VOWIFI_REPO=$REPO_DIR
+Environment=VOWIFI_USERBOT_IMAGE=vowifi/userbot
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$VENV_DIR/bin/python run.py
 Restart=on-failure
@@ -495,13 +497,16 @@ run_control() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /run/pcscd:/run/pcscd \
     -v "${DATA_ABS}:/data" \
+    -v "${REPO_DIR}:/opt/vowifi-src:ro" \
     -e VOWIFI_DATA=/data \
     -e VOWIFI_HOST_DATA="${DATA_ABS}" \
+    -e VOWIFI_REPO=/opt/vowifi-src \
     -e VOWIFI_HTTP_PORT=8443 \
     -e VOWIFI_BIND="${VOWIFI_BIND}" \
     -e VOWIFI_ADVERTISE_ADDR="${LAN_IP}" \
     -e VOWIFI_MANAGER_URL="https://host.docker.internal:${VOWIFI_PORT}" \
     -e VOWIFI_ENGINE_IMAGE="${ENGINE_IMAGE}" \
+    -e VOWIFI_USERBOT_IMAGE=vowifi/userbot \
     -e VOWIFI_PCSCD_DIR=/run/pcscd \
     "$CONTROL_IMAGE"
 }

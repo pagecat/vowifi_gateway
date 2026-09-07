@@ -3,10 +3,19 @@ import { api } from '../api.js'
 import ProvisionModal from './ProvisionModal.jsx'
 import SipInfoModal from './SipInfoModal.jsx'
 
+// Header status pill. It must never be squeezed by a long reader name — a shrunk pill wraps
+// its label over two or three lines and flattens the status dot. The auto margins centre it
+// on the row it wraps onto; while it still shares the header row, the title block's flex-grow
+// leaves no free space for them, so it stays hard right.
+const BADGE_STYLE = {
+  display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600,
+  flexShrink: 0, whiteSpace: 'nowrap', marginLeft: 'auto', marginRight: 'auto',
+}
+
 function StateBadge({ st }) {
   const state = st?.state || 'STOPPED'
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600 }}>
+    <span style={BADGE_STYLE}>
       <span className={`dot st-${state}`} />
       {st?.label || 'Unknown'}
     </span>
@@ -215,7 +224,10 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
 
   const act = async (id, fn) => {
     setBusy(id)
-    try { await fn(); await refresh() }
+    // Kick the refresh off but don't wait for it: /api/instances re-derives every line's
+    // status (Docker + AMI) and can take seconds, while the state this action produced is
+    // pushed over the WebSocket anyway. Awaiting it left the whole page looking frozen.
+    try { await fn(); refresh().catch(() => {}) }
     catch (e) {
       const pe = pinError(e)
       if (pe) setPinPrompt({ inst: instances.find((i) => String(i.id) === String(id)), tries: pe.tries,
@@ -266,11 +278,14 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
                 outline: isSel ? '2px solid var(--primary)' : '1px solid transparent', outlineOffset: 2 }}>
 
               {/* ---- Header: reader as the identity ---- */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 10 }}>
-                <div style={{ minWidth: 0 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                {/* Fixed flex basis, not `auto`: wrapping is decided from an item's hypothetical
+                    size, so a content-sized basis would drop the pill below even when the name
+                    could simply wrap beside it. */}
+                <div style={{ flex: '1 1 180px', minWidth: 0 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={{ fontSize: 15, fontWeight: 700 }}>{readerTitle(r)}</span>
-                    {isSel && <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--primary)', border: '1px solid var(--primary)', borderRadius: 6, padding: '1px 6px' }}>ACTIVE</span>}
+                    {isSel && <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--primary)', border: '1px solid var(--primary)', borderRadius: 6, padding: '1px 6px', flexShrink: 0 }}>ACTIVE</span>}
                   </div>
                   <div style={{ fontSize: 12, color: 'var(--text-mute)', marginTop: 3 }}>
                     {inst ? (inst.name || `Line ${inst.id}`) : r.present ? 'Unprovisioned SIM' : 'Empty'}
@@ -278,7 +293,7 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
                 </div>
                 {inst
                   ? <StateBadge st={inst.status} />
-                  : <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600, color: r.present ? '#eab308' : 'var(--text-mute)' }}>
+                  : <span style={{ ...BADGE_STYLE, color: r.present ? '#eab308' : 'var(--text-mute)' }}>
                       <span className={`dot st-${r.present ? 'REGISTERING' : 'NO_CARD'}`} />
                       {r.present ? 'SIM detected' : 'No SIM card'}
                     </span>}

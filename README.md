@@ -196,8 +196,55 @@ Open `https://<host-ip>:<VOWIFI_PORT>` (default 8443). Tabs (see [Screenshots](#
 - **/softphone** — browser-based WebRTC dialer (click-to-call from the dashboard, or dial manually; supports inbound calls, DTMF, call recording)
 - **/messages** — SMS inbox/outbox (SIP MESSAGE ↔ carrier SMS, per instance)
 - **/esim** — eUICC profile management via local lpac (chip info, download, enable/disable/delete, notifications; dual-SE aware). Requires cloning [lpac](https://github.com/estkme-group/lpac) next to this repo and running `./install.sh build-lpac` once.
-- **/settings** — global config (TLS domain for Let's Encrypt, Asterisk debug toggles, ring timeout, etc.)
+- **/settings** — global config (TLS domain for Let's Encrypt, Asterisk debug toggles, ring timeout, Telegram bot notices/commands, Telegram-call sidecar)
 - **/logs** — call/SMS logs with filtering
+
+---
+
+## Telegram bot (two-way commands)
+
+The same bot that sends incoming-SMS / incoming-call notices can also take orders. This is **off by default**.
+
+In **Settings → Telegram**:
+
+1. Enable Telegram push and set the bot token + Chat / Channel ID (same as for notices). The token is write-only in the WebUI — leave the field blank to keep the saved one.
+2. Turn on **Accept commands (SMS, status)**.
+3. Optionally list extra chats allowed to command the bot (comma-separated). Empty = only the Chat / Channel ID above. Unlisted chats are ignored without a reply.
+4. Separately opt in to **line control** (start / stop / re-register / re-provision / PIN) and **eSIM management** (switch / download / delete profiles). Each is a different amount of trust.
+
+Commands older than a minute are discarded, so a queue built up while the gateway was down is never replayed. A PIN or eSIM activation code sent in chat is deleted from the conversation as soon as it is read; prefer entering a PIN in the WebUI.
+
+| Command | Switch | What |
+|---------|--------|------|
+| `/status`, `/lines`, `/use <line>` | Accept commands | Line state. With one SIM you never need `/use`. |
+| `/sms <number> <text>`, `/msgs` | Accept commands | Send SMS; list or open recent conversations. The send confirmation rewrites itself to delivered or the failure reason. |
+| Reply to an incoming-SMS notice | Accept commands | Answers that sender — no `/sms` needed. |
+| `/line_start`, `/line_stop`, `/line_register`, `/line_reprovision`, `/pin` | + line control | Stop and re-provision ask for confirmation first. |
+| `/esim`, `/esim_profiles`, `/esim_enable`, `/esim_disable`, `/esim_delete`, `/esim_download`, `/esim_notify`, `/esim_notify_process` | + eSIM | Addressed by reader (and eUICC on dual-SE cards), not by line. `/esim` picks the target; that choice expires after a few minutes. Delete asks you to type the last four ICCID digits back. If a line is using the reader, the bot offers to stop it, run the operation, and start it again. |
+
+Send `/help` in the chat for the live list.
+
+---
+
+## Telegram calls (userbot)
+
+A bot account cannot join a Telegram voice call. Bridging Telegram calls to a SIM therefore needs a **second Telegram user account** and a separate container (`vowifi/userbot`).
+
+Configure it in **Settings → Telegram calls (userbot)**: API id / hash (from [my.telegram.org/apps](https://my.telegram.org/apps)), the spare account's phone number (`+…`), and your numeric Telegram user id (from [@userinfobot](https://t.me/userinfobot)). Add a **card** per SIM it should answer for, then press **Start**. That one action:
+
+1. Writes `data/userbot/config.json`
+2. Creates each card's external SIP account on its line if it is missing, and reloads PJSIP on a running engine
+3. Builds `vowifi/userbot` if the image is not present (first build compiles PJSIP; the page shows the log)
+4. Sends the Telegram login code to the spare account; type it (and the 2FA cloud password if asked) in the same card
+5. Starts the sidecar
+
+After that, Restart applies config changes. The control plane needs `telethon` in its venv (`sudo ./install.sh reload` on an existing install).
+
+**Several SIMs, several people.** Each card names a line, its own SIP username and the account rung when that SIM receives a call. Extra Telegram user ids may be authorised alongside yours; permissions are flat, so anyone listed may dial on any card, and one call runs at a time. In chat: `/call <number> [line]`, `/use <line>` to pick your default card, `/lines`, `/dtmf`, `/hangup`. An inbound call is announced before your phone rings (the Telegram call itself only names the userbot), and every call is summarised when it ends.
+
+SIP usernames have to be unique **across** lines, not merely within one — the sidecar registers them all from a single PJSUA2 endpoint, where two identical `sip:user@host` identities make an inbound call ambiguous. The control plane refuses a name another line already uses.
+
+Calls have been exercised on hardware in both directions with two SIMs. What that does and does not cover, the risks, and how to debug a call that connects with no audio: [`userbot/README.md`](userbot/README.md).
 
 ---
 

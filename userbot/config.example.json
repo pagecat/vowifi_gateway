@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy to config.json next to this file (or mount it at /data/userbot/config.json). The session file it creates IS the account - keep both out of git and off shared storage.",
+
+  "api_id": 0,
+  "api_hash": "get both from https://my.telegram.org/apps",
+  "phone": "+10000000000",
+  "session_name": "/data/userbot/userbot",
+
+  "_owner": "Numeric Telegram user ids allowed to drive this. owner_id is the primary: the default answerer for a card, and the one it will not run without. owner_ids lists everyone else. Permissions are flat - all of them may dial on any card - but only one call runs at a time. Get the ids from @userinfobot; nothing else is obeyed.",
+  "owner_id": 0,
+  "owner_ids": [],
+
+  "_gateway": "Control plane, used read-only to discover lines and their SIP parameters.",
+  "gateway_url": "https://127.0.0.1:8443",
+  "gateway_verify_tls": false,
+
+  "_cards": "One entry per SIM. sip_user is an external SIP account created in the WebUI under SIM Config -> External SIP accounts; the dialplan already rings every external account on an incoming call. Usernames MUST differ between lines: they are all registered from one PJSUA2 endpoint, and two accounts sharing a sip:user@host identity make an inbound call ambiguous. answer_owner is the account rung when that SIM receives a call, 0 = the primary. Leave sip_password out: the gateway hands out each account's own password. A blank line means the first configured one.",
+  "cards": [
+    {"line": "1", "sip_user": "tgbridge", "answer_owner": 0}
+  ],
+
+  "_dial_allowlist": "Optional. Empty = any number may be dialled. A compromised sidecar can place calls, so pin this down if the numbers you call are predictable.",
+  "dial_allowlist": []
+}

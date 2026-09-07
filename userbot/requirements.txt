@@ -1,0 +1,15 @@
+# Telegram userbot sidecar.
+#
+# ntgcalls is the WebRTC/SRTP stack for Telegram calls; the high-level py-tgcalls
+# wrapper does NOT expose raw PCM for 1-on-1 private calls, so we use the native
+# pybind11 bindings directly. Prebuilt wheels exist for linux x86_64 and arm64.
+ntgcalls==2.1.0
+
+# MTProto signaling only (accept/request call, DH exchange, endpoints).
+telethon>=1.36
+
+# Reads the gateway's own API to self-configure.
+requests>=2.31
+
+# PJSUA2 (the SIP leg) is NOT installable from PyPI - it is built from source in
+# the Dockerfile and lands in site-packages as `pjsua2`.

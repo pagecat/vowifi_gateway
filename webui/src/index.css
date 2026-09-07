@@ -62,7 +62,7 @@ body {
 }
 
 /* status dot colors (semantic — consistent across themes) */
-.dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+.dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; flex-shrink: 0; }
 .st-OK { background: #22c55e; box-shadow: 0 0 8px #22c55e88; }
 .st-REGISTERING { background: #eab308; box-shadow: 0 0 8px #eab30888; }
 .st-TUNNEL_DOWN { background: #f97316; }
@@ -170,6 +170,13 @@ a { color: inherit; }
   white-space: nowrap;
 }
 
+/* SIM config: card/PIN panel next to the line form; they stack on narrow screens. */
+.sim-config-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
 .msg-bubble {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -272,6 +279,7 @@ a { color: inherit; }
   .sim-selector-label { font-size: 11px; }
   .sim-selector select { min-height: 34px; padding: 4px 8px; font-size: 13px; border-radius: 8px; }
   .sim-selector-hint { display: none; }
+  .sim-config-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; }
 
   .split-pane, .split-pane.softphone {
     grid-template-columns: minmax(0, 1fr) !important;

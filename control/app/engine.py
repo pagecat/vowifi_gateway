@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 
 import docker
 
@@ -30,8 +31,27 @@ PCSCD_SOCK = os.environ.get("VOWIFI_PCSCD_DIR", "/run/pcscd")
 HOST_DATA_DIR = os.environ.get("VOWIFI_HOST_DATA", DATA_DIR)
 
 
-def _client():
-    return docker.from_env()
+_client_lock = threading.Lock()
+_client_cached: "docker.DockerClient | None" = None
+
+
+def client():
+    """One shared client. docker.from_env() re-reads the environment, builds a new HTTP
+    session over the daemon socket and negotiates an API version on EVERY call — the status
+    poller probes each container every few seconds, so paying that repeatedly is a real cost
+    on a small board. The SDK is designed to be built once and reused."""
+    global _client_cached
+    with _client_lock:
+        if _client_cached is None:
+            _client_cached = docker.from_env()
+        return _client_cached
+
+
+def reset_client():
+    """Drop the shared client so the next call rebuilds it (daemon restarted / socket gone)."""
+    global _client_cached
+    with _client_lock:
+        _client_cached = None
 
 
 def container_name(iid: str) -> str:
@@ -52,16 +72,18 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
     cfg.write_instance_json(inst, settings)
     base, host_base = _instance_paths(iid)
     ports = inst.get("ports", {})
-    client = _client()
+    dc = client()
     # remove any existing container
     try:
-        old = client.containers.get(container_name(iid))
+        old = dc.containers.get(container_name(iid))
         old.remove(force=True)
     except docker.errors.NotFound:
         pass
 
     volumes = {
-        os.path.join(host_base, "instance.json"): {"bind": "/config/instance.json", "mode": "ro"},
+        # Directory mount, not the file: a file bind sticks to one inode, so
+        # rewriting instance.json on the host is invisible inside a running engine.
+        host_base: {"bind": "/config", "mode": "ro"},
         os.path.join(host_base, "logs"): {"bind": "/logs", "mode": "rw"},
         os.path.join(host_base, "run"): {"bind": "/run/vowifi", "mode": "rw"},
         PCSCD_SOCK: {"bind": "/run/pcscd", "mode": "rw"},
@@ -109,7 +131,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
     for p in range(ports.get("rtp_start", 10000), ports.get("rtp_start", 10000) + 60):
         port_bindings[f"{p}/udp"] = p
 
-    c = client.containers.run(
+    c = dc.containers.run(
         IMAGE,
         name=container_name(iid),
         detach=True,
@@ -127,7 +149,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
 
 def stop(iid: str):
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         c.remove(force=True)
         return True
     except docker.errors.NotFound:
@@ -136,20 +158,26 @@ def stop(iid: str):
 
 def is_running(iid: str) -> bool:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         return c.status == "running"
     except docker.errors.NotFound:
         return False
+    except docker.errors.DockerException:
+        reset_client()      # a wedged socket must not be reused by every later probe
+        raise
 
 
 def container_ip(iid: str) -> str | None:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         nets = c.attrs["NetworkSettings"]["Networks"]
         for n in nets.values():
             if n.get("IPAddress"):
                 return n["IPAddress"]
+    except docker.errors.NotFound:
+        return None
     except Exception:
+        reset_client()
         return None
     return None
 
@@ -180,9 +208,43 @@ def tunnel_installed(iid: str) -> bool:
     return st is not None and st.get("state") == "CONNECTED"
 
 
+def rerender(iid: str, expect_user: str | None = None) -> str:
+    """Rewrite Asterisk configs from the current instance.json and reload PJSIP,
+    without recreating the engine. Used when an external SIP account is added for
+    the userbot while the line is already up.
+
+    `expect_user` is an endpoint that must exist afterwards. Checking is not
+    paranoia: a container created before instance.json became a directory mount
+    holds the file by inode, so it renders from a copy the host can no longer
+    reach, and every step here still reports success.
+    """
+    try:
+        c = client().containers.get(container_name(iid))
+    except docker.errors.NotFound:
+        return "not running"
+    rc1, out1 = c.exec_run(["python3", "/usr/local/bin/render.py"])
+    text1 = out1.decode(errors="replace") if isinstance(out1, bytes) else str(out1)
+    if rc1:
+        return f"render failed: {text1}"
+    # This Asterisk has no `pjsip reload` (CLI still exits 0 with "No such command").
+    # Reloading the module re-reads pjsip.conf; dialplan reload picks up new local endpoints.
+    for command in ("module reload res_pjsip.so", "dialplan reload"):
+        rc, out = c.exec_run(["asterisk", "-rx", command])
+        text = out.decode(errors="replace") if isinstance(out, bytes) else str(out)
+        if rc or "No such command" in text:
+            return f"{command} failed: {text}"
+    if expect_user:
+        # -F: the section header is [name], and those brackets are a character
+        # class to grep. The rendered line is `[name](endpoint-local)`.
+        rc, _ = c.exec_run(["grep", "-qF", f"[{expect_user}]", "/etc/asterisk/pjsip.conf"])
+        if rc:
+            return "the engine is reading an older copy of its config"
+    return "ok"
+
+
 def exec_cli(iid: str, command: str) -> str:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         rc, out = c.exec_run(["asterisk", "-rx", command])
         return out.decode(errors="replace") if isinstance(out, bytes) else str(out)
     except Exception as e:  # noqa
@@ -191,7 +253,7 @@ def exec_cli(iid: str, command: str) -> str:
 
 def logs(iid: str, tail: int = 200, since=None) -> str:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         kwargs = {"tail": tail}
         if since is not None:
             # docker SDK accepts an int (unix ts) or datetime; used by the SMS delivery

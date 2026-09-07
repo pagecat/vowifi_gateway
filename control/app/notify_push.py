@@ -88,12 +88,14 @@ def _telegram_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def _post_telegram(cfg: dict, payload: dict):
+def _post_telegram(cfg: dict, payload: dict) -> int | None:
+    """Send the notification. Returns the Telegram message id so the caller can remember what
+    conversation it announced — replying to that message is how the bot answers an SMS."""
     token = (cfg.get("bot_token") or "").strip()
     chat = str(cfg.get("chat_id") or "").strip()
     if not token or not chat:
         log.warning("telegram enabled but bot_token/chat_id missing; skipping")
-        return
+        return None
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -102,17 +104,21 @@ def _post_telegram(cfg: dict, payload: dict):
             timeout=_TIMEOUT)
         if r.status_code != 200:
             log.warning("telegram sendMessage -> %s %s", r.status_code, r.text[:200])
-        else:
-            log.info("telegram %s -> chat %s ok", payload.get("event"), chat)
+            return None
+        log.info("telegram %s -> chat %s ok", payload.get("event"), chat)
+        return ((r.json() or {}).get("result") or {}).get("message_id")
     except Exception as e:  # noqa
         log.warning("telegram sendMessage failed: %r", e)
+    return None
 
 
-def dispatch(settings: dict, event: str, instance: dict, source: str, text: str | None = None):
+def dispatch(settings: dict, event: str, instance: dict, source: str,
+             text: str | None = None) -> int | None:
     """Fire both configured channels for one event. BLOCKING (does the HTTP itself) — the
     caller runs this off the event path (e.g. asyncio.to_thread + create_task) so a slow
     endpoint never stalls engine-event handling. Safe to call unconditionally: each channel
-    is gated on its own enable flag + per-event checkbox."""
+    is gated on its own enable flag + per-event checkbox. Returns the Telegram message id when
+    one was sent, so the bot can treat a reply to it as a reply to that conversation."""
     try:
         payload = build_payload(event, instance, source, text)
         wh = settings.get("webhook") or {}
@@ -120,6 +126,7 @@ def dispatch(settings: dict, event: str, instance: dict, source: str, text: str 
             _post_webhook(wh, payload)
         tg = settings.get("telegram") or {}
         if tg.get("enabled") and _events_enabled(tg).get(event):
-            _post_telegram(tg, payload)
+            return _post_telegram(tg, payload)
     except Exception as e:  # noqa
         log.warning("push dispatch error: %r", e)
+    return None

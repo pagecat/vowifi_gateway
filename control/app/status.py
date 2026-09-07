@@ -11,6 +11,7 @@ detail:      raw signals (pin, pcscf, registration, ike classification) for adva
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import socket
 
@@ -99,7 +100,11 @@ async def compute(inst: dict, ami_client=None) -> dict:
         return {"state": state, "label": LABELS[state],
                 "reason_code": code, "reason": REASONS.get(code, ""), "detail": detail}
 
-    if not inst.get("enabled", True) or not engine.is_running(iid):
+    # compute() runs for every line on every poll and on every /api/instances. The three
+    # calls below are blocking (Docker socket, DNS, a 400-line log read), so they go to a
+    # worker thread — left inline they stall the single event loop that also serves the
+    # WebUI, the API and the WebSocket.
+    if not inst.get("enabled", True) or not await asyncio.to_thread(engine.is_running, iid):
         return {"state": "STOPPED", "label": LABELS["STOPPED"],
                 "reason_code": "stopped", "reason": "Stopped.", "detail": detail}
 
@@ -113,11 +118,11 @@ async def compute(inst: dict, ami_client=None) -> dict:
     if pstate == "PIN_BLOCKED":
         return out("PIN_PROBLEM", "pin_blocked")
 
-    if not resolve_epdg(epdg):
+    if not await asyncio.to_thread(resolve_epdg, epdg):
         return out("EPDG_UNRESOLVED", "epdg_unresolved")
 
     if not engine.tunnel_installed(iid):
-        code, _ = classify_ike(iid)
+        code, _ = await asyncio.to_thread(classify_ike, iid)
         r = out("TUNNEL_DOWN", code)
         detail["ike_reason"] = code
         return r

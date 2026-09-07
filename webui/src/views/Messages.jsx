@@ -195,7 +195,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
                   flexDirection: m.direction === 'out' ? 'row-reverse' : 'row' }}>
                 {selMode && <input type="checkbox" readOnly checked={checked} style={{ width: 'auto', flexShrink: 0, marginTop: 10 }} />}
                 <div style={{ minWidth: 0, maxWidth: '100%', flex: '1 1 auto' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6,
+                  {/* This wrapper is as wide as its widest child — usually the timestamp, not the
+                      bubble — so pin the bubble to the outer edge. flex-end is that edge either
+                      way: right under 'row' (outbound), left under 'row-reverse' (inbound). */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'flex-end',
                     flexDirection: m.direction === 'out' ? 'row' : 'row-reverse' }}>
                     {failed && <span title={m.error || 'Delivery failed'}
                       style={{ color: '#ef4444', fontWeight: 800, cursor: 'help', fontSize: 15 }}>❗</span>}

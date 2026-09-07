@@ -16,6 +16,12 @@ control/.venv/
 .env
 .env.*
 
+# userbot: a Telethon session file grants full control of the account it logged
+# in as, and config.json carries the api_hash. Neither belongs in the repo.
+userbot/config.json
+*.session
+*.session-journal
+
 # editor / tooling / OS cruft
 .claude/
 .vscode/
